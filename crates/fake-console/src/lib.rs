@@ -309,10 +309,17 @@ fn set_value_is_valid(path: &str, value: &str) -> bool {
     }
 }
 fn default_value(path: &str) -> &'static str {
-    if path.ends_with("/On") || path.ends_with("/Pan") {
-        "0"
-    } else {
-        "-32768"
+    match path {
+        // Labels are strings on the wire, even before an engineer has named
+        // them. Returning an empty quoted label keeps a new fake console in
+        // the same value domain as a physical console.
+        "MIXER:Current/InCh/Label/Name" | "MIXER:Current/Mix/Label/Name" => "\"\"",
+        // The fake models BusType as a boolean-like 0/1 field; a new mix is
+        // unlinked. The physical CL5's precise encoding remains documented as
+        // unconfirmed, but the fake must not return a send-level sentinel here.
+        "MIXER:Current/Mix/BusType" => "0",
+        path if path.ends_with("/On") || path.ends_with("/Pan") => "0",
+        _ => "-32768",
     }
 }
 
@@ -417,6 +424,33 @@ mod tests {
             line(&mut lines).await,
             "OK get MIXER:Current/InCh/Label/Name 0 0 \"Lead Vocal\""
         );
+    }
+
+    #[tokio::test]
+    async fn untouched_labels_and_mix_type_have_typed_defaults_over_tcp() {
+        let console = Arc::new(FakeConsole::new());
+        let addr = console.listen("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (read, mut write) = client.into_split();
+        let mut lines = BufReader::new(read).lines();
+
+        for (command, expected) in [
+            (
+                "get MIXER:Current/InCh/Label/Name 0 0\n",
+                "OK get MIXER:Current/InCh/Label/Name 0 0 \"\"",
+            ),
+            (
+                "get MIXER:Current/Mix/Label/Name 0 0\n",
+                "OK get MIXER:Current/Mix/Label/Name 0 0 \"\"",
+            ),
+            (
+                "get MIXER:Current/Mix/BusType 0 0\n",
+                "OK get MIXER:Current/Mix/BusType 0 0 0",
+            ),
+        ] {
+            write.write_all(command.as_bytes()).await.unwrap();
+            assert_eq!(line(&mut lines).await, expected);
+        }
     }
 
     #[tokio::test]

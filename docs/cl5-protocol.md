@@ -23,6 +23,11 @@ examples and must be checked against the physical CL5 during bridge work.
 | Mix name | `get MIXER:Current/Mix/Label/Name <mix> 0` | `set MIXER:Current/Mix/Label/Name <mix> 0 "name"` | quoted string | [RCP notes: mix name](https://github.com/BrenekH/yamaha-rcp-docs/blob/master/commands/current_mix_label_name.md) |
 | Stereo-linked mix | `get MIXER:Current/Mix/BusType <mix> 0` | n/a | **unconfirmed — check exact values on the real console** | [RCP notes: bus type](https://github.com/BrenekH/yamaha-rcp-docs/blob/master/commands/current_mix_bustype.md) |
 
+For deterministic tests, the fake initializes names as the quoted empty string
+and `BusType` as `0` (unlinked). Those defaults are fake-console conventions,
+not claims about the exact CL5 encoding; confirm the physical console's bus-type
+values before the bridge interprets them.
+
 CL5 capacity used by the fake: 72 mono inputs, 8 stereo inputs, and 24 mixes.
 The count is **unconfirmed — check on the real console**; it is deliberately
 not presented as an official protocol fact.
