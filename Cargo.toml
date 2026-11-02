@@ -2,6 +2,14 @@
 resolver = "2"
 members = ["crates/server", "crates/web"]
 
+[workspace.dependencies]
+axum = { version = "0.8", features = ["form"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+rand = "0.9"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+
 [workspace.package]
 edition = "2021"
 license = "UNLICENSED"
