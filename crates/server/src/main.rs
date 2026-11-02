@@ -135,7 +135,17 @@ fn valid(n: &str, p: &str) -> Result<(), String> {
     }
 }
 fn page(title: &str, body: &str) -> Html<String> {
-    Html(format!("<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'><title>{title} · Monitor Mix</title><style>body{{font:18px system-ui;background:#111;color:#fff;max-width:34rem;margin:auto;padding:1rem}}main{{display:grid;gap:1rem}}input,button{{font:inherit;min-height:44px;padding:.5rem}}button{{background:#4cf;border:0;border-radius:.4rem}}@media(orientation:landscape){{body{{max-width:48rem}}}}</style><main>{body}</main>"))
+    Html(
+        cl5_web::SHELL
+            .replace(
+                "<title>Monitor Mix</title>",
+                &format!("<title>{title} · Monitor Mix</title>"),
+            )
+            .replace(
+                "<main id=\"app\"></main>",
+                &format!("<main id=\"app\">{body}</main>"),
+            ),
+    )
 }
 async fn home(State(a): State<App>, h: HeaderMap) -> Response {
     if let Some(u) = session(&a, &h) {

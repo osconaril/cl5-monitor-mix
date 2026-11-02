@@ -126,10 +126,12 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "chrono",
+ "cl5-web",
  "rand",
  "rusqlite",
  "serde",
  "tokio",
+ "tower",
 ]
 
 [[package]]
