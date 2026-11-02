@@ -1,0 +1,11 @@
+/target
+/dist
+*.db
+*.db-shm
+*.db-wal
+.DS_Store
+/.claude/*
+!/.claude/dev-loop.json
+!/.claude/settings.json
+!/.claude/hooks/
+!/.claude/hooks/**

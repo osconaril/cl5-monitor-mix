@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/project-scope-guard.py\"",
+            "timeout": 10,
+            "statusMessage": "Checking path is inside this project…"
+          }
+        ]
+      }
+    ]
+  }
+}

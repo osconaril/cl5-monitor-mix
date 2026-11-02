@@ -1,0 +1,15 @@
+{
+  "team": "CL5 Monitor Mix",
+  "ship": "review-only",
+  "shipStops": {
+    "paths": ["crates/server/migrations/**"],
+    "pathsReason": "SQLite schema changes run on the show machine at startup; a bad migration can lock performers out mid-show.",
+    "labels": ["console-control"],
+    "labelsReason": "Anything that changes what is sent to the live console is checked against the real CL5 before shipping."
+  },
+  "verify": {
+    "typecheck": "cargo check --workspace --all-targets",
+    "lint": "cargo clippy --workspace --all-targets -- -D warnings",
+    "tests": ["cargo test --workspace", "cargo check -p cl5-web --target wasm32-unknown-unknown"]
+  }
+}
