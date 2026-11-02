@@ -37,5 +37,15 @@ The exact CL5 replies and notification ordering are **unconfirmed — check on
 the real console**. The fake announces a recall with `NOTIFY ssrecall_ex ...`
 and the name with `NOTIFY ssinfo_ex ...`; it also announces changed send values.
 
+For a scene store, the expected event shape is `NOTIFY ssstore_ex
+MIXER:Lib/Scene <number>`. Its exact command name, arguments, whether the scene
+name is emitted separately, and ordering are **unconfirmed — check on the real
+console**. This provisional shape follows the Yamaha protocol's command/event
+model in the [PC Remote Control Protocol Specification v1.02
+rev.3](https://mx.yamaha.com/files/download/other_assets/4/1307804/pc_remote_control_protocol_spec_v102_rev3_en.pdf);
+the CL5-capable Bitfocus module above is the source for the `MIXER:Lib/Scene`
+scene path. The fake does not implement storing scenes because it only needs to
+model recalls for tests.
+
 The app must only observe scene changes; it never recalls or stores a scene on
 a real console.
