@@ -145,9 +145,12 @@ impl FakeConsole {
     }
 
     async fn command(&self, line: &str) -> String {
-        let words: Vec<_> = line.split_whitespace().collect();
+        let words = match command_words(line) {
+            Ok(words) => words,
+            Err(()) => return "ERROR malformed command".into(),
+        };
         match words.as_slice() {
-            ["get", path, channel, mix] => {
+            [command, path, channel, mix] if command == "get" => {
                 let key = send_key(path, channel.parse().unwrap_or(0), mix.parse().unwrap_or(0));
                 let value = self
                     .state
@@ -159,18 +162,18 @@ impl FakeConsole {
                     .unwrap_or_else(|| default_value(path).into());
                 format!("OK get {path} {channel} {mix} {value}")
             }
-            ["set", path, channel, mix, value] => {
+            [command, path, channel, mix, value] if command == "set" => {
                 let key = send_key(path, channel.parse().unwrap_or(0), mix.parse().unwrap_or(0));
-                self.state.lock().await.values.insert(key, (*value).into());
+                self.state.lock().await.values.insert(key, value.clone());
                 let wire = format!("NOTIFY set {path} {channel} {mix} {value}");
                 let _ = self.notifications.send(wire);
                 "OK".into()
             }
-            ["sscurrent_ex", "MIXER:Lib/Scene"] => {
+            [command, path] if command == "sscurrent_ex" && path == "MIXER:Lib/Scene" => {
                 let current = self.state.lock().await.current_scene;
                 format!("OK sscurrent_ex MIXER:Lib/Scene {current}")
             }
-            ["ssinfo_ex", "MIXER:Lib/Scene", number] => {
+            [command, path, number] if command == "ssinfo_ex" && path == "MIXER:Lib/Scene" => {
                 let number = number.parse().unwrap_or(0);
                 let state = self.state.lock().await;
                 match state.scenes.get(&number) {
@@ -180,7 +183,7 @@ impl FakeConsole {
                     None => "ERROR scene not found".into(),
                 }
             }
-            ["ssrecall_ex", "MIXER:Lib/Scene", number] => {
+            [command, path, number] if command == "ssrecall_ex" && path == "MIXER:Lib/Scene" => {
                 self.recall(number.parse().unwrap_or(0)).await
             }
             _ => "ERROR unsupported command".into(),
@@ -208,6 +211,36 @@ impl FakeConsole {
         ));
         "OK".into()
     }
+}
+
+/// Splits an RCP line while retaining quoted values on the wire. RCP label
+/// commands use quoted names, which may contain spaces.
+fn command_words(line: &str) -> Result<Vec<String>, ()> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quoted = false;
+
+    for character in line.chars() {
+        match character {
+            '"' => {
+                quoted = !quoted;
+                word.push(character);
+            }
+            character if character.is_whitespace() && !quoted => {
+                if !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+            }
+            _ => word.push(character),
+        }
+    }
+    if quoted {
+        return Err(());
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    Ok(words)
 }
 
 fn send_key(path: &str, channel: usize, mix: usize) -> String {
@@ -294,6 +327,33 @@ mod tests {
         assert_eq!(
             line(&mut lines).await,
             "NOTIFY ssinfo_ex MIXER:Lib/Scene 2 \"Show\""
+        );
+    }
+
+    #[tokio::test]
+    async fn quoted_multi_word_label_round_trips_over_tcp() {
+        let console = Arc::new(FakeConsole::new());
+        let addr = console.listen("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (read, mut write) = client.into_split();
+        let mut lines = BufReader::new(read).lines();
+
+        write
+            .write_all(b"set MIXER:Current/InCh/Label/Name 0 0 \"Lead Vocal\"\n")
+            .await
+            .unwrap();
+        assert_eq!(line(&mut lines).await, "OK");
+        assert_eq!(
+            line(&mut lines).await,
+            "NOTIFY set MIXER:Current/InCh/Label/Name 0 0 \"Lead Vocal\""
+        );
+        write
+            .write_all(b"get MIXER:Current/InCh/Label/Name 0 0\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            line(&mut lines).await,
+            "OK get MIXER:Current/InCh/Label/Name 0 0 \"Lead Vocal\""
         );
     }
 }
