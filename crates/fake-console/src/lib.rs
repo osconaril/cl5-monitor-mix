@@ -151,7 +151,9 @@ impl FakeConsole {
         };
         match words.as_slice() {
             [command, path, channel, mix] if command == "get" => {
-                let key = send_key(path, channel.parse().unwrap_or(0), mix.parse().unwrap_or(0));
+                let Ok(key) = control_key(path, channel, mix) else {
+                    return "ERROR unsupported command".into();
+                };
                 let value = self
                     .state
                     .lock()
@@ -163,7 +165,12 @@ impl FakeConsole {
                 format!("OK get {path} {channel} {mix} {value}")
             }
             [command, path, channel, mix, value] if command == "set" => {
-                let key = send_key(path, channel.parse().unwrap_or(0), mix.parse().unwrap_or(0));
+                let Ok(key) = control_key(path, channel, mix) else {
+                    return "ERROR unsupported command".into();
+                };
+                if !set_value_is_valid(path, value) {
+                    return "ERROR invalid value".into();
+                }
                 self.state.lock().await.values.insert(key, value.clone());
                 let wire = format!("NOTIFY set {path} {channel} {mix} {value}");
                 let _ = self.notifications.send(wire);
@@ -174,7 +181,9 @@ impl FakeConsole {
                 format!("OK sscurrent_ex MIXER:Lib/Scene {current}")
             }
             [command, path, number] if command == "ssinfo_ex" && path == "MIXER:Lib/Scene" => {
-                let number = number.parse().unwrap_or(0);
+                let Ok(number) = number.parse() else {
+                    return "ERROR scene not found".into();
+                };
                 let state = self.state.lock().await;
                 match state.scenes.get(&number) {
                     Some(scene) => {
@@ -184,7 +193,10 @@ impl FakeConsole {
                 }
             }
             [command, path, number] if command == "ssrecall_ex" && path == "MIXER:Lib/Scene" => {
-                self.recall(number.parse().unwrap_or(0)).await
+                match number.parse() {
+                    Ok(number) => self.recall(number).await,
+                    Err(_) => "ERROR scene not found".into(),
+                }
             }
             _ => "ERROR unsupported command".into(),
         }
@@ -245,6 +257,56 @@ fn command_words(line: &str) -> Result<Vec<String>, ()> {
 
 fn send_key(path: &str, channel: usize, mix: usize) -> String {
     format!("{path} {channel} {mix}")
+}
+
+/// Validates the subset of RCP controls documented for this fake before it
+/// reaches state. Keeping the bounds here prevents bridge tests from passing
+/// against inputs or mixes a CL5 Monitor Mix deployment cannot address.
+fn control_key(path: &str, first: &str, second: &str) -> Result<String, ()> {
+    let first = first.parse::<usize>().map_err(|_| ())?;
+    let second = second.parse::<usize>().map_err(|_| ())?;
+    let input_path = matches!(
+        path,
+        "MIXER:Current/InCh/ToMix/Level"
+            | "MIXER:Current/InCh/ToMix/On"
+            | "MIXER:Current/InCh/ToMix/Pan"
+    );
+    let input_label_path = matches!(
+        path,
+        "MIXER:Current/InCh/Label/Name" | "MIXER:Current/InCh/Label/Color"
+    );
+    let mix_path = matches!(
+        path,
+        "MIXER:Current/Mix/Label/Name" | "MIXER:Current/Mix/BusType"
+    );
+
+    if (input_path && first < MONO_INPUTS + STEREO_INPUTS && second < MIXES)
+        || (input_label_path && first < MONO_INPUTS + STEREO_INPUTS && second == 0)
+        || (mix_path && first < MIXES && second == 0)
+    {
+        Ok(send_key(path, first, second))
+    } else {
+        Err(())
+    }
+}
+
+fn set_value_is_valid(path: &str, value: &str) -> bool {
+    match path {
+        "MIXER:Current/InCh/ToMix/Level" => value
+            .parse::<i32>()
+            .is_ok_and(|level| level == -32768 || (-13800..=1000).contains(&level)),
+        "MIXER:Current/InCh/ToMix/On" => matches!(value, "0" | "1"),
+        // The precise pan and color code domains remain deliberately
+        // unconfirmed in the protocol notes. They are still numeric controls.
+        "MIXER:Current/InCh/ToMix/Pan" | "MIXER:Current/InCh/Label/Color" => {
+            value.parse::<i32>().is_ok()
+        }
+        "MIXER:Current/InCh/Label/Name" | "MIXER:Current/Mix/Label/Name" => {
+            value.starts_with('"') && value.ends_with('"') && value.len() >= 2
+        }
+        // BusType is read-only in the documented surface.
+        _ => false,
+    }
 }
 fn default_value(path: &str) -> &'static str {
     if path.ends_with("/On") || path.ends_with("/Pan") {
@@ -355,5 +417,43 @@ mod tests {
             line(&mut lines).await,
             "OK get MIXER:Current/InCh/Label/Name 0 0 \"Lead Vocal\""
         );
+    }
+
+    #[tokio::test]
+    async fn tcp_rejects_out_of_range_and_invalid_send_controls() {
+        let console = Arc::new(FakeConsole::new());
+        let addr = console.listen("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(addr).await.unwrap();
+        let (read, mut write) = client.into_split();
+        let mut lines = BufReader::new(read).lines();
+
+        write
+            .write_all(b"set MIXER:Current/InCh/ToMix/Level 79 23 -13800\n")
+            .await
+            .unwrap();
+        assert_eq!(line(&mut lines).await, "OK");
+        assert_eq!(
+            line(&mut lines).await,
+            "NOTIFY set MIXER:Current/InCh/ToMix/Level 79 23 -13800"
+        );
+
+        for command in [
+            "set MIXER:Current/InCh/ToMix/Level 80 23 -1200\n",
+            "set MIXER:Current/InCh/ToMix/Level 79 24 -1200\n",
+            "set MIXER:Current/InCh/ToMix/Level nope 0 -1200\n",
+        ] {
+            write.write_all(command.as_bytes()).await.unwrap();
+            assert_eq!(line(&mut lines).await, "ERROR unsupported command");
+        }
+        write
+            .write_all(b"set MIXER:Current/InCh/ToMix/Level 79 23 -13801\n")
+            .await
+            .unwrap();
+        assert_eq!(line(&mut lines).await, "ERROR invalid value");
+        write
+            .write_all(b"set MIXER:Current/InCh/ToMix/On 79 23 2\n")
+            .await
+            .unwrap();
+        assert_eq!(line(&mut lines).await, "ERROR invalid value");
     }
 }
