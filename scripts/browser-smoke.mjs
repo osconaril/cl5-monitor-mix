@@ -11,23 +11,37 @@ const root = new URL('..', import.meta.url).pathname;
 const temp = await mkdtemp(join(tmpdir(), 'cl5-browser-'));
 const port = 38123;
 const chrome = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-const server = spawn('cargo', ['run', '-p', 'cl5-server'], {
-  cwd: root,
-  env: { ...process.env, CL5_LISTEN: `127.0.0.1:${port}`, CL5_DATABASE_PATH: join(temp, 'test.sqlite') },
-  stdio: 'ignore',
-});
-const browser = spawn(chrome, ['--headless=new', '--no-first-run', '--no-default-browser-check', '--remote-debugging-port=9222', `--user-data-dir=${join(temp, 'chrome')}`], { stdio: 'ignore' });
+const webDist = join(temp, 'web');
+let server;
+let browser;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+async function buildWeb() {
+  // launchd sets NO_COLOR=1, while Trunk accepts only boolean spellings.
+  const build = spawn('env', ['-u', 'NO_COLOR', 'trunk', 'build', '--dist', webDist], { cwd: join(root, 'crates', 'web'), stdio: 'inherit' });
+  const code = await new Promise((resolve, reject) => {
+    build.once('error', reject);
+    build.once('exit', resolve);
+  });
+  if (code !== 0) throw new Error(`trunk build failed with exit ${code}`);
+}
 async function ready(url) { for (let i = 0; i < 100; i++) { try { if ((await fetch(url)).ok) return; } catch {} await sleep(100); } throw new Error(`Timed out waiting for ${url}`); }
 async function command(ws, method, params = {}) { const id = ++command.id; ws.send(JSON.stringify({ id, method, params })); return new Promise((resolve, reject) => { const timer = setTimeout(() => reject(new Error(`${method} timed out`)), 10000); const listener = event => { const message = JSON.parse(event.data); if (message.id === id) { clearTimeout(timer); ws.removeEventListener('message', listener); message.error ? reject(new Error(message.error.message)) : resolve(message.result); } }; ws.addEventListener('message', listener); }); }
 command.id = 0;
 async function stop(process) {
+  if (!process) return;
   if (process.exitCode !== null) return;
   const exited = once(process, 'exit');
   process.kill();
   await exited;
 }
 try {
+  await buildWeb();
+  server = spawn('cargo', ['run', '-p', 'cl5-server'], {
+    cwd: root,
+    env: { ...process.env, CL5_LISTEN: `127.0.0.1:${port}`, CL5_DATABASE_PATH: join(temp, 'test.sqlite'), CL5_WEB_DIST: webDist },
+    stdio: 'ignore',
+  });
+  browser = spawn(chrome, ['--headless=new', '--no-first-run', '--no-default-browser-check', '--remote-debugging-port=9222', `--user-data-dir=${join(temp, 'chrome')}`], { stdio: 'ignore' });
   await ready(`http://127.0.0.1:${port}/setup`);
   await ready('http://127.0.0.1:9222/json/version');
   const target = await fetch(`http://127.0.0.1:9222/json/new?http://127.0.0.1:${port}/setup`, { method: 'PUT' }).then(r => r.json());

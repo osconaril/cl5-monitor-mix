@@ -21,3 +21,17 @@ cargo test --workspace
 cargo check --workspace --all-targets
 node scripts/browser-smoke.mjs
 ```
+## Web application
+
+The phone UI is a Yew WebAssembly application. Build it before starting the
+LAN server:
+
+```bash
+cargo install trunk
+cd crates/web && trunk build --dist dist
+cd ../.. && cargo run -p cl5-server
+```
+
+For the full phone-size smoke check, run `node scripts/browser-smoke.mjs`; it
+builds the Yew app into an isolated temporary directory before starting the
+server.

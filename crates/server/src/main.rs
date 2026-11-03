@@ -2,21 +2,23 @@
 use axum::{
     extract::{Form, State},
     http::{header, HeaderMap, StatusCode},
-    response::{Html, IntoResponse, Redirect, Response},
+    response::{IntoResponse, Redirect, Response},
     routing::{get, post},
-    Router,
+    Json, Router,
 };
 use chrono::Utc;
 use rand::{distr::Alphanumeric, Rng};
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     env,
     net::SocketAddr,
+    path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+use tower_http::services::ServeDir;
 
 type Db = Arc<Mutex<Connection>>;
 #[derive(Clone)]
@@ -31,6 +33,16 @@ struct User {
     name: String,
     role: String,
     updated_at: String,
+}
+#[derive(Serialize)]
+struct Bootstrap {
+    has_admin: bool,
+    user: Option<BootstrapUser>,
+}
+#[derive(Serialize)]
+struct BootstrapUser {
+    name: String,
+    role: String,
 }
 struct Attempt {
     failures: u8,
@@ -66,12 +78,14 @@ async fn main() {
 }
 fn routes(app: App) -> Router {
     Router::new()
-        .route("/", get(home))
-        .route("/setup", get(setup_page).post(setup))
+        .route("/", get(web_app))
+        .route("/setup", get(web_app).post(setup))
         .route("/signin", post(signin))
         .route("/signout", post(signout))
         .route("/api/admin/ping", get(admin_ping))
+        .route("/api/bootstrap", get(bootstrap))
         .with_state(app)
+        .fallback_service(ServeDir::new(web_dist()))
 }
 impl App {
     fn open(path: &str) -> rusqlite::Result<Self> {
@@ -166,51 +180,30 @@ fn valid(n: &str, p: &str) -> Result<(), String> {
         Ok(())
     }
 }
-fn page(title: &str, body: &str) -> Html<String> {
-    Html(
-        cl5_web::SHELL
-            .replace(
-                "<title>Monitor Mix</title>",
-                &format!("<title>{title} · Monitor Mix</title>"),
-            )
-            .replace(
-                "<main id=\"app\"></main>",
-                &format!("<main id=\"app\">{body}</main>"),
-            ),
-    )
+fn web_dist() -> PathBuf {
+    env::var_os("CL5_WEB_DIST")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("crates/web/dist"))
 }
-fn html_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
+async fn web_app() -> Response {
+    let index = std::fs::read_to_string(web_dist().join("index.html"))
+        .unwrap_or_else(|_| include_str!("../../web/index.html").to_owned());
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], index).into_response()
 }
-async fn home(State(a): State<App>, h: HeaderMap) -> Response {
-    if let Some(u) = session(&a, &h) {
-        page("Monitor Mix",&format!("<h1>Welcome, {}</h1><p>Signed in as {}.</p><form method=post action=/signout><button>Sign out</button></form>",html_escape(&u.name),html_escape(&u.role))).into_response()
-    } else if a.has_admin().unwrap_or(false) {
-        page("Sign in","<h1>Monitor Mix</h1><form method=post action=/signin><label>Name <input name=name required></label><label>4-digit passcode <input name=passcode inputmode=numeric pattern='[0-9]{4}' maxlength=4 required></label><button>Sign in</button></form>").into_response()
-    } else {
-        Redirect::to("/setup").into_response()
-    }
-}
-async fn setup_page(State(a): State<App>) -> Response {
-    if a.has_admin().unwrap_or(true) {
-        Redirect::to("/").into_response()
-    } else {
-        page("First setup","<h1>Create the first admin</h1><p>This page works only once.</p><form method=post action=/setup><label>Name <input name=name required></label><label>4-digit passcode <input name=passcode inputmode=numeric pattern='[0-9]{4}' maxlength=4 required></label><button>Create admin</button></form>").into_response()
-    }
+async fn bootstrap(State(a): State<App>, headers: HeaderMap) -> Json<Bootstrap> {
+    let user = session(&a, &headers).map(|user| BootstrapUser {
+        name: user.name,
+        role: user.role,
+    });
+    Json(Bootstrap {
+        has_admin: a.has_admin().unwrap_or(true),
+        user,
+    })
 }
 async fn setup(State(a): State<App>, Form(f): Form<Credentials>) -> Response {
     match a.add_first_admin(&f.name, &f.passcode) {
         Ok(()) => login(&a, a.user(&f.name, &f.passcode).unwrap().unwrap()),
-        Err(e) => page(
-            "First setup",
-            &format!("<p>{e}</p><a href=/setup>Try again</a>"),
-        )
-        .into_response(),
+        Err(_) => Redirect::to("/setup?error=setup").into_response(),
     }
 }
 async fn signin(State(a): State<App>, Form(f): Form<Credentials>) -> Response {
@@ -221,14 +214,7 @@ async fn signin(State(a): State<App>, Form(f): Form<Credentials>) -> Response {
     });
     if let Some(until) = entry.locked_until {
         if until > Instant::now() {
-            return page(
-                "Sign in",
-                &format!(
-                    "<p>This name is locked. Try again in {} seconds.</p>",
-                    until.duration_since(Instant::now()).as_secs()
-                ),
-            )
-            .into_response();
+            return Redirect::to("/?error=locked").into_response();
         }
         entry.failures = 0;
         entry.locked_until = None
@@ -248,13 +234,9 @@ async fn signin(State(a): State<App>, Form(f): Form<Credentials>) -> Response {
             e.failures += 1;
             if e.failures >= 5 {
                 e.locked_until = Some(Instant::now() + Duration::from_secs(300));
-                return page(
-                    "Sign in",
-                    "<p>This name is locked. Try again in 300 seconds.</p><a href=/>Try again</a>",
-                )
-                .into_response();
+                return Redirect::to("/?error=locked").into_response();
             }
-            page("Sign in", "<p>Wrong passcode.</p><a href=/>Try again</a>").into_response()
+            Redirect::to("/?error=wrong").into_response()
         }
     }
 }
@@ -363,9 +345,7 @@ mod tests {
         let app = App::memory().unwrap();
         let setup = call(&app, Request::get("/setup").body(Body::empty()).unwrap()).await;
         assert_eq!(setup.status(), StatusCode::OK);
-        assert!(response_text(setup)
-            .await
-            .contains("Create the first admin"));
+        assert!(response_text(setup).await.contains("data-trunk"));
 
         let created = call(
             &app,
@@ -379,7 +359,7 @@ mod tests {
         assert!(created.headers().contains_key(header::SET_COOKIE));
 
         let again = call(&app, Request::get("/setup").body(Body::empty()).unwrap()).await;
-        assert_eq!(again.status(), StatusCode::SEE_OTHER);
+        assert_eq!(again.status(), StatusCode::OK);
     }
 
     #[test]
@@ -412,11 +392,12 @@ mod tests {
                     .unwrap(),
             )
             .await;
-            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.status(), StatusCode::SEE_OTHER);
             if attempt == 5 {
-                let body = response_text(response).await;
-                assert!(body.contains("This name is locked"));
-                assert!(body.contains("300 seconds"));
+                assert_eq!(
+                    response.headers().get(header::LOCATION).unwrap(),
+                    "/?error=locked"
+                );
             }
         }
         let locked = call(
@@ -427,7 +408,11 @@ mod tests {
                 .unwrap(),
         )
         .await;
-        assert!(response_text(locked).await.contains("locked"));
+        assert_eq!(locked.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            locked.headers().get(header::LOCATION).unwrap(),
+            "/?error=locked"
+        );
 
         let admin = call(
             &app,
@@ -506,17 +491,14 @@ mod tests {
             .unwrap();
         let signed_out = call(
             &app,
-            Request::get("/")
+            Request::get("/api/bootstrap")
                 .header(header::COOKIE, cookie)
                 .body(Body::empty())
                 .unwrap(),
         )
         .await;
-        assert_eq!(signed_out.status(), StatusCode::SEE_OTHER);
-        assert_eq!(
-            signed_out.headers().get(header::LOCATION).unwrap(),
-            "/setup"
-        );
+        assert_eq!(signed_out.status(), StatusCode::OK);
+        assert!(response_text(signed_out).await.contains("\"user\":null"));
     }
 
     #[tokio::test]
@@ -544,20 +526,20 @@ mod tests {
         let restarted = App::open(path.to_str().unwrap()).unwrap();
         let home = call(
             &restarted,
-            Request::get("/")
+            Request::get("/api/bootstrap")
                 .header(header::COOKIE, cookie)
                 .body(Body::empty())
                 .unwrap(),
         )
         .await;
         assert_eq!(home.status(), StatusCode::OK);
-        assert!(response_text(home).await.contains("Welcome, Performer"));
+        assert!(response_text(home).await.contains("\"name\":\"Performer\""));
         drop(restarted);
         std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]
-    async fn signed_in_display_name_is_html_escaped() {
+    async fn signed_in_display_name_is_returned_as_json_data() {
         let app = App::memory().unwrap();
         let name = "<svg onload=alert(1)>";
         app.add_user(name, "1234", "admin").unwrap();
@@ -574,14 +556,17 @@ mod tests {
             .to_owned();
         let home = call(
             &app,
-            Request::get("/")
+            Request::get("/api/bootstrap")
                 .header(header::COOKIE, cookie)
                 .body(Body::empty())
                 .unwrap(),
         )
         .await;
+        assert_eq!(
+            home.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
         let body = response_text(home).await;
-        assert!(body.contains("&lt;svg onload=alert(1)&gt;"));
-        assert!(!body.contains("<svg onload=alert(1)>"));
+        assert!(body.contains("<svg onload=alert(1)>"));
     }
 }
