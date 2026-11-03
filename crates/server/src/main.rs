@@ -214,7 +214,7 @@ async fn signin(State(a): State<App>, Form(f): Form<Credentials>) -> Response {
     });
     if let Some(until) = entry.locked_until {
         if until > Instant::now() {
-            return Redirect::to("/?error=locked").into_response();
+            return locked_redirect(until).into_response();
         }
         entry.failures = 0;
         entry.locked_until = None
@@ -233,12 +233,20 @@ async fn signin(State(a): State<App>, Form(f): Form<Credentials>) -> Response {
             });
             e.failures += 1;
             if e.failures >= 5 {
-                e.locked_until = Some(Instant::now() + Duration::from_secs(300));
-                return Redirect::to("/?error=locked").into_response();
+                let until = Instant::now() + Duration::from_secs(300);
+                e.locked_until = Some(until);
+                return locked_redirect(until).into_response();
             }
             Redirect::to("/?error=wrong").into_response()
         }
     }
+}
+fn locked_redirect(until: Instant) -> Redirect {
+    let seconds = until
+        .saturating_duration_since(Instant::now())
+        .as_secs()
+        .max(1);
+    Redirect::to(&format!("/?error=locked&seconds={seconds}"))
 }
 async fn signout(State(a): State<App>, h: HeaderMap) -> Response {
     if let Some(t) = cookie(&h) {
@@ -394,10 +402,15 @@ mod tests {
             .await;
             assert_eq!(response.status(), StatusCode::SEE_OTHER);
             if attempt == 5 {
-                assert_eq!(
-                    response.headers().get(header::LOCATION).unwrap(),
-                    "/?error=locked"
-                );
+                let location = response
+                    .headers()
+                    .get(header::LOCATION)
+                    .unwrap()
+                    .to_str()
+                    .unwrap();
+                assert!(location.starts_with("/?error=locked&seconds="));
+                let seconds: u64 = location.rsplit('=').next().unwrap().parse().unwrap();
+                assert!((299..=300).contains(&seconds));
             }
         }
         let locked = call(
@@ -409,10 +422,15 @@ mod tests {
         )
         .await;
         assert_eq!(locked.status(), StatusCode::SEE_OTHER);
-        assert_eq!(
-            locked.headers().get(header::LOCATION).unwrap(),
-            "/?error=locked"
-        );
+        let location = locked
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(location.starts_with("/?error=locked&seconds="));
+        let seconds: u64 = location.rsplit('=').next().unwrap().parse().unwrap();
+        assert!((1..=300).contains(&seconds));
 
         let admin = call(
             &app,

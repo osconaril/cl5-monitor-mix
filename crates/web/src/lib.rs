@@ -31,7 +31,9 @@ enum Screen {
 #[function_component(App)]
 pub fn app() -> Html {
     let screen = use_state(|| Screen::Loading);
-    let notice = error_notice();
+    let notice = web_sys::window()
+        .and_then(|window| window.location().search().ok())
+        .and_then(|search| error_notice(&search));
     {
         let screen = screen.clone();
         use_effect_with((), move |_| {
@@ -90,15 +92,32 @@ pub fn app() -> Html {
     }
 }
 
-fn error_notice() -> Option<&'static str> {
-    let search = web_sys::window()?.location().search().ok()?;
+fn error_notice(search: &str) -> Option<String> {
     if search.contains("error=locked") {
-        Some("This name is locked. Try again in 5 minutes.")
+        let seconds = search
+            .split('&')
+            .find_map(|part| part.strip_prefix("seconds=")?.parse::<u64>().ok())?;
+        Some(format!(
+            "This name is locked. Try again in {seconds} seconds."
+        ))
     } else if search.contains("error=wrong") {
-        Some("Wrong passcode. Check the 4 digits and try again.")
+        Some("Wrong passcode. Check the 4 digits and try again.".into())
     } else if search.contains("error=setup") {
-        Some("The first admin could not be created. Check the details and try again.")
+        Some("The first admin could not be created. Check the details and try again.".into())
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::error_notice;
+
+    #[test]
+    fn lockout_notice_uses_the_server_reported_time_left() {
+        assert_eq!(
+            error_notice("?error=locked&seconds=137"),
+            Some("This name is locked. Try again in 137 seconds.".into())
+        );
     }
 }
