@@ -9,3 +9,8 @@ publish.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+gloo-net = "0.6"
+serde.workspace = true
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Location", "Window"] }
+yew = { version = "0.21", features = ["csr"] }
