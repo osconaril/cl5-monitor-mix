@@ -3,13 +3,14 @@ resolver = "2"
 members = ["crates/server", "crates/web", "crates/fake-console"]
 
 [workspace.dependencies]
-axum = { version = "0.8", features = ["form"] }
+axum = { version = "0.8", features = ["form", "ws"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 local-ip-address = "0.6.13"
 rand = "0.9"
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+serde_json = "1"
+tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "net", "sync", "time"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["fs"] }
 
