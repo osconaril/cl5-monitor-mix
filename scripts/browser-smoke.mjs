@@ -34,7 +34,7 @@ try {
   const ws = new WebSocket(target.webSocketDebuggerUrl);
   await new Promise((resolve, reject) => { ws.addEventListener('open', resolve, { once: true }); ws.addEventListener('error', reject, { once: true }); });
   await command(ws, 'Page.enable');
-  await command(ws, 'Runtime.evaluate', { expression: "fetch('/setup', {method: 'POST', headers: {'content-type': 'application/x-www-form-urlencoded'}, body: 'name=Browser&passcode=1234'}).then(() => location.assign('/'))", awaitPromise: true });
+  await command(ws, 'Runtime.evaluate', { expression: "fetch('/setup', {method: 'POST', headers: {'content-type': 'application/x-www-form-urlencoded'}, body: 'name=Browser&passcode=1234'}).then(() => fetch('/signout', {method: 'POST'})).then(() => location.assign('/'))", awaitPromise: true });
   await sleep(200);
   for (const [width, height] of [[390, 844], [844, 390]]) {
     await command(ws, 'Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: true });
@@ -42,8 +42,12 @@ try {
     await sleep(200);
     const result = await command(ws, 'Runtime.evaluate', { expression: 'JSON.stringify({scroll: Math.max(document.documentElement.scrollWidth, document.body.scrollWidth), width: innerWidth, buttons: [...document.querySelectorAll("button")].map(b => b.getBoundingClientRect().height), text: document.body.innerText})', returnByValue: true });
     const page = JSON.parse(result.result.value);
-    if (page.scroll > page.width || page.buttons.some(height => height < 44) || !page.text.includes('Welcome, Browser')) throw new Error(`Phone layout or session persistence failed at ${width}x${height}: ${JSON.stringify(page)}`);
+    if (page.scroll > page.width || page.buttons.some(height => height < 44) || !page.text.includes('Sign in')) throw new Error(`Sign-in phone layout failed at ${width}x${height}: ${JSON.stringify(page)}`);
   }
+  await command(ws, 'Runtime.evaluate', { expression: "fetch('/signin', {method: 'POST', headers: {'content-type': 'application/x-www-form-urlencoded'}, body: 'name=Browser&passcode=1234'}).then(() => location.assign('/'))", awaitPromise: true });
+  await sleep(200);
+  const signedIn = await command(ws, 'Runtime.evaluate', { expression: 'document.body.innerText', returnByValue: true });
+  if (!signedIn.result.value.includes('Welcome, Browser')) throw new Error('Sign-in did not preserve the browser session.');
   ws.close();
   console.log('Browser smoke passed at 390x844 and 844x390.');
 } finally {

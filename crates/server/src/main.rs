@@ -51,7 +51,10 @@ async fn main() {
         .expect("CL5_LISTEN must be host:port");
     let app = App::open(&path).expect("open SQLite database");
     if !app.has_admin().expect("read users") {
-        println!("First-run setup: http://{address}/setup");
+        println!(
+            "First-run setup: open http://<this-show-machine's-LAN-IP>:{} /setup from the stage network.",
+            address.port()
+        );
     }
     let listener = tokio::net::TcpListener::bind(address)
         .await
@@ -95,10 +98,38 @@ impl App {
             |r| r.get::<_, i64>(0),
         )? != 0)
     }
+    #[cfg(test)]
     fn add_user(&self, n: &str, p: &str, role: &str) -> Result<(), String> {
         valid(n, p)?;
         let now = Utc::now().to_rfc3339();
         self.db.lock().unwrap().execute("INSERT INTO users(name,passcode,role,created_at,updated_at) VALUES(?1,?2,?3,?4,?4)",params![n.trim(),p,role,now]).map(|_|()).map_err(|_|"That name is already in use.".into())
+    }
+    fn add_first_admin(&self, n: &str, p: &str) -> Result<(), String> {
+        valid(n, p)?;
+        let mut connection = self.db.lock().unwrap();
+        let transaction = connection
+            .transaction()
+            .map_err(|_| "Could not create the first admin. Try again.".to_string())?;
+        let has_admin: i64 = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM users WHERE role='admin')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|_| "Could not create the first admin. Try again.".to_string())?;
+        if has_admin != 0 {
+            return Err("An administrator already exists. Sign in instead.".into());
+        }
+        let now = Utc::now().to_rfc3339();
+        transaction
+            .execute(
+                "INSERT INTO users(name,passcode,role,created_at,updated_at) VALUES(?1,?2,'admin',?3,?3)",
+                params![n.trim(), p, now],
+            )
+            .map_err(|_| "That name is already in use. Try another name.".to_string())?;
+        transaction
+            .commit()
+            .map_err(|_| "Could not create the first admin. Try again.".to_string())
     }
     fn user(&self, n: &str, p: &str) -> rusqlite::Result<Option<User>> {
         self.db
@@ -173,10 +204,7 @@ async fn setup_page(State(a): State<App>) -> Response {
     }
 }
 async fn setup(State(a): State<App>, Form(f): Form<Credentials>) -> Response {
-    if a.has_admin().unwrap_or(true) {
-        return Redirect::to("/").into_response();
-    }
-    match a.add_user(&f.name, &f.passcode, "admin") {
+    match a.add_first_admin(&f.name, &f.passcode) {
         Ok(()) => login(&a, a.user(&f.name, &f.passcode).unwrap().unwrap()),
         Err(e) => page(
             "First setup",
@@ -352,6 +380,22 @@ mod tests {
 
         let again = call(&app, Request::get("/setup").body(Body::empty()).unwrap()).await;
         assert_eq!(again.status(), StatusCode::SEE_OTHER);
+    }
+
+    #[test]
+    fn first_admin_creation_is_atomic() {
+        let app = App::memory().unwrap();
+        assert!(app.add_first_admin("Corey", "1234").is_ok());
+        assert!(app.add_first_admin("Second", "5678").is_err());
+        let count: i64 = app
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM users WHERE role='admin'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[tokio::test]
