@@ -108,6 +108,17 @@ impl FakeConsole {
         let _ = self.notifications.send("__FAKE_DROP__".into());
     }
 
+    /// Test-only stand-in for an engineer recalling a scene on the desk.
+    /// Phones never receive a scene-recall command path.
+    pub async fn recall_scene(&self, number: u16) -> Result<(), &'static str> {
+        if self.state.lock().await.scenes.contains_key(&number) {
+            let _ = self.recall(number).await;
+            Ok(())
+        } else {
+            Err("scene not found")
+        }
+    }
+
     /// Test-only connection accounting lets the bridge prove that browsers do
     /// not fan out into one console connection apiece.
     pub async fn total_connections(&self) -> usize {

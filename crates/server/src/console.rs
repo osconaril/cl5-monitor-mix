@@ -51,6 +51,22 @@ pub struct ConsoleBridge {
 }
 
 impl ConsoleBridge {
+    /// A bridge used before the server's TCP worker has been configured.  It
+    /// remains safely disconnected, so a route can never accidentally accept
+    /// a phone command without a real console connection.
+    pub fn offline() -> Self {
+        let state = Arc::new(RwLock::new(ConsoleState::default()));
+        let (_connected_tx, connected) = watch::channel(false);
+        let (events, _) = broadcast::channel(512);
+        let (writes, _receiver) = mpsc::channel(1);
+        Self {
+            state,
+            connected,
+            events,
+            writes,
+        }
+    }
+
     pub fn start(address: impl Into<String>) -> Self {
         let state = Arc::new(RwLock::new(ConsoleState::default()));
         let (connected_tx, connected) = watch::channel(false);
@@ -391,5 +407,68 @@ mod tests {
             }
         }).await.expect("latest coalesced write reaches the fake console");
         assert_eq!(fake.total_connections().await, 1);
+    }
+
+    #[tokio::test]
+    async fn fifty_browser_subscribers_share_one_bridge_and_receive_console_changes() {
+        let fake = Arc::new(FakeConsole::new());
+        let address = fake.clone().listen("127.0.0.1:0").await.unwrap();
+        let bridge = ConsoleBridge::start(address.to_string());
+        ready(&bridge).await;
+        let mut browsers: Vec<_> = (0..50).map(|_| bridge.subscribe()).collect();
+        bridge.change(level("-3")).await.unwrap();
+        for browser in &mut browsers {
+            timeout(Duration::from_millis(200), async {
+                loop {
+                    if matches!(browser.recv().await, Ok(BridgeEvent::Value { value, .. }) if value == "-3") {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("each browser receives the shared bridge update");
+        }
+        assert_eq!(fake.total_connections().await, 1);
+    }
+
+    #[tokio::test]
+    async fn recall_rehydrates_and_a_dropped_connection_reconnects() {
+        let fake = Arc::new(FakeConsole::new());
+        let address = fake.clone().listen("127.0.0.1:0").await.unwrap();
+        let bridge = ConsoleBridge::start(address.to_string());
+        ready(&bridge).await;
+        let mut events = bridge.subscribe();
+        fake.recall_scene(2).await.unwrap();
+        timeout(Duration::from_secs(30), async {
+            loop {
+                if matches!(events.recv().await, Ok(BridgeEvent::SceneRecalled { number: 2, name: Some(name) }) if name == "Show") {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("scene recall reaches every subscriber");
+        timeout(Duration::from_secs(30), async {
+            loop {
+                if bridge.state().await.scene_number == Some(2) && bridge.is_connected() {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("recall rehydrates before writes resume");
+
+        fake.drop_connections();
+        timeout(Duration::from_secs(30), async {
+            loop {
+                if fake.total_connections().await >= 2 && bridge.is_connected() {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("bridge reconnects after a console drop");
     }
 }

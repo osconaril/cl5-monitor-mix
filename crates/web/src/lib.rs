@@ -2,7 +2,9 @@
 
 use gloo_net::http::Request;
 use serde::Deserialize;
+use wasm_bindgen::{closure::Closure, JsCast};
 use wasm_bindgen_futures::spawn_local;
+use web_sys::{MessageEvent, WebSocket};
 use yew::prelude::*;
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -16,6 +18,21 @@ struct Bootstrap {
     has_admin: bool,
     user: Option<User>,
     users: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum BridgeMessage {
+    Snapshot { kind: String, connected: bool },
+    Event(BridgeEvent),
+}
+
+#[derive(Debug, Deserialize)]
+enum BridgeEvent {
+    Connected,
+    Disconnected,
+    Value { key: String, value: String },
+    SceneRecalled { number: u16, name: Option<String> },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -91,10 +108,74 @@ pub fn app() -> Html {
             <>
                 <h1>{format!("Welcome, {}", user.name)}</h1>
                 <p>{format!("Signed in as {}.", user.role)}</p>
+                <LiveConsole />
                 <form method="post" action="/signout"><button>{"Sign out"}</button></form>
             </>
         },
     }
+}
+
+/// Keeps every already-open screen subscribed to the server-owned bridge.
+/// Mix controls are deliberately left to CL5-6; this card supplies the shared
+/// connection, state notifications, and operator-visible safety notices.
+#[function_component(LiveConsole)]
+fn live_console() -> Html {
+    let notice = use_state(|| "Connecting to console…".to_owned());
+    {
+        let notice = notice.clone();
+        use_effect_with((), move |_| -> Box<dyn FnOnce()> {
+            let Some(window) = web_sys::window() else {
+                return Box::new(|| ());
+            };
+            let location = window.location();
+            let protocol = match location.protocol().ok().as_deref() {
+                Some("https:") => "wss:",
+                _ => "ws:",
+            };
+            let Ok(host) = location.host() else {
+                return Box::new(|| ());
+            };
+            let Ok(socket) = WebSocket::new(&format!("{protocol}//{host}/api/console")) else {
+                notice.set("Console disconnected — reconnecting".into());
+                return Box::new(|| ());
+            };
+            let message_notice = notice.clone();
+            let callback = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+                let Some(text) = event.data().as_string() else {
+                    return;
+                };
+                match serde_json::from_str::<BridgeMessage>(&text) {
+                    Ok(BridgeMessage::Snapshot { kind, connected })
+                        if kind == "snapshot" && connected =>
+                    {
+                        message_notice.set("Console connected".into());
+                    }
+                    Ok(BridgeMessage::Snapshot { .. })
+                    | Ok(BridgeMessage::Event(BridgeEvent::Disconnected)) => {
+                        message_notice.set("Console disconnected — reconnecting".into());
+                    }
+                    Ok(BridgeMessage::Event(BridgeEvent::Connected)) => {
+                        message_notice.set("Console connected".into());
+                    }
+                    Ok(BridgeMessage::Event(BridgeEvent::SceneRecalled { number, name })) => {
+                        let name = name.unwrap_or_else(|| "Unnamed".into());
+                        message_notice.set(format!("Scene {number} {name} recalled — mix updated"));
+                    }
+                    Ok(BridgeMessage::Event(BridgeEvent::Value { key, value })) => {
+                        let _ = (key, value); // CL5-6 renders the shared live values as controls.
+                    }
+                    _ => {}
+                }
+            });
+            socket.set_onmessage(Some(callback.as_ref().unchecked_ref()));
+            Box::new(move || {
+                socket.set_onmessage(None);
+                let _ = socket.close();
+                drop(callback);
+            })
+        });
+    }
+    html! { <p role="status">{(*notice).clone()}</p> }
 }
 
 fn error_notice(search: &str) -> Option<String> {
