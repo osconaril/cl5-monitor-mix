@@ -26,5 +26,6 @@
     "typecheck": "cargo check --workspace --all-targets",
     "lint": "cargo clippy --workspace --all-targets -- -D warnings",
     "tests": ["cargo test --workspace", "cargo check -p cl5-web --target wasm32-unknown-unknown"]
-  }
+  },
+  "slack": { "workspace": "lead2client", "channel": "C0CE31KNJ5R" }
 }
