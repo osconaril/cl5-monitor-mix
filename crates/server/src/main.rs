@@ -63,7 +63,9 @@ async fn main() {
         .expect("CL5_LISTEN must be host:port");
     let app = App::open(&path).expect("open SQLite database");
     if !app.has_admin().expect("read users") {
-        println!("{}", setup_instruction(address.port()));
+        let lan_address =
+            local_ip_address::local_ip().expect("find a reachable LAN address for first-run setup");
+        println!("{}", setup_instruction(lan_address, address.port()));
     }
     let listener = tokio::net::TcpListener::bind(address)
         .await
@@ -73,10 +75,8 @@ async fn main() {
         .await
         .expect("serve HTTP");
 }
-fn setup_instruction(port: u16) -> String {
-    format!(
-        "First-run setup: open http://<this-show-machine's-LAN-IP>:{port}/setup from the stage network."
-    )
+fn setup_instruction(lan_address: std::net::IpAddr, port: u16) -> String {
+    format!("First-run setup: open http://{lan_address}:{port}/setup from the stage network.")
 }
 fn routes(app: App) -> Router {
     Router::new()
@@ -353,8 +353,8 @@ mod tests {
     #[test]
     fn first_run_instruction_is_a_complete_lan_url() {
         assert_eq!(
-            setup_instruction(8080),
-            "First-run setup: open http://<this-show-machine's-LAN-IP>:8080/setup from the stage network."
+            setup_instruction("192.168.1.42".parse().unwrap(), 8080),
+            "First-run setup: open http://192.168.1.42:8080/setup from the stage network."
         );
     }
 
