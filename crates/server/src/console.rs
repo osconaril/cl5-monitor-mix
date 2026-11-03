@@ -246,25 +246,20 @@ async fn apply_line(
         .strip_prefix("NOTIFY ")
         .or_else(|| line.strip_prefix("OK "))
         .unwrap_or(line);
-    let words: Vec<_> = text.split_whitespace().collect();
-    let set = if matches!(words.first(), Some(&"set" | &"get")) {
-        Some(&words[1..])
-    } else {
-        None
-    };
-    if let Some([path, first, second, value]) = set {
+    if let Some((path, first, second, value)) = value_reply(text) {
         let key = format!("{path} {first} {second}");
         state
             .write()
             .await
             .values
-            .insert(key.clone(), (*value).to_owned());
+            .insert(key.clone(), value.to_owned());
         let _ = events.send(BridgeEvent::Value {
             key,
-            value: (*value).to_owned(),
+            value: value.to_owned(),
         });
         return;
     }
+    let words: Vec<_> = text.split_whitespace().collect();
     if words.len() >= 3 && words[0] == "sscurrent_ex" && words[1] == SCENE {
         if let Ok(number) = words[2].parse() {
             state.write().await.scene_number = Some(number);
@@ -285,6 +280,27 @@ async fn apply_line(
             });
         }
     }
+}
+
+/// Parses an RCP get/set reply while preserving the complete wire value.  Label
+/// values are quoted and may contain spaces, so treating the reply as exactly
+/// five whitespace-delimited words would silently discard them.
+fn value_reply(text: &str) -> Option<(&str, &str, &str, &str)> {
+    fn next_word(text: &str) -> Option<(&str, &str)> {
+        let text = text.trim_start();
+        let end = text.find(char::is_whitespace).unwrap_or(text.len());
+        (!text[..end].is_empty()).then_some((&text[..end], &text[end..]))
+    }
+
+    let (operation, text) = next_word(text)?;
+    if !matches!(operation, "set" | "get") {
+        return None;
+    }
+    let (path, text) = next_word(text)?;
+    let (first, text) = next_word(text)?;
+    let (second, value) = next_word(text)?;
+    let value = value.trim_start();
+    (!value.is_empty()).then_some((path, first, second, value))
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -346,6 +362,10 @@ mod tests {
     use fake_console::FakeConsole;
     use std::sync::Arc;
     use tokio::time::{sleep, timeout};
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+        net::TcpStream,
+    };
 
     fn level(value: &str) -> PhoneChange {
         PhoneChange {
@@ -438,6 +458,49 @@ mod tests {
             .expect("each browser receives the shared bridge update");
         }
         assert_eq!(fake.total_connections().await, 1);
+    }
+
+    #[tokio::test]
+    async fn quoted_multi_word_labels_hydrate_and_notify_the_bridge() {
+        let fake = Arc::new(FakeConsole::new());
+        let address = fake.clone().listen("127.0.0.1:0").await.unwrap();
+        let key = format!("{INPUT_NAME} 0 0");
+
+        let engineer = TcpStream::connect(address).await.unwrap();
+        let mut engineer = BufReader::new(engineer);
+        engineer
+            .get_mut()
+            .write_all(format!("set {INPUT_NAME} 0 0 \"Lead Vocal\"\n").as_bytes())
+            .await
+            .unwrap();
+        let mut response = String::new();
+        engineer.read_line(&mut response).await.unwrap();
+        assert_eq!(response.trim(), "OK");
+        drop(engineer);
+
+        let bridge = ConsoleBridge::start(address.to_string());
+        ready(&bridge).await;
+        assert_eq!(
+            bridge.state().await.values.get(&key),
+            Some(&"\"Lead Vocal\"".to_owned()),
+            "hydration retains the complete quoted label"
+        );
+
+        let mut events = bridge.subscribe();
+        let mut engineer = TcpStream::connect(address).await.unwrap();
+        engineer
+            .write_all(format!("set {INPUT_NAME} 0 0 \"Lead Guitar\"\n").as_bytes())
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(events.recv().await, Ok(BridgeEvent::Value { key: event_key, value }) if event_key == key && value == "\"Lead Guitar\"") {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("a quoted multi-word label reaches bridge subscribers");
     }
 
     #[tokio::test]
