@@ -15,13 +15,14 @@ struct User {
 struct Bootstrap {
     has_admin: bool,
     user: Option<User>,
+    users: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 enum Screen {
     Loading,
     Setup,
-    SignIn,
+    SignIn(Vec<String>),
     SignedIn(User),
     Unavailable,
 }
@@ -44,7 +45,7 @@ pub fn app() -> Html {
                 }
                 .map(|bootstrap| match bootstrap.user {
                     Some(user) => Screen::SignedIn(user),
-                    None if bootstrap.has_admin => Screen::SignIn,
+                    None if bootstrap.has_admin => Screen::SignIn(bootstrap.users),
                     None => Screen::Setup,
                 })
                 .unwrap_or(Screen::Unavailable);
@@ -71,12 +72,16 @@ pub fn app() -> Html {
                 </form>
             </>
         },
-        Screen::SignIn => html! {
+        Screen::SignIn(users) => html! {
             <>
                 <h1>{"Monitor Mix"}</h1>
                 {notice.map(|text| html! { <p role="alert">{text}</p> }).unwrap_or_default()}
                 <form method="post" action="/signin">
-                    <label>{"Name"}<input name="name" required=true /></label>
+                    <label>{"Name"}<input name="name" list="existing-user-names" required=true /></label>
+                    <datalist id="existing-user-names">
+                        {for users.iter().map(|name| html! { <option value={name.clone()} /> })}
+                    </datalist>
+                    <p>{"Choose a saved name from the list or type your name."}</p>
                     <label>{"4-digit passcode"}<input name="passcode" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" required=true /></label>
                     <button>{"Sign in"}</button>
                 </form>

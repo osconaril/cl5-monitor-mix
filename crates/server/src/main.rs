@@ -38,6 +38,7 @@ struct User {
 struct Bootstrap {
     has_admin: bool,
     user: Option<BootstrapUser>,
+    users: Vec<String>,
 }
 #[derive(Serialize)]
 struct BootstrapUser {
@@ -164,6 +165,13 @@ impl App {
             )
             .optional()
     }
+    fn user_names(&self) -> rusqlite::Result<Vec<String>> {
+        let connection = self.db.lock().unwrap();
+        let mut statement =
+            connection.prepare("SELECT name FROM users ORDER BY name COLLATE NOCASE")?;
+        let names = statement.query_map([], |row| row.get(0))?.collect();
+        names
+    }
 }
 fn migrate(c: &mut Connection) -> rusqlite::Result<()> {
     c.execute_batch(
@@ -220,6 +228,7 @@ async fn bootstrap(State(a): State<App>, headers: HeaderMap) -> Json<Bootstrap> 
     Json(Bootstrap {
         has_admin: a.has_admin().unwrap_or(true),
         user,
+        users: a.user_names().unwrap_or_default(),
     })
 }
 async fn setup(State(a): State<App>, Form(f): Form<Credentials>) -> Response {
@@ -644,5 +653,22 @@ mod tests {
         );
         let body = response_text(home).await;
         assert!(body.contains("<svg onload=alert(1)>"));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_offers_existing_names_for_sign_in() {
+        let app = App::memory().unwrap();
+        app.add_user("Zoe", "1234", "performer").unwrap();
+        app.add_user("Alex", "5678", "performer").unwrap();
+
+        let response = call(
+            &app,
+            Request::get("/api/bootstrap").body(Body::empty()).unwrap(),
+        )
+        .await;
+
+        assert!(response_text(response)
+            .await
+            .contains("\"users\":[\"Alex\",\"Zoe\"]"));
     }
 }
