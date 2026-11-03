@@ -69,6 +69,10 @@ struct ConsoleStatus {
     phones_connected: usize,
 }
 #[derive(Serialize)]
+struct PerformerMixes {
+    mixes: Vec<String>,
+}
+#[derive(Serialize)]
 struct BootstrapUser {
     name: String,
     role: String,
@@ -94,7 +98,8 @@ struct Passcode {
 }
 #[derive(Deserialize)]
 struct Mixes {
-    mixes: String,
+    #[serde(default)]
+    mixes: Vec<String>,
 }
 
 #[tokio::main]
@@ -132,6 +137,7 @@ fn routes(app: App) -> Router {
         .route("/api/admin/users", post(create_user))
         .route("/api/admin/users/{name}/passcode", post(reset_passcode))
         .route("/api/admin/users/{name}/mixes", post(assign_mixes))
+        .route("/api/performer/mixes", get(performer_mixes))
         .route(
             "/api/admin/users/{name}",
             post(delete_user).delete(delete_user),
@@ -278,6 +284,14 @@ impl App {
         )?;
         Ok(())
     }
+    fn user_mixes(&self, name: &str) -> rusqlite::Result<Vec<String>> {
+        let c = self.db.lock().unwrap();
+        let mixes = c
+            .prepare("SELECT mix_name FROM user_mixes WHERE user_name=?1 ORDER BY mix_name")?
+            .query_map([name], |row| row.get(0))?
+            .collect();
+        mixes
+    }
     fn create_user(&self, actor: &str, f: &NewUser) -> Result<String, String> {
         let passcode = if f.passcode == "Generate" {
             generate_passcode()
@@ -350,7 +364,7 @@ impl App {
         self.audit(actor, &format!("Deleted {name} and their saved settings"))
             .map_err(|_| "Could not save history.".to_string())
     }
-    fn assign_mixes(&self, actor: &str, name: &str, mixes: &str) -> Result<(), String> {
+    fn assign_mixes(&self, actor: &str, name: &str, mixes: &[String]) -> Result<(), String> {
         let c = self.db.lock().unwrap();
         if c.query_row(
             "SELECT EXISTS(SELECT 1 FROM users WHERE name=?1)",
@@ -367,7 +381,7 @@ impl App {
             .map_err(|_| "Could not save mix assignments.".to_string())?;
         tx.execute("DELETE FROM user_mixes WHERE user_name=?1", [name])
             .map_err(|_| "Could not save mix assignments.".to_string())?;
-        for mix in mixes.split(',').map(str::trim).filter(|m| !m.is_empty()) {
+        for mix in canonical_mix_numbers(mixes)? {
             tx.execute(
                 "INSERT INTO user_mixes(user_name,mix_name) VALUES(?1,?2)",
                 params![name, mix],
@@ -380,6 +394,23 @@ impl App {
         self.audit(actor, &format!("Changed mix assignments for {name}"))
             .map_err(|_| "Could not save history.".to_string())
     }
+}
+fn canonical_mix_numbers(mixes: &[String]) -> Result<Vec<String>, String> {
+    let mut result = Vec::new();
+    for value in mixes {
+        let number = value
+            .trim()
+            .parse::<u8>()
+            .map_err(|_| "Choose mix numbers from 1 through 24.".to_string())?;
+        if !(1..=24).contains(&number) {
+            return Err("Choose mix numbers from 1 through 24.".into());
+        }
+        let mix = format!("Mix {number}");
+        if !result.contains(&mix) {
+            result.push(mix);
+        }
+    }
+    Ok(result)
 }
 fn migrate(c: &mut Connection) -> rusqlite::Result<()> {
     c.execute_batch(
@@ -574,6 +605,19 @@ async fn assign_mixes(
     match a.assign_mixes(&actor.name, &name, &f.mixes) {
         Ok(()) => Redirect::to("/").into_response(),
         Err(message) => (StatusCode::BAD_REQUEST, message).into_response(),
+    }
+}
+async fn performer_mixes(State(a): State<App>, h: HeaderMap) -> Response {
+    match session(&a, &h) {
+        Some(user) => match a.user_mixes(&user.name) {
+            Ok(mixes) => Json(PerformerMixes { mixes }).into_response(),
+            Err(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not load mix assignments.",
+            )
+                .into_response(),
+        },
+        None => (StatusCode::UNAUTHORIZED, "Sign in first.").into_response(),
     }
 }
 async fn delete_user(State(a): State<App>, h: HeaderMap, Path(name): Path<String>) -> Response {
@@ -997,7 +1041,8 @@ mod tests {
             )
             .unwrap_err()
             .contains("already"));
-        app.assign_mixes("Corey", "Sam", "Mix 1, Mix 2").unwrap();
+        app.assign_mixes("Corey", "Sam", &["1".into(), "2".into()])
+            .unwrap();
         let login_response = login(&app, app.user("Sam", &created).unwrap().unwrap());
         let cookie = login_response
             .headers()
@@ -1027,6 +1072,7 @@ mod tests {
             .find(|user| user.name == "Sam")
             .unwrap();
         assert_eq!(sam.mixes, ["Mix 1", "Mix 2"]);
+        assert!(app.assign_mixes("Corey", "Sam", &["25".into()]).is_err());
         assert!(overview
             .history
             .iter()

@@ -1,6 +1,7 @@
 //! CL5 Monitor Mix's browser client, compiled to WebAssembly by Trunk.
 
 use gloo_net::http::Request;
+use gloo_timers::callback::Interval;
 use serde::Deserialize;
 use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
@@ -44,6 +45,18 @@ struct AdminOverview {
     users: Vec<AdminUser>,
     history: Vec<HistoryRow>,
     console: ConsoleStatus,
+}
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+struct PerformerMixes {
+    mixes: Vec<String>,
+}
+
+fn refresh_performer_mixes(mixes: UseStateHandle<Option<PerformerMixes>>) {
+    spawn_local(async move {
+        if let Ok(response) = Request::get("/api/performer/mixes").send().await {
+            mixes.set(response.json::<PerformerMixes>().await.ok());
+        }
+    });
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -119,10 +132,34 @@ pub fn app() -> Html {
             if user.role == "admin" {
                 html! { <AdminPortal user={user.clone()} /> }
             } else {
-                html! { <><h1>{format!("Welcome, {}", user.name)}</h1><p>{"Your assigned mixes appear here when the performer screen is installed."}</p><form method="post" action="/signout"><button>{"Sign out"}</button></form></> }
+                html! { <PerformerAssignments user={user.clone()} /> }
             }
         }
     }
+}
+
+#[derive(Properties, PartialEq)]
+struct PerformerAssignmentsProps {
+    user: User,
+}
+
+#[function_component(PerformerAssignments)]
+fn performer_assignments(props: &PerformerAssignmentsProps) -> Html {
+    let mixes = use_state(|| None::<PerformerMixes>);
+    {
+        let mixes = mixes.clone();
+        use_effect_with((), move |_| {
+            refresh_performer_mixes(mixes.clone());
+            let interval = Interval::new(1_000, move || refresh_performer_mixes(mixes.clone()));
+            move || drop(interval)
+        });
+    }
+    let assignment = match &*mixes {
+        Some(value) if value.mixes.is_empty() => "No mixes assigned yet.".into(),
+        Some(value) => format!("Assigned mix numbers: {}", value.mixes.join(", ")),
+        None => "Loading your mix assignments…".into(),
+    };
+    html! { <><h1>{format!("Welcome, {}", props.user.name)}</h1><p>{assignment}</p><p>{"Assignments update automatically."}</p><form method="post" action="/signout"><button>{"Sign out"}</button></form></> }
 }
 
 #[derive(Properties, PartialEq)]
@@ -175,7 +212,7 @@ fn user_card(user: &AdminUser) -> Html {
     } else {
         user.mixes.join(", ")
     };
-    html! { <article class="user-card"><h3>{&user.name}</h3><p>{format!("{} · code {}", user.role, user.passcode)}</p><p>{format!("Mixes: {mixes}")}</p><p>{format!("Last sign-in: {}", user.last_sign_in.as_deref().unwrap_or("Never"))}</p><form method="post" action={format!("/api/admin/users/{encoded}/passcode")}><label>{"New passcode"}<input name="passcode" value="Generate" pattern="([0-9]{4}|Generate)" required=true /></label><button>{"Reset passcode"}</button></form><form method="post" action={format!("/api/admin/users/{encoded}/mixes")}><label>{"Mix names (comma-separated)"}<input name="mixes" value={user.mixes.join(", ")} /></label><button>{"Save mix assignments"}</button></form><form method="post" action={format!("/api/admin/users/{encoded}")}><p class="delete-note">{format!("Delete {}? Their saved settings go too.", user.name)}</p><button>{"Delete user"}</button></form></article> }
+    html! { <article class="user-card"><h3>{&user.name}</h3><p>{format!("{} · code {}", user.role, user.passcode)}</p><p>{format!("Mixes: {mixes}")}</p><p>{format!("Last sign-in: {}", user.last_sign_in.as_deref().unwrap_or("Never"))}</p><form method="post" action={format!("/api/admin/users/{encoded}/passcode")}><label>{"New passcode"}<input name="passcode" value="Generate" pattern="([0-9]{4}|Generate)" required=true /></label><button>{"Reset passcode"}</button></form><form method="post" action={format!("/api/admin/users/{encoded}/mixes")}><fieldset><legend>{"Mix numbers"}</legend>{for (1..=24).map(|number| { let selected = user.mixes.contains(&format!("Mix {number}")); html! { <label class="mix-choice"><input type="checkbox" name="mixes" value={number.to_string()} checked={selected} />{format!("Mix {number}")}</label> } })}</fieldset><button>{"Save mix assignments"}</button></form><form method="post" action={format!("/api/admin/users/{encoded}")}><p class="delete-note">{format!("Delete {}? Their saved settings go too.", user.name)}</p><button>{"Delete user"}</button></form></article> }
 }
 
 fn document_title(window: &web_sys::Window, title: &str) {
