@@ -1,6 +1,6 @@
 //! Offline LAN sign-in server. Console control is intentionally a later card.
 use axum::{
-    extract::{Form, State},
+    extract::{Form, Path, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -41,6 +41,34 @@ struct Bootstrap {
     users: Vec<String>,
 }
 #[derive(Serialize)]
+struct AdminOverview {
+    users: Vec<AdminUser>,
+    history: Vec<HistoryRow>,
+    console: ConsoleStatus,
+}
+#[derive(Serialize)]
+struct AdminUser {
+    name: String,
+    role: String,
+    passcode: String,
+    mixes: Vec<String>,
+    last_sign_in: Option<String>,
+}
+#[derive(Serialize)]
+struct HistoryRow {
+    who: String,
+    what: String,
+    when: String,
+}
+#[derive(Serialize)]
+struct ConsoleStatus {
+    connected: bool,
+    address: String,
+    scene_number: Option<u16>,
+    scene_name: Option<String>,
+    phones_connected: usize,
+}
+#[derive(Serialize)]
 struct BootstrapUser {
     name: String,
     role: String,
@@ -53,6 +81,20 @@ struct Attempt {
 struct Credentials {
     name: String,
     passcode: String,
+}
+#[derive(Deserialize)]
+struct NewUser {
+    name: String,
+    role: String,
+    passcode: String,
+}
+#[derive(Deserialize)]
+struct Passcode {
+    passcode: String,
+}
+#[derive(Deserialize)]
+struct Mixes {
+    mixes: String,
 }
 
 #[tokio::main]
@@ -86,6 +128,14 @@ fn routes(app: App) -> Router {
         .route("/signin", post(signin))
         .route("/signout", post(signout))
         .route("/api/admin/ping", get(admin_ping))
+        .route("/api/admin/overview", get(admin_overview))
+        .route("/api/admin/users", post(create_user))
+        .route("/api/admin/users/{name}/passcode", post(reset_passcode))
+        .route("/api/admin/users/{name}/mixes", post(assign_mixes))
+        .route(
+            "/api/admin/users/{name}",
+            post(delete_user).delete(delete_user),
+        )
         .route("/api/bootstrap", get(bootstrap))
         .with_state(app)
         .fallback_service(ServeDir::new(web_dist()))
@@ -172,6 +222,164 @@ impl App {
         let names = statement.query_map([], |row| row.get(0))?.collect();
         names
     }
+    fn admin_overview(&self) -> rusqlite::Result<AdminOverview> {
+        let c = self.db.lock().unwrap();
+        let mut statement = c.prepare(
+            "SELECT name, role, passcode, last_sign_in FROM users ORDER BY name COLLATE NOCASE",
+        )?;
+        let users = statement
+            .query_map([], |r| {
+                let name: String = r.get(0)?;
+                let mixes = c
+                    .prepare(
+                        "SELECT mix_name FROM user_mixes WHERE user_name=?1 ORDER BY mix_name",
+                    )?
+                    .query_map([&name], |m| m.get(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()?;
+                Ok(AdminUser {
+                    name,
+                    role: r.get(1)?,
+                    passcode: r.get(2)?,
+                    mixes,
+                    last_sign_in: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut history_statement = c.prepare(
+            "SELECT who, what, happened_at FROM admin_history ORDER BY id DESC LIMIT 20",
+        )?;
+        let history = history_statement
+            .query_map([], |r| {
+                Ok(HistoryRow {
+                    who: r.get(0)?,
+                    what: r.get(1)?,
+                    when: r.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let phones_connected =
+            c.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get::<_, i64>(0))? as usize;
+        Ok(AdminOverview {
+            users,
+            history,
+            console: ConsoleStatus {
+                connected: false,
+                address: env::var("CL5_CONSOLE_ADDR").unwrap_or_else(|_| "Not configured".into()),
+                scene_number: None,
+                scene_name: None,
+                phones_connected,
+            },
+        })
+    }
+    fn audit(&self, who: &str, what: &str) -> rusqlite::Result<()> {
+        self.db.lock().unwrap().execute(
+            "INSERT INTO admin_history(who,what,happened_at) VALUES(?1,?2,?3)",
+            params![who, what, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+    fn create_user(&self, actor: &str, f: &NewUser) -> Result<String, String> {
+        let passcode = if f.passcode == "Generate" {
+            generate_passcode()
+        } else {
+            f.passcode.clone()
+        };
+        valid(&f.name, &passcode)?;
+        if !matches!(f.role.as_str(), "admin" | "performer") {
+            return Err("Choose admin or performer.".into());
+        }
+        let now = Utc::now().to_rfc3339();
+        self.db.lock().unwrap().execute("INSERT INTO users(name,passcode,role,created_at,updated_at) VALUES(?1,?2,?3,?4,?4)", params![f.name.trim(), passcode, f.role, now]).map_err(|_| "That name is already in use.".to_string())?;
+        self.audit(actor, &format!("Added {} ({})", f.name.trim(), f.role))
+            .map_err(|_| "Could not save history.".to_string())?;
+        Ok(passcode)
+    }
+    fn reset_passcode(&self, actor: &str, name: &str, requested: &str) -> Result<String, String> {
+        let passcode = if requested == "Generate" {
+            generate_passcode()
+        } else {
+            requested.into()
+        };
+        valid(name, &passcode)?;
+        let now = Utc::now().to_rfc3339();
+        let changed = self
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE users SET passcode=?1,updated_at=?2 WHERE name=?3",
+                params![passcode, now, name],
+            )
+            .map_err(|_| "Could not reset passcode.".to_string())?;
+        if changed == 0 {
+            return Err("That user no longer exists.".into());
+        }
+        self.audit(actor, &format!("Reset passcode for {name}"))
+            .map_err(|_| "Could not save history.".to_string())?;
+        Ok(passcode)
+    }
+    fn delete_user(&self, actor: &str, name: &str) -> Result<(), String> {
+        if actor == name {
+            return Err("You cannot delete yourself.".into());
+        }
+        let c = self.db.lock().unwrap();
+        let role: Option<String> = c
+            .query_row("SELECT role FROM users WHERE name=?1", [name], |r| r.get(0))
+            .optional()
+            .map_err(|_| "Could not find that user.".to_string())?;
+        if role.as_deref() == Some("admin")
+            && c.query_row("SELECT COUNT(*) FROM users WHERE role='admin'", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap_or(0)
+                <= 1
+        {
+            return Err("The last admin cannot be deleted.".into());
+        }
+        c.execute("DELETE FROM user_mixes WHERE user_name=?1", [name])
+            .map_err(|_| "Could not delete saved settings.".to_string())?;
+        c.execute("DELETE FROM sessions WHERE user_name=?1", [name])
+            .map_err(|_| "Could not sign out that user.".to_string())?;
+        if c.execute("DELETE FROM users WHERE name=?1", [name])
+            .map_err(|_| "Could not delete that user.".to_string())?
+            == 0
+        {
+            return Err("That user no longer exists.".into());
+        }
+        drop(c);
+        self.audit(actor, &format!("Deleted {name} and their saved settings"))
+            .map_err(|_| "Could not save history.".to_string())
+    }
+    fn assign_mixes(&self, actor: &str, name: &str, mixes: &str) -> Result<(), String> {
+        let c = self.db.lock().unwrap();
+        if c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE name=?1)",
+            [name],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+            == 0
+        {
+            return Err("That user no longer exists.".into());
+        }
+        let tx = c
+            .unchecked_transaction()
+            .map_err(|_| "Could not save mix assignments.".to_string())?;
+        tx.execute("DELETE FROM user_mixes WHERE user_name=?1", [name])
+            .map_err(|_| "Could not save mix assignments.".to_string())?;
+        for mix in mixes.split(',').map(str::trim).filter(|m| !m.is_empty()) {
+            tx.execute(
+                "INSERT INTO user_mixes(user_name,mix_name) VALUES(?1,?2)",
+                params![name, mix],
+            )
+            .map_err(|_| "Could not save mix assignments.".to_string())?;
+        }
+        tx.commit()
+            .map_err(|_| "Could not save mix assignments.".to_string())?;
+        drop(c);
+        self.audit(actor, &format!("Changed mix assignments for {name}"))
+            .map_err(|_| "Could not save history.".to_string())
+    }
 }
 fn migrate(c: &mut Connection) -> rusqlite::Result<()> {
     c.execute_batch(
@@ -181,6 +389,11 @@ fn migrate(c: &mut Connection) -> rusqlite::Result<()> {
         c,
         "0001_users",
         include_str!("../migrations/0001_users.sql"),
+    )?;
+    apply_migration(
+        c,
+        "0002_admin_portal",
+        include_str!("../migrations/0002_admin_portal.sql"),
     )?;
     Ok(())
 }
@@ -295,6 +508,84 @@ async fn admin_ping(State(a): State<App>, h: HeaderMap) -> Response {
         None => (StatusCode::UNAUTHORIZED, "Sign in first.").into_response(),
     }
 }
+fn admin(a: &App, h: &HeaderMap) -> Result<User, StatusCode> {
+    match session(a, h) {
+        Some(u) if u.role == "admin" => Ok(u),
+        Some(_) => Err(StatusCode::FORBIDDEN),
+        None => Err(StatusCode::UNAUTHORIZED),
+    }
+}
+async fn admin_overview(State(a): State<App>, h: HeaderMap) -> Response {
+    if let Err(status) = admin(&a, &h) {
+        return (
+            status,
+            if status == StatusCode::FORBIDDEN {
+                "Admins only."
+            } else {
+                "Sign in first."
+            },
+        )
+            .into_response();
+    }
+    match a.admin_overview() {
+        Ok(overview) => Json(overview).into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not load admin data.",
+        )
+            .into_response(),
+    }
+}
+async fn create_user(State(a): State<App>, h: HeaderMap, Form(f): Form<NewUser>) -> Response {
+    let actor = match admin(&a, &h) {
+        Ok(actor) => actor,
+        Err(status) => return status.into_response(),
+    };
+    match a.create_user(&actor.name, &f) {
+        Ok(_) => Redirect::to("/").into_response(),
+        Err(message) => (StatusCode::BAD_REQUEST, message).into_response(),
+    }
+}
+async fn reset_passcode(
+    State(a): State<App>,
+    h: HeaderMap,
+    Path(name): Path<String>,
+    Form(f): Form<Passcode>,
+) -> Response {
+    let actor = match admin(&a, &h) {
+        Ok(actor) => actor,
+        Err(status) => return status.into_response(),
+    };
+    match a.reset_passcode(&actor.name, &name, &f.passcode) {
+        Ok(_) => Redirect::to("/").into_response(),
+        Err(message) => (StatusCode::BAD_REQUEST, message).into_response(),
+    }
+}
+async fn assign_mixes(
+    State(a): State<App>,
+    h: HeaderMap,
+    Path(name): Path<String>,
+    Form(f): Form<Mixes>,
+) -> Response {
+    let actor = match admin(&a, &h) {
+        Ok(actor) => actor,
+        Err(status) => return status.into_response(),
+    };
+    match a.assign_mixes(&actor.name, &name, &f.mixes) {
+        Ok(()) => Redirect::to("/").into_response(),
+        Err(message) => (StatusCode::BAD_REQUEST, message).into_response(),
+    }
+}
+async fn delete_user(State(a): State<App>, h: HeaderMap, Path(name): Path<String>) -> Response {
+    let actor = match admin(&a, &h) {
+        Ok(actor) => actor,
+        Err(status) => return status.into_response(),
+    };
+    match a.delete_user(&actor.name, &name) {
+        Ok(()) => Redirect::to("/").into_response(),
+        Err(message) => (StatusCode::BAD_REQUEST, message).into_response(),
+    }
+}
 fn login(a: &App, u: User) -> Response {
     let t: String = rand::rng()
         .sample_iter(&Alphanumeric)
@@ -308,6 +599,10 @@ fn login(a: &App, u: User) -> Response {
             params![&t, &u.name, &u.updated_at, Utc::now().to_rfc3339()],
         )
         .expect("store session");
+    let _ = a.db.lock().unwrap().execute(
+        "UPDATE users SET last_sign_in=?1 WHERE name=?2",
+        params![Utc::now().to_rfc3339(), &u.name],
+    );
     (
         [
             (
@@ -319,6 +614,9 @@ fn login(a: &App, u: User) -> Response {
         StatusCode::SEE_OTHER,
     )
         .into_response()
+}
+fn generate_passcode() -> String {
+    format!("{:04}", rand::rng().random_range(0..10_000))
 }
 fn cookie(h: &HeaderMap) -> Option<&str> {
     h.get(header::COOKIE)?
@@ -670,5 +968,74 @@ mod tests {
         assert!(response_text(response)
             .await
             .contains("\"users\":[\"Alex\",\"Zoe\"]"));
+    }
+
+    #[tokio::test]
+    async fn admin_user_actions_audit_and_invalidate_sessions() {
+        let app = App::memory().unwrap();
+        app.add_user("Corey", "1234", "admin").unwrap();
+        let created = app
+            .create_user(
+                "Corey",
+                &NewUser {
+                    name: "Sam".into(),
+                    role: "performer".into(),
+                    passcode: "Generate".into(),
+                },
+            )
+            .unwrap();
+        assert!(created.bytes().all(|byte| byte.is_ascii_digit()));
+        assert_eq!(created.len(), 4);
+        assert!(app
+            .create_user(
+                "Corey",
+                &NewUser {
+                    name: "Sam".into(),
+                    role: "performer".into(),
+                    passcode: "1234".into(),
+                },
+            )
+            .unwrap_err()
+            .contains("already"));
+        app.assign_mixes("Corey", "Sam", "Mix 1, Mix 2").unwrap();
+        let login_response = login(&app, app.user("Sam", &created).unwrap().unwrap());
+        let cookie = login_response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let reset = app.reset_passcode("Corey", "Sam", "4321").unwrap();
+        assert_eq!(reset, "4321");
+        let signed_out = call(
+            &app,
+            Request::get("/api/bootstrap")
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert!(response_text(signed_out).await.contains("\"user\":null"));
+        let overview = app.admin_overview().unwrap();
+        let sam = overview
+            .users
+            .iter()
+            .find(|user| user.name == "Sam")
+            .unwrap();
+        assert_eq!(sam.mixes, ["Mix 1", "Mix 2"]);
+        assert!(overview
+            .history
+            .iter()
+            .any(|row| row.what.contains("Reset")));
+        app.delete_user("Corey", "Sam").unwrap();
+        assert!(app.user("Sam", "4321").unwrap().is_none());
+        assert!(app
+            .delete_user("Corey", "Corey")
+            .unwrap_err()
+            .contains("yourself"));
     }
 }

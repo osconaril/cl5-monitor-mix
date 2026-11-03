@@ -11,8 +11,17 @@
       body { padding: 1rem; color: #fff; font: 18px system-ui, sans-serif; }
       #app { width: min(100%, 34rem); margin: 0 auto; display: grid; gap: 1rem; }
       form, label { display: grid; gap: .35rem; }
-      input, button { width: 100%; min-height: 44px; font: inherit; padding: .5rem; }
+      input, button, select { width: 100%; min-height: 44px; font: inherit; padding: .5rem; }
       button { border: 0; border-radius: .4rem; background: #4cf; color: #002; font-weight: 700; }
+      .scene-bar { position: sticky; top: 0; z-index: 1; padding: .7rem; border-radius: .4rem; background: #223; display: grid; gap: .15rem; }
+      .scene-bar strong { font-size: 1.1rem; }
+      .panel, .user-card { background: #1d1d1d; padding: 1rem; border-radius: .5rem; margin: 1rem 0; }
+      .users { display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); gap: 1rem; }
+      .user-card { margin: 0; overflow-wrap: anywhere; }
+      .user-card form { margin-top: .8rem; }
+      .history { padding-left: 1.2rem; overflow-wrap: anywhere; }
+      .history small { color: #bbb; }
+      .delete-note { color: #fbb; }
       @media (orientation: landscape) { #app { width: min(100%, 48rem); } }
     </style>
   </head>

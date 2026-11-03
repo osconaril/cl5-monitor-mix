@@ -17,6 +17,34 @@ struct Bootstrap {
     user: Option<User>,
     users: Vec<String>,
 }
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+struct AdminUser {
+    name: String,
+    role: String,
+    passcode: String,
+    mixes: Vec<String>,
+    last_sign_in: Option<String>,
+}
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+struct HistoryRow {
+    who: String,
+    what: String,
+    when: String,
+}
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+struct ConsoleStatus {
+    connected: bool,
+    address: String,
+    scene_number: Option<u16>,
+    scene_name: Option<String>,
+    phones_connected: usize,
+}
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+struct AdminOverview {
+    users: Vec<AdminUser>,
+    history: Vec<HistoryRow>,
+    console: ConsoleStatus,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 enum Screen {
@@ -87,13 +115,72 @@ pub fn app() -> Html {
                 </form>
             </>
         },
-        Screen::SignedIn(user) => html! {
-            <>
-                <h1>{format!("Welcome, {}", user.name)}</h1>
-                <p>{format!("Signed in as {}.", user.role)}</p>
-                <form method="post" action="/signout"><button>{"Sign out"}</button></form>
-            </>
-        },
+        Screen::SignedIn(user) => {
+            if user.role == "admin" {
+                html! { <AdminPortal user={user.clone()} /> }
+            } else {
+                html! { <><h1>{format!("Welcome, {}", user.name)}</h1><p>{"Your assigned mixes appear here when the performer screen is installed."}</p><form method="post" action="/signout"><button>{"Sign out"}</button></form></> }
+            }
+        }
+    }
+}
+
+#[derive(Properties, PartialEq)]
+struct AdminPortalProps {
+    user: User,
+}
+
+#[function_component(AdminPortal)]
+fn admin_portal(props: &AdminPortalProps) -> Html {
+    let overview = use_state(|| None::<AdminOverview>);
+    {
+        let overview = overview.clone();
+        use_effect_with((), move |_| {
+            spawn_local(async move {
+                if let Ok(response) = Request::get("/api/admin/overview").send().await {
+                    overview.set(response.json::<AdminOverview>().await.ok());
+                }
+            });
+            || ()
+        });
+    }
+    let Some(overview) = &*overview else {
+        return html! { <p role="status">{"Loading admin portal…"}</p> };
+    };
+    let scene = match (&overview.console.scene_number, &overview.console.scene_name) {
+        (Some(_number), Some(name)) if !name.is_empty() => format!("{name} · Monitor Mix"),
+        (Some(number), _) => format!("Scene {number} · Monitor Mix"),
+        _ => "Console disconnected — scene unknown".into(),
+    };
+    if let Some(window) = web_sys::window() {
+        document_title(&window, &scene);
+    }
+    html! {
+        <>
+            <header class="scene-bar"><small>{"Console"}</small><strong>{scene.clone()}</strong></header>
+            <h1>{"Users"}</h1>
+            <p>{format!("Signed in as {}. Console {} at {} · {} phone{} connected.", props.user.name, if overview.console.connected { "connected" } else { "disconnected" }, overview.console.address, overview.console.phones_connected, if overview.console.phones_connected == 1 { "" } else { "s" })}</p>
+            <section class="panel"><h2>{"Add user"}</h2><form method="post" action="/api/admin/users"><label>{"Name"}<input name="name" required=true /></label><label>{"Role"}<select name="role"><option value="performer">{"Performer"}</option><option value="admin">{"Admin"}</option></select></label><label>{"4-digit passcode"}<input name="passcode" value="Generate" pattern="([0-9]{4}|Generate)" required=true /></label><button>{"Add user"}</button></form></section>
+            <section class="users"><h2>{"Saved users"}</h2>{for overview.users.iter().map(user_card)}</section>
+            <section class="panel"><h2>{"History"}</h2><ul class="history">{for overview.history.iter().map(|row| html! { <li><strong>{&row.who}</strong>{": "}{&row.what}<small>{format!(" · {}", row.when)}</small></li> })}</ul></section>
+            <form method="post" action="/signout"><button>{"Sign out"}</button></form>
+        </>
+    }
+}
+
+fn user_card(user: &AdminUser) -> Html {
+    let encoded = user.name.replace(' ', "%20");
+    let mixes = if user.mixes.is_empty() {
+        "No mixes assigned".into()
+    } else {
+        user.mixes.join(", ")
+    };
+    html! { <article class="user-card"><h3>{&user.name}</h3><p>{format!("{} · code {}", user.role, user.passcode)}</p><p>{format!("Mixes: {mixes}")}</p><p>{format!("Last sign-in: {}", user.last_sign_in.as_deref().unwrap_or("Never"))}</p><form method="post" action={format!("/api/admin/users/{encoded}/passcode")}><label>{"New passcode"}<input name="passcode" value="Generate" pattern="([0-9]{4}|Generate)" required=true /></label><button>{"Reset passcode"}</button></form><form method="post" action={format!("/api/admin/users/{encoded}/mixes")}><label>{"Mix names (comma-separated)"}<input name="mixes" value={user.mixes.join(", ")} /></label><button>{"Save mix assignments"}</button></form><form method="post" action={format!("/api/admin/users/{encoded}")}><p class="delete-note">{format!("Delete {}? Their saved settings go too.", user.name)}</p><button>{"Delete user"}</button></form></article> }
+}
+
+fn document_title(window: &web_sys::Window, title: &str) {
+    if let Some(document) = window.document() {
+        document.set_title(title);
     }
 }
 
