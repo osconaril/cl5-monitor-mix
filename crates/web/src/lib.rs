@@ -220,17 +220,36 @@ fn admin_portal(props: &AdminPortalProps) -> Html {
     let Some(overview) = &*overview else {
         return html! { <p role="status">{"Loading admin portal…"}</p> };
     };
-    let scene = match (&overview.console.scene_number, &overview.console.scene_name) {
-        (Some(_number), Some(name)) if !name.is_empty() => format!("{name} · Monitor Mix"),
-        (Some(number), _) => format!("Scene {number} · Monitor Mix"),
-        _ => "Console disconnected — scene unknown".into(),
+    let (scene_number, scene_name, title) = match (
+        overview.console.connected,
+        overview.console.scene_number,
+        overview.console.scene_name.as_deref(),
+    ) {
+        (true, Some(number), Some(name)) if !name.is_empty() => (
+            format!("Scene {number}"),
+            name.to_owned(),
+            format!("{name} · Monitor Mix"),
+        ),
+        (true, Some(number), _) => {
+            let scene = format!("Scene {number}");
+            (
+                scene.clone(),
+                scene.clone(),
+                format!("{scene} · Monitor Mix"),
+            )
+        }
+        _ => (
+            "Console".into(),
+            "Console disconnected — scene unknown".into(),
+            "Console disconnected — scene unknown".into(),
+        ),
     };
     if let Some(window) = web_sys::window() {
-        document_title(&window, &scene);
+        document_title(&window, &title);
     }
     html! {
         <>
-            <header class="scene-bar"><small>{"Console"}</small><strong>{scene.clone()}</strong></header>
+            <header class="scene-bar"><small>{scene_number}</small><strong>{scene_name}</strong></header>
             <h1>{"Users"}</h1>
             <p>{format!("Signed in as {}. Console {} at {} · {} phone{} connected.", props.user.name, if overview.console.connected { "connected" } else { "disconnected" }, overview.console.address, overview.console.phones_connected, if overview.console.phones_connected == 1 { "" } else { "s" })}</p>
             <section class="panel"><h2>{"Add user"}</h2><form method="post" action="/api/admin/users"><label>{"Name"}<input name="name" required=true /></label><label>{"Role"}<select name="role"><option value="performer">{"Performer"}</option><option value="admin">{"Admin"}</option></select></label><label>{"4-digit passcode"}<input name="passcode" value="Generate" pattern="([0-9]{4}|Generate)" required=true /></label><button>{"Add user"}</button></form></section>
