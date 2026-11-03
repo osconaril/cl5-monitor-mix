@@ -7,6 +7,10 @@
     "labels": ["console-control"],
     "labelsReason": "Anything that changes what is sent to the live console is checked against the real CL5 before shipping."
   },
+  "machineMigrations": {
+    "ownership": "deploy",
+    "reason": "The show-machine server applies bundled SQLite migrations before binding its LAN listener; migration and deployment are one atomic step."
+  },
   "verify": {
     "typecheck": "cargo check --workspace --all-targets",
     "lint": "cargo clippy --workspace --all-targets -- -D warnings",
