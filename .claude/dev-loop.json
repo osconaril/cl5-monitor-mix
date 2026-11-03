@@ -20,6 +20,8 @@
   },
   "machineMigrations": {
     "ownership": "deploy",
+    "receipt": "exact-head-ci",
+    "receiptTest": "database_migrates_and_accepts_admin",
     "reason": "The show-machine server applies bundled SQLite migrations before binding its LAN listener; migration and deployment are one atomic step."
   },
   "verify": {
