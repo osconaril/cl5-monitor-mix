@@ -190,6 +190,7 @@ name = "cl5-web"
 version = "0.1.0"
 dependencies = [
  "gloo-net 0.6.0",
+ "gloo-timers 0.3.0",
  "serde",
  "serde_json",
  "wasm-bindgen",
