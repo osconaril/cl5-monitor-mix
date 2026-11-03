@@ -6,13 +6,26 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
+import { createConnection, createServer } from 'node:net';
 
 const root = new URL('..', import.meta.url).pathname;
 const temp = await mkdtemp(join(tmpdir(), 'cl5-browser-'));
-const port = 38123;
+async function unusedPort() {
+  const listener = createServer();
+  listener.listen(0, '127.0.0.1');
+  await once(listener, 'listening');
+  const port = listener.address().port;
+  await new Promise(resolve => listener.close(resolve));
+  return port;
+}
+const port = await unusedPort();
+const consolePort = await unusedPort();
+const debugPort = await unusedPort();
 const chrome = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const webDist = join(temp, 'web');
 let server;
+let fake;
+let engineer;
 let browser;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 async function buildWeb() {
@@ -38,13 +51,13 @@ try {
   await buildWeb();
   server = spawn('cargo', ['run', '-p', 'cl5-server'], {
     cwd: root,
-    env: { ...process.env, CL5_LISTEN: `127.0.0.1:${port}`, CL5_DATABASE_PATH: join(temp, 'test.sqlite'), CL5_WEB_DIST: webDist },
+    env: { ...process.env, CL5_LISTEN: `127.0.0.1:${port}`, CL5_DATABASE_PATH: join(temp, 'test.sqlite'), CL5_WEB_DIST: webDist, CL5_CONSOLE_ADDRESS:`127.0.0.1:${consolePort}` },
     stdio: 'ignore',
   });
-  browser = spawn(chrome, ['--headless=new', '--no-first-run', '--no-default-browser-check', '--remote-debugging-port=9222', `--user-data-dir=${join(temp, 'chrome')}`], { stdio: 'ignore' });
+  browser = spawn(chrome, ['--headless=new', '--no-first-run', '--no-default-browser-check', `--remote-debugging-port=${debugPort}`, `--user-data-dir=${join(temp, 'chrome')}`], { stdio: 'ignore' });
   await ready(`http://127.0.0.1:${port}/setup`);
-  await ready('http://127.0.0.1:9222/json/version');
-  const target = await fetch(`http://127.0.0.1:9222/json/new?http://127.0.0.1:${port}/setup`, { method: 'PUT' }).then(r => r.json());
+  await ready(`http://127.0.0.1:${debugPort}/json/version`);
+  const target = await fetch(`http://127.0.0.1:${debugPort}/json/new?http://127.0.0.1:${port}/setup`, { method: 'PUT' }).then(r => r.json());
   const ws = new WebSocket(target.webSocketDebuggerUrl);
   await new Promise((resolve, reject) => { ws.addEventListener('open', resolve, { once: true }); ws.addEventListener('error', reject, { once: true }); });
   await command(ws, 'Page.enable');
@@ -87,9 +100,83 @@ try {
     const page = JSON.parse(admin.result.value);
     if (page.scroll > page.width || !page.text.includes('Users') || !page.text.includes('Console disconnected') || !page.text.includes('Browser')) throw new Error(`Admin phone layout failed at ${width}x${height}: ${JSON.stringify(page)}`);
   }
+
+  // Performer controls exercise the real HTTP/WebSocket bridge and fake RCP
+  // console, never a production host or database.
+  await command(ws, 'Runtime.evaluate', { expression: "(async () => { await fetch('/api/admin/users', {method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:'name=Singer&role=performer&passcode=5678'}); await fetch('/api/admin/users/Singer/mixes', {method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:'mixes=1&mixes=2'}); await fetch('/signout',{method:'POST'}); await fetch('/signin',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:'name=Singer&passcode=5678'}); })()", awaitPromise: true });
+  fake = spawn('cargo', ['run', '-p', 'fake-console'], {
+    cwd: root, env: {...process.env, FAKE_CONSOLE_ADDR:`127.0.0.1:${consolePort}`}, stdio: 'ignore'
+  });
+  for (let i = 0; i < 150; i++) {
+    try {
+      engineer = createConnection({host:'127.0.0.1', port:consolePort});
+      await once(engineer, 'connect');
+      break;
+    } catch { engineer.destroy(); engineer = null; await sleep(100); }
+  }
+  if (!engineer) throw new Error('Fake console failed to start');
+  // Drain notifications; readbacks below each use a bounded listener.
+  engineer.on('data', () => {});
+  async function rcp(line, expected) {
+    let buffer = '';
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { engineer.off('data', listener); reject(new Error('RCP timeout: '+line)); }, 5000);
+      const listener = chunk => {
+        buffer += chunk.toString();
+        if (buffer.split('\n').some(line => line.trim() === expected)) {
+          clearTimeout(timer); engineer.off('data', listener); resolve();
+        }
+      };
+      engineer.on('data', listener);
+      engineer.write(line+'\n');
+    });
+  }
+  async function evaluate(expression) {
+    const result = await command(ws, 'Runtime.evaluate', {expression, returnByValue:true, awaitPromise:true});
+    if (result.exceptionDetails) throw new Error(JSON.stringify(result.exceptionDetails));
+    return result.result.value;
+  }
+  async function expectBrowser(expression, label) {
+    for (let i=0; i<300; i++) { if (await evaluate(expression)) return; await sleep(100); }
+    throw new Error(label + ": " + await evaluate("JSON.stringify({title:document.title,text:document.body.innerText.slice(0,2000)})"));
+  }
+  await rcp('set MIXER:Current/InCh/Label/Name 0 0 "Lead Vocal"', 'OK');
+  await rcp('set MIXER:Current/InCh/ToMix/Level 0 0 -350', 'OK');
+  await rcp('set MIXER:Current/InCh/ToMix/On 0 0 1', 'OK');
+  await command(ws, 'Page.navigate', {url:`http://127.0.0.1:${port}/`});
+  await expectBrowser("document.querySelectorAll('.mix-picker button').length === 2 && document.title === 'Soundcheck · Monitor Mix'", 'Assigned-mix picker or live scene missing');
+  await evaluate("document.querySelector('.mix-picker button').click()");
+  const strip = "document.querySelector('.channel-strip')";
+  await expectBrowser(`document.querySelectorAll('.channel-strip').length === 80 && ${strip}?.innerText.includes('-3.5 dB') && ${strip}?.innerText.includes('Lead Vocal')`, 'Console fractional level/name was not rendered');
+  // A resize or readback cannot send a rounded level back to the console.
+  for (const [width,height] of [[390,844],[844,390]]) {
+    await command(ws, 'Emulation.setDeviceMetricsOverride', {width,height,deviceScaleFactor:1,mobile:true});
+    if (!await evaluate("Math.max(document.documentElement.scrollWidth, document.body.scrollWidth) <= innerWidth && [...document.querySelectorAll('button')].every(b=>b.getBoundingClientRect().height>=44) && !document.body.innerText.toLowerCase().includes('wedge')"))
+      throw new Error('Performer page overflow, small controls or incorrect wording');
+    await rcp('get MIXER:Current/InCh/ToMix/Level 0 0', 'OK get MIXER:Current/InCh/ToMix/Level 0 0 -350');
+  }
+  await evaluate(`(() => {const f = ${strip}.querySelector('input'); f.value='-3.49'; f.dispatchEvent(new Event('input',{bubbles:true}));})()`);
+  await expectBrowser(`${strip}.innerText.includes('-3 dB')`, 'Upward fractional move did not snap to -3 dB');
+  await rcp('get MIXER:Current/InCh/ToMix/Level 0 0', 'OK get MIXER:Current/InCh/ToMix/Level 0 0 -300');
+  await rcp('set MIXER:Current/InCh/ToMix/Level 0 0 -350', 'OK');
+  await expectBrowser(`${strip}.innerText.includes('-3.5 dB')`, 'Engineer changes did not reach open screen');
+  await evaluate(`(() => {const f = ${strip}.querySelector('input'); f.value='-3.51'; f.dispatchEvent(new Event('input',{bubbles:true}));})()`);
+  await expectBrowser(`${strip}.innerText.includes('-4 dB')`, 'Downward fractional move did not snap to -4 dB');
+  await evaluate(`${strip}.querySelector('button').click()`);
+  await expectBrowser(`${strip}.querySelector('button').getAttribute('aria-pressed') === 'true'`, 'Mute readback did not reach the browser');
+  await rcp('get MIXER:Current/InCh/ToMix/On 0 0', 'OK get MIXER:Current/InCh/ToMix/On 0 0 0');
+  await rcp('ssrecall_ex MIXER:Lib/Scene 2', 'OK');
+  await expectBrowser("document.title === 'Show · Monitor Mix' && document.querySelector('.scene-bar').innerText.includes('Show')", 'Scene recall did not update mix page/title');
+  await evaluate("[...document.querySelectorAll('button')].find(b=>b.textContent==='Choose another mix').click()");
+  await expectBrowser("document.querySelectorAll('.mix-picker button').length === 2 && document.title === 'Show · Monitor Mix'", 'Picker lost current scene');
+  await stop(fake); fake = null;
+  await expectBrowser("document.querySelector('.scene-bar').innerText.includes('Console disconnected — scene unknown')", 'Disconnected console left stale scene name');
+  await evaluate("document.querySelector('.mix-picker button').click()");
+  await expectBrowser("[...document.querySelectorAll('.channel-strip input, .channel-strip button')].every(e=>e.disabled)", 'Disconnected controls remained enabled');
   ws.close();
-  console.log('Browser smoke passed at 390x844 and 844x390.');
+  console.log('Browser smoke passed at 390x844 and 844x390, including performer picker, live faders/mute and scenes.');
 } finally {
-  await Promise.all([stop(server), stop(browser)]);
+  engineer?.destroy();
+  await Promise.all([stop(server), stop(browser), stop(fake)]);
   await rm(temp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 }

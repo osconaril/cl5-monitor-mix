@@ -25,6 +25,16 @@
       .history { padding-left: 1.2rem; overflow-wrap: anywhere; }
       .history small { color: #bbb; }
       .delete-note { color: #fbb; }
+      .mix-picker { display: grid; gap: .75rem; }
+      .mix-heading { display: flex; align-items: center; gap: 1rem; }
+      .mix-heading button { width: auto; }
+      .channel-strips { display: grid; gap: .75rem; margin-bottom: 1rem; }
+      .channel-strip { min-width: 0; padding: .75rem; background: #222; border-radius: .5rem; }
+      .channel-strip h3 { margin: 0 0 .5rem; overflow-wrap: anywhere; }
+      .send-control { margin-bottom: .5rem; }
+      .send-control input { touch-action: none; padding: 0; }
+      button[aria-pressed="true"] { background: #ffb454; }
+      button:disabled, input:disabled { opacity: .55; }
       @media (orientation: landscape) { #app { width: min(100%, 48rem); } }
     </style>
   </head>

@@ -210,11 +210,6 @@ struct Passcode {
     passcode: String,
 }
 #[derive(Deserialize)]
-struct Mixes {
-    #[serde(default)]
-    mixes: Vec<String>,
-}
-#[derive(Deserialize)]
 struct ConsoleChange {
     path: String,
     input: u8,
@@ -884,13 +879,19 @@ async fn assign_mixes(
     State(a): State<App>,
     h: HeaderMap,
     Path(name): Path<String>,
-    Form(f): Form<Mixes>,
+    Form(fields): Form<Vec<(String, String)>>,
 ) -> Response {
     let actor = match admin(&a, &h) {
         Ok(actor) => actor,
         Err(status) => return status.into_response(),
     };
-    match a.assign_mixes(&actor.name, &name, &f.mixes) {
+    // HTML checkboxes repeat the same key. Deserialize the form as pairs:
+    // serde_urlencoded does not decode repeated keys into a struct Vec field.
+    let mixes: Vec<_> = fields
+        .into_iter()
+        .filter_map(|(key, value)| (key == "mixes").then_some(value))
+        .collect();
+    match a.assign_mixes(&actor.name, &name, &mixes) {
         Ok(()) => Redirect::to("/").into_response(),
         Err(message) => (StatusCode::BAD_REQUEST, message).into_response(),
     }
@@ -1178,6 +1179,38 @@ mod tests {
             "Mix 24 is protocol index 23"
         );
         assert!(may_change_mix(&app, &admin, 23));
+    }
+
+    #[tokio::test]
+    async fn assignment_checkboxes_accept_multiple_one_and_no_mixes_over_http() {
+        let app = App::memory().unwrap();
+        app.add_user("Admin", "1234", "admin").unwrap();
+        app.add_user("Singer", "5678", "performer").unwrap();
+        let response = login(&app, app.user("Admin", "1234").unwrap().unwrap());
+        let cookie = response.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        for (body, expected) in [
+            ("mixes=1&mixes=24", vec!["Mix 1", "Mix 24"]),
+            ("mixes=2", vec!["Mix 2"]),
+            ("", vec![]),
+        ] {
+            let response = call(
+                &app,
+                Request::post("/api/admin/users/Singer/mixes")
+                    .header(header::COOKIE, &cookie)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::SEE_OTHER);
+            assert_eq!(app.user_mixes("Singer").unwrap(), expected);
+        }
     }
 
     #[tokio::test]
