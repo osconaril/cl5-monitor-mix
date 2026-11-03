@@ -91,8 +91,8 @@ fn routes(app: App) -> Router {
 }
 impl App {
     fn open(path: &str) -> rusqlite::Result<Self> {
-        let c = Connection::open(path)?;
-        migrate(&c)?;
+        let mut c = Connection::open(path)?;
+        migrate(&mut c)?;
         Ok(Self {
             db: Arc::new(Mutex::new(c)),
             attempts: Default::default(),
@@ -100,8 +100,8 @@ impl App {
     }
     #[cfg(test)]
     fn memory() -> rusqlite::Result<Self> {
-        let c = Connection::open_in_memory()?;
-        migrate(&c)?;
+        let mut c = Connection::open_in_memory()?;
+        migrate(&mut c)?;
         Ok(Self {
             db: Arc::new(Mutex::new(c)),
             attempts: Default::default(),
@@ -165,12 +165,32 @@ impl App {
             .optional()
     }
 }
-fn migrate(c: &Connection) -> rusqlite::Result<()> {
-    c.execute_batch(include_str!("../migrations/0001_users.sql"))?;
-    c.execute(
-        "INSERT OR IGNORE INTO schema_migrations VALUES('0001_users',?1)",
-        [Utc::now().to_rfc3339()],
+fn migrate(c: &mut Connection) -> rusqlite::Result<()> {
+    c.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY, applied_at TEXT NOT NULL);",
     )?;
+    apply_migration(
+        c,
+        "0001_users",
+        include_str!("../migrations/0001_users.sql"),
+    )?;
+    Ok(())
+}
+fn apply_migration(c: &mut Connection, version: &str, sql: &str) -> rusqlite::Result<()> {
+    let transaction = c.transaction()?;
+    let applied = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version=?1)",
+        [version],
+        |row| row.get::<_, i64>(0),
+    )?;
+    if applied == 0 {
+        transaction.execute_batch(sql)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES(?1, ?2)",
+            params![version, Utc::now().to_rfc3339()],
+        )?;
+    }
+    transaction.commit()?;
     Ok(())
 }
 fn valid(n: &str, p: &str) -> Result<(), String> {
@@ -342,6 +362,34 @@ mod tests {
         a.add_user("Corey", "1234", "admin").unwrap();
         assert!(a.has_admin().unwrap());
         assert_eq!(a.user("Corey", "1234").unwrap().unwrap().role, "admin");
+    }
+
+    #[test]
+    fn migration_ledger_skips_an_already_applied_migration() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (version TEXT PRIMARY KEY, applied_at TEXT NOT NULL);",
+            )
+            .unwrap();
+        apply_migration(
+            &mut connection,
+            "test_once",
+            "CREATE TABLE migration_runs (value TEXT NOT NULL);",
+        )
+        .unwrap();
+
+        // A restarted process must consult the version ledger before attempting
+        // the SQL again. This SQL would fail if it were replayed.
+        apply_migration(&mut connection, "test_once", "THIS IS NOT VALID SQL").unwrap();
+        let runs: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version='test_once'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(runs, 1);
     }
     #[test]
     fn passcodes_are_four_digits() {
