@@ -1,5 +1,6 @@
 //! Offline LAN sign-in server and the shared CL5 console bridge.
 mod console;
+mod layout;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -267,6 +268,7 @@ fn routes(app: App) -> Router {
         .route("/api/admin/users/{name}/passcode", post(reset_passcode))
         .route("/api/admin/users/{name}/mixes", post(assign_mixes))
         .route("/api/performer/mixes", get(performer_mixes))
+        .route("/api/performer/layout", get(layout::get).put(layout::save))
         .route(
             "/api/admin/users/{name}",
             post(delete_user).delete(delete_user),
@@ -512,6 +514,8 @@ impl App {
         }
         c.execute("DELETE FROM user_mixes WHERE user_name=?1", [name])
             .map_err(|_| "Could not delete saved settings.".to_string())?;
+        c.execute("DELETE FROM performer_layouts WHERE user_name=?1", [name])
+            .map_err(|_| "Could not delete saved layout.".to_string())?;
         c.execute("DELETE FROM sessions WHERE user_name=?1", [name])
             .map_err(|_| "Could not sign out that user.".to_string())?;
         if c.execute("DELETE FROM users WHERE name=?1", [name])
@@ -586,6 +590,11 @@ fn migrate(c: &mut Connection) -> rusqlite::Result<()> {
         c,
         "0002_admin_portal",
         include_str!("../migrations/0002_admin_portal.sql"),
+    )?;
+    apply_migration(
+        c,
+        "0003_performer_layouts",
+        include_str!("../migrations/0003_performer_layouts.sql"),
     )?;
     Ok(())
 }
@@ -974,7 +983,7 @@ mod tests {
     use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest};
     use tower::ServiceExt;
 
-    async fn response_text(response: Response) -> String {
+    pub(super) async fn response_text(response: Response) -> String {
         String::from_utf8(
             to_bytes(response.into_body(), usize::MAX)
                 .await
@@ -984,7 +993,7 @@ mod tests {
         .unwrap()
     }
 
-    async fn call(app: &App, request: Request<Body>) -> Response {
+    pub(super) async fn call(app: &App, request: Request<Body>) -> Response {
         routes(app.clone()).oneshot(request).await.unwrap()
     }
 
