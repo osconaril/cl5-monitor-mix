@@ -137,6 +137,11 @@ impl App {
         self.bridge = console::ConsoleBridge::start(address);
         self
     }
+    #[cfg(test)]
+    fn with_bridge(mut self, bridge: console::ConsoleBridge) -> Self {
+        self.bridge = bridge;
+        self
+    }
     fn has_admin(&self) -> rusqlite::Result<bool> {
         Ok(self.db.lock().unwrap().query_row(
             "SELECT EXISTS(SELECT 1 FROM users WHERE role='admin')",
@@ -273,20 +278,44 @@ async fn console_socket(
 }
 
 async fn stream_console(mut socket: WebSocket, bridge: console::ConsoleBridge) {
-    let snapshot = ConsoleSnapshot {
-        kind: "snapshot",
-        connected: bridge.is_connected(),
-        state: bridge.state().await,
-    };
-    if send_socket(&mut socket, &snapshot).await.is_err() {
+    if send_console_snapshot(&mut socket, &bridge).await.is_err() {
         return;
     }
     let mut events = bridge.subscribe();
-    while let Ok(event) = events.recv().await {
-        if send_socket(&mut socket, &event).await.is_err() {
-            return;
+    loop {
+        match events.recv().await {
+            Ok(event) => {
+                if send_socket(&mut socket, &event).await.is_err() {
+                    return;
+                }
+            }
+            // A scene rehydration deliberately emits more individual values
+            // than a slow browser's event buffer can hold. The bridge state is
+            // authoritative, so replace the missed delta with one fresh
+            // snapshot and continue listening for later changes.
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                if send_console_snapshot(&mut socket, &bridge).await.is_err() {
+                    return;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         }
     }
+}
+
+async fn send_console_snapshot(
+    socket: &mut WebSocket,
+    bridge: &console::ConsoleBridge,
+) -> Result<(), ()> {
+    send_socket(
+        socket,
+        &ConsoleSnapshot {
+            kind: "snapshot",
+            connected: bridge.is_connected(),
+            state: bridge.state().await,
+        },
+    )
+    .await
 }
 
 async fn send_socket<T: Serialize>(socket: &mut WebSocket, message: &T) -> Result<(), ()> {
@@ -447,6 +476,9 @@ mod tests {
         body::{to_bytes, Body},
         http::Request,
     };
+    use futures_util::StreamExt;
+    use tokio::{net::TcpListener, time::timeout};
+    use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest};
     use tower::ServiceExt;
 
     async fn response_text(response: Response) -> String {
@@ -461,6 +493,118 @@ mod tests {
 
     async fn call(app: &App, request: Request<Body>) -> Response {
         routes(app.clone()).oneshot(request).await.unwrap()
+    }
+
+    async fn next_websocket_text<S>(socket: &mut tokio_tungstenite::WebSocketStream<S>) -> String
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        timeout(Duration::from_secs(15), async {
+            loop {
+                match socket.next().await {
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                        break text.to_string()
+                    }
+                    Some(Ok(_)) => continue,
+                    Some(Err(error)) => panic!("websocket read failed: {error}"),
+                    None => panic!("websocket closed"),
+                }
+            }
+        })
+        .await
+        .expect("websocket response arrives")
+    }
+
+    #[tokio::test]
+    async fn websocket_resynchronizes_after_scene_recall_and_stays_live() {
+        use fake_console::FakeConsole;
+
+        let fake = Arc::new(FakeConsole::new());
+        let console_address = fake.clone().listen("127.0.0.1:0").await.unwrap();
+        let bridge = console::ConsoleBridge::start_for_lag_test(console_address.to_string());
+        let app = App::memory().unwrap().with_bridge(bridge.clone());
+        app.add_user("Admin", "1234", "admin").unwrap();
+        timeout(Duration::from_secs(15), async {
+            while !bridge.is_connected() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("bridge connects to fake console");
+
+        let login_response = login(&app, app.user("Admin", "1234").unwrap().unwrap());
+        let cookie = login_response.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, routes(app)).await });
+
+        let mut request = format!("ws://{address}/api/console")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert(header::COOKIE, cookie.parse().unwrap());
+        let (mut socket, _) = connect_async(request).await.unwrap();
+        assert!(next_websocket_text(&mut socket)
+            .await
+            .contains("\"kind\":\"snapshot\""));
+
+        fake.recall_scene(2).await.unwrap();
+        let resynchronized = timeout(Duration::from_secs(5), async {
+            loop {
+                if next_websocket_text(&mut socket)
+                    .await
+                    .contains("\"kind\":\"snapshot\"")
+                {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(
+            resynchronized.is_ok(),
+            "scene recall resynchronizes the WebSocket"
+        );
+
+        timeout(Duration::from_secs(15), async {
+            while !bridge.is_connected() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("bridge rehydrates before accepting the later phone change");
+
+        bridge
+            .change(console::PhoneChange {
+                path: console::LEVEL.into(),
+                input: 0,
+                mix: 0,
+                value: "-2".into(),
+            })
+            .await
+            .unwrap();
+        let later_change = timeout(Duration::from_secs(5), async {
+            loop {
+                if next_websocket_text(&mut socket)
+                    .await
+                    .contains("\"value\":\"-2\"")
+                {
+                    break;
+                }
+            }
+        })
+        .await;
+        server.abort();
+        assert!(
+            later_change.is_ok(),
+            "the same WebSocket receives later console changes"
+        );
     }
 
     #[test]

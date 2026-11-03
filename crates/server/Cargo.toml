@@ -19,4 +19,6 @@ cl5-web = { path = "../web" }
 
 [dev-dependencies]
 fake-console = { path = "../fake-console" }
+futures-util = "0.3"
+tokio-tungstenite = "0.29"
 tower.workspace = true

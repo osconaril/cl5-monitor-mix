@@ -68,12 +68,16 @@ impl ConsoleBridge {
     }
 
     pub fn start(address: impl Into<String>) -> Self {
+        Self::start_with_event_capacity(address.into(), 512)
+    }
+
+    fn start_with_event_capacity(address: String, event_capacity: usize) -> Self {
         let state = Arc::new(RwLock::new(ConsoleState::default()));
         let (connected_tx, connected) = watch::channel(false);
-        let (events, _) = broadcast::channel(512);
+        let (events, _) = broadcast::channel(event_capacity);
         let (writes, receiver) = mpsc::channel(512);
         tokio::spawn(run_bridge(
-            address.into(),
+            address,
             state.clone(),
             connected_tx,
             events.clone(),
@@ -85,6 +89,11 @@ impl ConsoleBridge {
             events,
             writes,
         }
+    }
+
+    #[cfg(test)]
+    pub fn start_for_lag_test(address: impl Into<String>) -> Self {
+        Self::start_with_event_capacity(address.into(), 4)
     }
 
     pub fn is_connected(&self) -> bool {
