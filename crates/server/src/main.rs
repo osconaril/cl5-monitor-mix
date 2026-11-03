@@ -1,4 +1,6 @@
-//! Offline LAN sign-in server. Console control is intentionally a later card.
+//! Offline LAN sign-in server and the shared CL5 console bridge.
+#[allow(dead_code)] // The bridge request route is added with the TCP worker.
+mod console;
 use axum::{
     extract::{Form, State},
     http::{header, HeaderMap, StatusCode},
