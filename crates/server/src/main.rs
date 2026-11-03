@@ -29,6 +29,7 @@ struct App {
 struct User {
     name: String,
     role: String,
+    updated_at: String,
 }
 struct Attempt {
     failures: u8,
@@ -105,12 +106,13 @@ impl App {
             .lock()
             .unwrap()
             .query_row(
-                "SELECT name,role FROM users WHERE name=?1 AND passcode=?2",
+                "SELECT name,role,updated_at FROM users WHERE name=?1 AND passcode=?2",
                 params![n.trim(), p],
                 |r| {
                     Ok(User {
                         name: r.get(0)?,
                         role: r.get(1)?,
+                        updated_at: r.get(2)?,
                     })
                 },
             )
@@ -257,11 +259,48 @@ fn cookie(h: &HeaderMap) -> Option<&str> {
         .find_map(|x| x.strip_prefix("cl5_session="))
 }
 fn session(a: &App, h: &HeaderMap) -> Option<User> {
-    a.sessions.lock().unwrap().get(cookie(h)?).cloned()
+    let token = cookie(h)?;
+    let user = a.sessions.lock().unwrap().get(token).cloned()?;
+    let current =
+        a.db.lock()
+            .unwrap()
+            .query_row(
+                "SELECT role,updated_at FROM users WHERE name=?1",
+                [&user.name],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()
+            .ok()??;
+    if current.0 == user.role && current.1 == user.updated_at {
+        Some(user)
+    } else {
+        a.sessions.lock().unwrap().remove(token);
+        None
+    }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        body::{to_bytes, Body},
+        http::Request,
+    };
+    use tower::ServiceExt;
+
+    async fn response_text(response: Response) -> String {
+        String::from_utf8(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap()
+    }
+
+    async fn call(app: &App, request: Request<Body>) -> Response {
+        routes(app.clone()).oneshot(request).await.unwrap()
+    }
+
     #[test]
     fn database_migrates_and_accepts_admin() {
         let a = App::memory().unwrap();
@@ -275,5 +314,145 @@ mod tests {
         assert!(valid("a", "1234").is_ok());
         assert!(valid("a", "123").is_err());
         assert!(valid("a", "abcd").is_err());
+    }
+
+    #[tokio::test]
+    async fn first_admin_setup_only_works_once() {
+        let app = App::memory().unwrap();
+        let setup = call(&app, Request::get("/setup").body(Body::empty()).unwrap()).await;
+        assert_eq!(setup.status(), StatusCode::OK);
+        assert!(response_text(setup)
+            .await
+            .contains("Create the first admin"));
+
+        let created = call(
+            &app,
+            Request::post("/setup")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("name=Corey&passcode=1234"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::SEE_OTHER);
+        assert!(created.headers().contains_key(header::SET_COOKIE));
+
+        let again = call(&app, Request::get("/setup").body(Body::empty()).unwrap()).await;
+        assert_eq!(again.status(), StatusCode::SEE_OTHER);
+    }
+
+    #[tokio::test]
+    async fn sign_in_lockout_and_admin_authorization_are_http_checked() {
+        let app = App::memory().unwrap();
+        app.add_user("Admin", "1234", "admin").unwrap();
+        app.add_user("Performer", "5678", "performer").unwrap();
+        for _ in 0..5 {
+            let response = call(
+                &app,
+                Request::post("/signin")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from("name=Performer&passcode=0000"))
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let locked = call(
+            &app,
+            Request::post("/signin")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("name=Performer&passcode=5678"))
+                .unwrap(),
+        )
+        .await;
+        assert!(response_text(locked).await.contains("locked"));
+
+        let admin = call(
+            &app,
+            Request::post("/signin")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("name=Admin&passcode=1234"))
+                .unwrap(),
+        )
+        .await;
+        let cookie = admin
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let permitted = call(
+            &app,
+            Request::get("/api/admin/ping")
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(permitted.status(), StatusCode::OK);
+
+        let performer = app.user("Performer", "5678").unwrap();
+        assert!(performer.is_some());
+        let performer_login = login(&app, performer.unwrap());
+        let performer_cookie = performer_login
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let forbidden = call(
+            &app,
+            Request::get("/api/admin/ping")
+                .header(header::COOKIE, performer_cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+        assert!(response_text(forbidden)
+            .await
+            .contains("Sign in as an admin"));
+    }
+
+    #[tokio::test]
+    async fn deleting_or_resetting_a_user_invalidates_its_session() {
+        let app = App::memory().unwrap();
+        app.add_user("Performer", "5678", "performer").unwrap();
+        let response = login(&app, app.user("Performer", "5678").unwrap().unwrap());
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        app.db
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM users WHERE name=?1", ["Performer"])
+            .unwrap();
+        let signed_out = call(
+            &app,
+            Request::get("/")
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(signed_out.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            signed_out.headers().get(header::LOCATION).unwrap(),
+            "/setup"
+        );
     }
 }

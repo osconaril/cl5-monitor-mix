@@ -18,4 +18,6 @@ The console allows only a limited number of connected mixing devices. This app c
 
 ```
 cargo test --workspace
+cargo check --workspace --all-targets
+node scripts/browser-smoke.mjs
 ```
