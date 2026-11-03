@@ -60,10 +60,33 @@ try {
     if (page.scroll > page.width || page.buttons.some(height => height < 44) || page.picker !== 1 || !page.text.includes('Sign in')) throw new Error(`Sign-in phone layout failed at ${width}x${height}: ${JSON.stringify(page)}`);
   }
   await command(ws, 'Runtime.evaluate', { expression: "fetch('/signin', {method: 'POST', headers: {'content-type': 'application/x-www-form-urlencoded'}, body: 'name=Browser&passcode=1234'})", awaitPromise: true });
+  await command(ws, 'Runtime.evaluate', { expression: "fetch('/api/admin/users', {method: 'POST', headers: {'content-type': 'application/x-www-form-urlencoded'}, body: 'name=Delete+Me&role=performer&passcode=1234'})", awaitPromise: true });
   await command(ws, 'Page.navigate', { url: `http://127.0.0.1:${port}/` });
-  await sleep(200);
-  const signedIn = await command(ws, 'Runtime.evaluate', { expression: 'document.body.innerText', returnByValue: true });
-  if (!signedIn.result.value.includes('Welcome, Browser')) throw new Error('Sign-in did not preserve the browser session.');
+  await sleep(250);
+  const deleteAction = action => `(() => { const card = [...document.querySelectorAll('.user-card')].find(card => card.querySelector('h3')?.textContent === 'Delete Me'); const button = [...(card?.querySelectorAll('button') ?? [])].find(button => button.textContent === '${action}'); if (!button) return false; button.click(); return true; })()`;
+  const requestedDelete = await command(ws, 'Runtime.evaluate', { expression: deleteAction('Delete user'), returnByValue: true });
+  if (!requestedDelete.result.value) throw new Error('Delete confirmation test user or initial action was missing.');
+  await sleep(50);
+  const confirmation = await command(ws, 'Runtime.evaluate', { expression: "document.body.innerText.includes('Delete Delete Me? Their saved settings go too.') && document.body.innerText.includes('Confirm delete')", returnByValue: true });
+  if (!confirmation.result.value) throw new Error('Delete confirmation did not appear.');
+  const cancelledDelete = await command(ws, 'Runtime.evaluate', { expression: deleteAction('Cancel'), returnByValue: true });
+  if (!cancelledDelete.result.value) throw new Error('Delete cancellation control was missing.');
+  await sleep(50);
+  const cancellation = await command(ws, 'Runtime.evaluate', { expression: "!document.body.innerText.includes('Confirm delete') && document.body.innerText.includes('Delete Me')", returnByValue: true });
+  if (!cancellation.result.value) throw new Error('Delete cancellation did not preserve the user.');
+  await command(ws, 'Runtime.evaluate', { expression: deleteAction('Delete user'), returnByValue: true });
+  await sleep(50);
+  const confirmedDelete = await command(ws, 'Runtime.evaluate', { expression: `(() => { const card = [...document.querySelectorAll('.user-card')].find(card => card.querySelector('h3')?.textContent === 'Delete Me'); const button = [...(card?.querySelectorAll('button') ?? [])].find(button => button.textContent === 'Confirm delete'); if (!button) return false; button.form.requestSubmit(button); return true; })()`, returnByValue: true });
+  if (!confirmedDelete.result.value) throw new Error('Delete confirmation control was missing.');
+  await sleep(50);
+  for (const [width, height] of [[390, 844], [844, 390]]) {
+    await command(ws, 'Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: true });
+    await command(ws, 'Page.navigate', { url: `http://127.0.0.1:${port}/` });
+    await sleep(250);
+    const admin = await command(ws, 'Runtime.evaluate', { expression: 'JSON.stringify({scroll: Math.max(document.documentElement.scrollWidth, document.body.scrollWidth), width: innerWidth, text: document.body.innerText})', returnByValue: true });
+    const page = JSON.parse(admin.result.value);
+    if (page.scroll > page.width || !page.text.includes('Users') || !page.text.includes('Console disconnected') || !page.text.includes('Browser')) throw new Error(`Admin phone layout failed at ${width}x${height}: ${JSON.stringify(page)}`);
+  }
   ws.close();
   console.log('Browser smoke passed at 390x844 and 844x390.');
 } finally {

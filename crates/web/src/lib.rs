@@ -1,12 +1,9 @@
 //! CL5 Monitor Mix's browser client, compiled to WebAssembly by Trunk.
 
 use gloo_net::http::Request;
-use gloo_timers::callback::Timeout;
+use gloo_timers::callback::{Interval, Timeout};
 use serde::Deserialize;
-use std::{
-    cell::{Cell, RefCell},
-    rc::Rc,
-};
+use std::{cell::RefCell, rc::Rc};
 use wasm_bindgen::{closure::Closure, JsCast};
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{MessageEvent, WebSocket};
@@ -24,12 +21,63 @@ struct Bootstrap {
     user: Option<User>,
     users: Vec<String>,
 }
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+struct AdminUser {
+    name: String,
+    role: String,
+    passcode: String,
+    mixes: Vec<String>,
+    last_sign_in: Option<String>,
+}
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+struct HistoryRow {
+    who: String,
+    what: String,
+    when: String,
+}
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+struct ConsoleStatus {
+    connected: bool,
+    address: String,
+    scene_number: Option<u16>,
+    scene_name: Option<String>,
+    mix_labels: Vec<String>,
+    phones_connected: usize,
+}
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+struct AdminOverview {
+    users: Vec<AdminUser>,
+    history: Vec<HistoryRow>,
+    console: ConsoleStatus,
+}
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+struct PerformerMixes {
+    mixes: Vec<String>,
+}
+
+fn refresh_performer_mixes(mixes: UseStateHandle<Option<PerformerMixes>>) {
+    spawn_local(async move {
+        if let Ok(response) = Request::get("/api/performer/mixes").send().await {
+            mixes.set(response.json::<PerformerMixes>().await.ok());
+        }
+    });
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum BridgeMessage {
-    Snapshot { kind: String, connected: bool },
+    Snapshot {
+        kind: String,
+        connected: bool,
+        state: BridgeState,
+    },
     Event(BridgeEvent),
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+struct BridgeState {
+    scene_number: Option<u16>,
+    scene_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -119,14 +167,125 @@ pub fn app() -> Html {
                 </form>
             </>
         },
-        Screen::SignedIn(user) => html! {
+        Screen::SignedIn(user) => {
+            if user.role == "admin" {
+                html! { <AdminPortal user={user.clone()} /> }
+            } else {
+                html! { <><PerformerAssignments user={user.clone()} /><LiveConsole /></> }
+            }
+        }
+    }
+}
+
+#[derive(Properties, PartialEq)]
+struct PerformerAssignmentsProps {
+    user: User,
+}
+
+#[function_component(PerformerAssignments)]
+fn performer_assignments(props: &PerformerAssignmentsProps) -> Html {
+    let mixes = use_state(|| None::<PerformerMixes>);
+    {
+        let mixes = mixes.clone();
+        use_effect_with((), move |_| {
+            refresh_performer_mixes(mixes.clone());
+            let interval = Interval::new(1_000, move || refresh_performer_mixes(mixes.clone()));
+            move || drop(interval)
+        });
+    }
+    let assignment = match &*mixes {
+        Some(value) if value.mixes.is_empty() => "No mixes assigned yet.".into(),
+        Some(value) => format!("Assigned mix numbers: {}", value.mixes.join(", ")),
+        None => "Loading your mix assignments…".into(),
+    };
+    html! { <><h1>{format!("Welcome, {}", props.user.name)}</h1><p>{assignment}</p><p>{"Assignments update automatically."}</p><form method="post" action="/signout"><button>{"Sign out"}</button></form></> }
+}
+
+#[derive(Properties, PartialEq)]
+struct AdminPortalProps {
+    user: User,
+}
+
+#[function_component(AdminPortal)]
+fn admin_portal(props: &AdminPortalProps) -> Html {
+    let overview = use_state(|| None::<AdminOverview>);
+    {
+        let overview = overview.clone();
+        use_effect_with((), move |_| {
+            let refresh = move || {
+                let overview = overview.clone();
+                spawn_local(async move {
+                    if let Ok(response) = Request::get("/api/admin/overview").send().await {
+                        overview.set(response.json::<AdminOverview>().await.ok());
+                    }
+                });
+            };
+            refresh();
+            let interval = Interval::new(1_000, refresh);
+            move || drop(interval)
+        });
+    }
+    let Some(overview) = &*overview else {
+        return html! { <p role="status">{"Loading admin portal…"}</p> };
+    };
+    html! {
+        <>
+            <LiveConsole />
+            <h1>{"Users"}</h1>
+            <p>{format!("Signed in as {}. Console {} at {} · {} phone{} connected.", props.user.name, if overview.console.connected { "connected" } else { "disconnected" }, overview.console.address, overview.console.phones_connected, if overview.console.phones_connected == 1 { "" } else { "s" })}</p>
+            <section class="panel"><h2>{"Add user"}</h2><form method="post" action="/api/admin/users"><label>{"Name"}<input name="name" required=true /></label><label>{"Role"}<select name="role"><option value="performer">{"Performer"}</option><option value="admin">{"Admin"}</option></select></label><label>{"4-digit passcode"}<input name="passcode" value="Generate" pattern="([0-9]{4}|Generate)" required=true /></label><button>{"Add user"}</button></form></section>
+            <section class="users"><h2>{"Saved users"}</h2>{for overview.users.iter().cloned().map(|user| html! { <UserCard {user} mix_labels={overview.console.mix_labels.clone()} /> })}</section>
+            <section class="panel"><h2>{"History"}</h2><ul class="history">{for overview.history.iter().map(|row| html! { <li><strong>{&row.who}</strong>{": "}{&row.what}<small>{format!(" · {}", row.when)}</small></li> })}</ul></section>
+            <form method="post" action="/signout"><button>{"Sign out"}</button></form>
+        </>
+    }
+}
+
+#[derive(Properties, PartialEq)]
+struct UserCardProps {
+    user: AdminUser,
+    mix_labels: Vec<String>,
+}
+
+#[function_component(UserCard)]
+fn user_card(props: &UserCardProps) -> Html {
+    let user = &props.user;
+    let confirming_delete = use_state(|| false);
+    // Names are data, not route syntax. Encode the whole path segment so an
+    // admin can safely manage a name containing '/', '#', '?' or spaces.
+    let encoded = js_sys::encode_uri_component(&user.name)
+        .as_string()
+        .unwrap_or_else(|| user.name.clone());
+    let mixes = if user.mixes.is_empty() {
+        "No mixes assigned".into()
+    } else {
+        user.mixes.join(", ")
+    };
+    let ask_to_delete = {
+        let confirming_delete = confirming_delete.clone();
+        Callback::from(move |_| confirming_delete.set(true))
+    };
+    let cancel_delete = {
+        let confirming_delete = confirming_delete.clone();
+        Callback::from(move |_| confirming_delete.set(false))
+    };
+    let delete_controls = if *confirming_delete {
+        html! {
             <>
-                <h1>{format!("Welcome, {}", user.name)}</h1>
-                <p>{format!("Signed in as {}.", user.role)}</p>
-                <LiveConsole />
-                <form method="post" action="/signout"><button>{"Sign out"}</button></form>
+                <p class="delete-note" role="alert">{format!("Delete {}? Their saved settings go too.", user.name)}</p>
+                <button>{"Confirm delete"}</button>
+                <button type="button" onclick={cancel_delete}>{"Cancel"}</button>
             </>
-        },
+        }
+    } else {
+        html! { <button type="button" onclick={ask_to_delete}>{"Delete user"}</button> }
+    };
+    html! { <article class="user-card"><h3>{&user.name}</h3><p>{format!("{} · code {}", user.role, user.passcode)}</p><p>{format!("Mixes: {mixes}")}</p><p>{format!("Last sign-in: {}", user.last_sign_in.as_deref().unwrap_or("Never"))}</p><form method="post" action={format!("/api/admin/users/{encoded}/passcode")}><label>{"New passcode"}<input name="passcode" value="Generate" pattern="([0-9]{4}|Generate)" required=true /></label><button>{"Reset passcode"}</button></form><form method="post" action={format!("/api/admin/users/{encoded}/mixes")}><fieldset><legend>{"Console mixes"}</legend>{for props.mix_labels.iter().enumerate().map(|(index, label)| { let number = index + 1; let selected = user.mixes.contains(&format!("Mix {number}")); html! { <label class="mix-choice"><input type="checkbox" name="mixes" value={number.to_string()} checked={selected} />{format!("Mix {number}: {label}")}</label> } })}</fieldset><button>{"Save mix assignments"}</button></form><form method="post" action={format!("/api/admin/users/{encoded}")}>{delete_controls}</form></article> }
+}
+
+fn document_title(window: &web_sys::Window, title: &str) {
+    if let Some(document) = window.document() {
+        document.set_title(title);
     }
 }
 
@@ -136,11 +295,13 @@ pub fn app() -> Html {
 #[function_component(LiveConsole)]
 fn live_console() -> Html {
     let notice = use_state(|| "Connecting to console…".to_owned());
-    let connected = Rc::new(Cell::new(false));
+    let connected = use_state(|| false);
+    let scene = use_state(BridgeState::default);
     let scene_notice_timeout = Rc::new(RefCell::new(None::<Timeout>));
     {
         let notice = notice.clone();
         let connected = connected.clone();
+        let scene = scene.clone();
         let scene_notice_timeout = scene_notice_timeout.clone();
         use_effect_with((), move |_| -> Box<dyn FnOnce()> {
             let Some(window) = web_sys::window() else {
@@ -160,21 +321,30 @@ fn live_console() -> Html {
             };
             let message_notice = notice.clone();
             let message_connected = connected.clone();
+            let message_scene = scene.clone();
             let message_scene_notice_timeout = scene_notice_timeout.clone();
             let callback = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
                 let Some(text) = event.data().as_string() else {
                     return;
                 };
                 match serde_json::from_str::<BridgeMessage>(&text) {
-                    Ok(BridgeMessage::Snapshot { kind, connected })
-                        if kind == "snapshot" && connected =>
-                    {
+                    Ok(BridgeMessage::Snapshot {
+                        kind,
+                        connected,
+                        state,
+                    }) if kind == "snapshot" && connected => {
                         message_connected.set(true);
+                        message_scene.set(state);
                         message_scene_notice_timeout.borrow_mut().take();
                         message_notice.set(connection_notice(true).into());
                     }
-                    Ok(BridgeMessage::Snapshot { .. })
-                    | Ok(BridgeMessage::Event(BridgeEvent::Disconnected)) => {
+                    Ok(BridgeMessage::Snapshot { state, .. }) => {
+                        message_connected.set(false);
+                        message_scene.set(state);
+                        message_scene_notice_timeout.borrow_mut().take();
+                        message_notice.set(connection_notice(false).into());
+                    }
+                    Ok(BridgeMessage::Event(BridgeEvent::Disconnected)) => {
                         message_connected.set(false);
                         message_scene_notice_timeout.borrow_mut().take();
                         message_notice.set(connection_notice(false).into());
@@ -185,14 +355,17 @@ fn live_console() -> Html {
                         message_notice.set(connection_notice(true).into());
                     }
                     Ok(BridgeMessage::Event(BridgeEvent::SceneRecalled { number, name })) => {
+                        message_scene.set(BridgeState {
+                            scene_number: Some(number),
+                            scene_name: name.clone(),
+                        });
                         let name = name.unwrap_or_else(|| "Unnamed".into());
                         message_notice.set(format!("Scene {number} {name} recalled — mix updated"));
                         let timeout_notice = message_notice.clone();
                         let timeout_connected = message_connected.clone();
                         *message_scene_notice_timeout.borrow_mut() =
                             Some(Timeout::new(SCENE_RECALL_NOTICE_MS, move || {
-                                timeout_notice
-                                    .set(connection_notice(timeout_connected.get()).into())
+                                timeout_notice.set(connection_notice(*timeout_connected).into())
                             }));
                     }
                     Ok(BridgeMessage::Event(BridgeEvent::Value { key, value })) => {
@@ -210,7 +383,45 @@ fn live_console() -> Html {
             })
         });
     }
-    html! { <p role="status">{(*notice).clone()}</p> }
+    html! { <><SceneBar connected={*connected} scene={(*scene).clone()} /><p role="status">{(*notice).clone()}</p></> }
+}
+
+#[derive(Properties, PartialEq)]
+struct SceneBarProps {
+    connected: bool,
+    scene: BridgeState,
+}
+
+#[function_component(SceneBar)]
+fn scene_bar(props: &SceneBarProps) -> Html {
+    let (number, name, title) = match (
+        props.connected,
+        props.scene.scene_number,
+        props.scene.scene_name.as_deref(),
+    ) {
+        (true, Some(number), Some(name)) if !name.is_empty() => (
+            format!("Scene {number}"),
+            name.to_owned(),
+            format!("{name} · Monitor Mix"),
+        ),
+        (true, Some(number), _) => {
+            let scene = format!("Scene {number}");
+            (
+                scene.clone(),
+                scene.clone(),
+                format!("{scene} · Monitor Mix"),
+            )
+        }
+        _ => (
+            "Console".into(),
+            "Console disconnected — scene unknown".into(),
+            "Console disconnected — scene unknown".into(),
+        ),
+    };
+    if let Some(window) = web_sys::window() {
+        document_title(&window, &title);
+    }
+    html! { <header class="scene-bar"><small>{number}</small><strong>{name}</strong></header> }
 }
 
 fn error_notice(search: &str) -> Option<String> {
