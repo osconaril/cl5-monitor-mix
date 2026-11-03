@@ -63,10 +63,7 @@ async fn main() {
         .expect("CL5_LISTEN must be host:port");
     let app = App::open(&path).expect("open SQLite database");
     if !app.has_admin().expect("read users") {
-        println!(
-            "First-run setup: open http://<this-show-machine's-LAN-IP>:{} /setup from the stage network.",
-            address.port()
-        );
+        println!("{}", setup_instruction(address.port()));
     }
     let listener = tokio::net::TcpListener::bind(address)
         .await
@@ -75,6 +72,11 @@ async fn main() {
     axum::serve(listener, routes(app))
         .await
         .expect("serve HTTP");
+}
+fn setup_instruction(port: u16) -> String {
+    format!(
+        "First-run setup: open http://<this-show-machine's-LAN-IP>:{port}/setup from the stage network."
+    )
 }
 fn routes(app: App) -> Router {
     Router::new()
@@ -346,6 +348,14 @@ mod tests {
         assert!(valid("a", "1234").is_ok());
         assert!(valid("a", "123").is_err());
         assert!(valid("a", "abcd").is_err());
+    }
+
+    #[test]
+    fn first_run_instruction_is_a_complete_lan_url() {
+        assert_eq!(
+            setup_instruction(8080),
+            "First-run setup: open http://<this-show-machine's-LAN-IP>:8080/setup from the stage network."
+        );
     }
 
     #[tokio::test]
