@@ -22,7 +22,8 @@ type Db = Arc<Mutex<Connection>>;
 #[derive(Clone)]
 struct App {
     db: Db,
-    sessions: Arc<Mutex<HashMap<String, User>>>,
+    // Login attempts are deliberately process-local: only sessions need to
+    // survive a routine server restart.
     attempts: Arc<Mutex<HashMap<String, Attempt>>>,
 }
 #[derive(Clone)]
@@ -75,7 +76,6 @@ impl App {
         migrate(&c)?;
         Ok(Self {
             db: Arc::new(Mutex::new(c)),
-            sessions: Default::default(),
             attempts: Default::default(),
         })
     }
@@ -85,7 +85,6 @@ impl App {
         migrate(&c)?;
         Ok(Self {
             db: Arc::new(Mutex::new(c)),
-            sessions: Default::default(),
             attempts: Default::default(),
         })
     }
@@ -221,6 +220,11 @@ async fn signin(State(a): State<App>, Form(f): Form<Credentials>) -> Response {
             e.failures += 1;
             if e.failures >= 5 {
                 e.locked_until = Some(Instant::now() + Duration::from_secs(300));
+                return page(
+                    "Sign in",
+                    "<p>This name is locked. Try again in 300 seconds.</p><a href=/>Try again</a>",
+                )
+                .into_response();
             }
             page("Sign in", "<p>Wrong passcode.</p><a href=/>Try again</a>").into_response()
         }
@@ -228,7 +232,10 @@ async fn signin(State(a): State<App>, Form(f): Form<Credentials>) -> Response {
 }
 async fn signout(State(a): State<App>, h: HeaderMap) -> Response {
     if let Some(t) = cookie(&h) {
-        a.sessions.lock().unwrap().remove(t);
+        let _ =
+            a.db.lock()
+                .unwrap()
+                .execute("DELETE FROM sessions WHERE token=?1", [t]);
     }
     Redirect::to("/").into_response()
 }
@@ -245,7 +252,13 @@ fn login(a: &App, u: User) -> Response {
         .take(32)
         .map(char::from)
         .collect();
-    a.sessions.lock().unwrap().insert(t.clone(), u);
+    a.db.lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO sessions(token,user_name,user_updated_at,created_at) VALUES(?1,?2,?3,?4)",
+            params![&t, &u.name, &u.updated_at, Utc::now().to_rfc3339()],
+        )
+        .expect("store session");
     (
         [
             (
@@ -268,23 +281,16 @@ fn cookie(h: &HeaderMap) -> Option<&str> {
 }
 fn session(a: &App, h: &HeaderMap) -> Option<User> {
     let token = cookie(h)?;
-    let user = a.sessions.lock().unwrap().get(token).cloned()?;
-    let current =
-        a.db.lock()
-            .unwrap()
-            .query_row(
-                "SELECT role,updated_at FROM users WHERE name=?1",
-                [&user.name],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-            )
-            .optional()
-            .ok()??;
-    if current.0 == user.role && current.1 == user.updated_at {
-        Some(user)
-    } else {
-        a.sessions.lock().unwrap().remove(token);
-        None
-    }
+    a.db
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT u.name,u.role,u.updated_at FROM sessions s JOIN users u ON u.name=s.user_name WHERE s.token=?1 AND s.user_updated_at=u.updated_at",
+            [token],
+            |r| Ok(User { name: r.get(0)?, role: r.get(1)?, updated_at: r.get(2)? }),
+        )
+        .optional()
+        .ok()?
 }
 #[cfg(test)]
 mod tests {
@@ -353,7 +359,7 @@ mod tests {
         let app = App::memory().unwrap();
         app.add_user("Admin", "1234", "admin").unwrap();
         app.add_user("Performer", "5678", "performer").unwrap();
-        for _ in 0..5 {
+        for attempt in 1..=5 {
             let response = call(
                 &app,
                 Request::post("/signin")
@@ -363,6 +369,11 @@ mod tests {
             )
             .await;
             assert_eq!(response.status(), StatusCode::OK);
+            if attempt == 5 {
+                let body = response_text(response).await;
+                assert!(body.contains("This name is locked"));
+                assert!(body.contains("300 seconds"));
+            }
         }
         let locked = call(
             &app,
@@ -462,6 +473,43 @@ mod tests {
             signed_out.headers().get(header::LOCATION).unwrap(),
             "/setup"
         );
+    }
+
+    #[tokio::test]
+    async fn session_survives_a_server_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "cl5-session-restart-{}-{}.sqlite",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        let app = App::open(path.to_str().unwrap()).unwrap();
+        app.add_user("Performer", "5678", "performer").unwrap();
+        let response = login(&app, app.user("Performer", "5678").unwrap().unwrap());
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        drop(app);
+
+        let restarted = App::open(path.to_str().unwrap()).unwrap();
+        let home = call(
+            &restarted,
+            Request::get("/")
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(home.status(), StatusCode::OK);
+        assert!(response_text(home).await.contains("Welcome, Performer"));
+        drop(restarted);
+        std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]

@@ -7,3 +7,9 @@ CREATE TABLE IF NOT EXISTS users (
   updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY, applied_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS sessions (
+  token TEXT PRIMARY KEY,
+  user_name TEXT NOT NULL,
+  user_updated_at TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
