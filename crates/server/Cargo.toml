@@ -17,4 +17,5 @@ tower-http.workspace = true
 cl5-web = { path = "../web" }
 
 [dev-dependencies]
+fake-console = { path = "../fake-console" }
 tower.workspace = true

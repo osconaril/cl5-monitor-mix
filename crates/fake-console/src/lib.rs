@@ -20,6 +20,7 @@ pub struct FakeConsole {
     reply_delay: Arc<RwLock<Duration>>,
     connection_limit: Arc<RwLock<usize>>,
     active_connections: Arc<Mutex<usize>>,
+    total_connections: Arc<Mutex<usize>>,
 }
 
 #[derive(Debug)]
@@ -68,6 +69,7 @@ impl Default for FakeConsole {
             reply_delay: Arc::new(RwLock::new(Duration::ZERO)),
             connection_limit: Arc::new(RwLock::new(usize::MAX)),
             active_connections: Arc::new(Mutex::new(0)),
+            total_connections: Arc::new(Mutex::new(0)),
         }
     }
 }
@@ -106,6 +108,12 @@ impl FakeConsole {
         let _ = self.notifications.send("__FAKE_DROP__".into());
     }
 
+    /// Test-only connection accounting lets the bridge prove that browsers do
+    /// not fan out into one console connection apiece.
+    pub async fn total_connections(&self) -> usize {
+        *self.total_connections.lock().await
+    }
+
     async fn accept(self: Arc<Self>, stream: TcpStream) -> io::Result<()> {
         {
             let mut active = self.active_connections.lock().await;
@@ -113,6 +121,7 @@ impl FakeConsole {
                 return Ok(());
             }
             *active += 1;
+            *self.total_connections.lock().await += 1;
         }
         let result = self.clone().serve(stream).await;
         *self.active_connections.lock().await -= 1;
