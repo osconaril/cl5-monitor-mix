@@ -1,11 +1,26 @@
 {
   "team": "CL5 Monitor Mix",
-  "ship": "review-only",
+  "ship": "auto",
+  "_shipComment": [
+    "auto since 2026-11-02 on Corey's word in chat (\"Please auto ship things ready\"), after the CL5-1 smoke pass",
+    "proved build -> review -> merge end to end. Was review-only until then. Migrations and console-control",
+    "cards still stop (shipStops below), and auth/sign-in paths are held by ~/dev-loop/auth-gates.json."
+  ],
+  "deployNote": [
+    "There is NO hosted deployment: no Vercel, no preview, no production URL. The app runs on the show machine,",
+    "which pulls main. So for this repo a ship is: merge at the approved exact head, confirm the merge commit is",
+    "on origin/main and the required `verify` check is green on it, then move the card to Done. Do not wait for",
+    "or search for a deploy; there is none to find, and the post-condition reads it as unverified, not failed."
+  ],
   "shipStops": {
-    "paths": ["crates/server/migrations/**"],
+    "paths": ["crates/server/migrations/"],
     "pathsReason": "SQLite schema changes run on the show machine at startup; a bad migration can lock performers out mid-show.",
     "labels": ["console-control"],
     "labelsReason": "Anything that changes what is sent to the live console is checked against the real CL5 before shipping."
+  },
+  "machineMigrations": {
+    "ownership": "deploy",
+    "reason": "The show-machine server applies bundled SQLite migrations before binding its LAN listener; migration and deployment are one atomic step."
   },
   "verify": {
     "typecheck": "cargo check --workspace --all-targets",
