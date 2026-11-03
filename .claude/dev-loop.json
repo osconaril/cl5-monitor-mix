@@ -13,10 +13,28 @@
     "or search for a deploy; there is none to find, and the post-condition reads it as unverified, not failed."
   ],
   "shipStops": {
-    "paths": ["crates/server/migrations/"],
+    "paths": [
+      "crates/server/migrations/"
+    ],
     "pathsReason": "SQLite schema changes run on the show machine at startup; a bad migration can lock performers out mid-show.",
-    "labels": ["console-control"],
-    "labelsReason": "Anything that changes what is sent to the live console is checked against the real CL5 before shipping."
+    "labels": [],
+    "labelsReason": "console-control no longer stops a merge: Corey ruled 2026-11-03 (\"1\", CL5-5) that console cards merge after review against the fake console, and the real-console check is CL5-8, which must pass before the first show. Restore it when CL5-8 is Done.",
+    "riskWordingExempt": [
+      "pr",
+      "card"
+    ],
+    "riskWordingExemptReason": "Corey's standing decision in chat, 2026-11-03: \"For CL5 ship anything ready. Even red\". The app is not on the show machine and no show uses it yet, so a reviewer-approved PR at its exact head ships without waiting for him, RED included. Observed failure: CL5-4 (#12) was approved at db7464e and sat in My Turn on a needs=red-ship ticket the decision had already answered. Still stops (dev-loop enforces it): review and required checks, needs-human-review, builder escalations, money-path, a person's risk-red, permanent data deletion in the diff, and migrations (they clear only through the exact-head-ci receipt: additive SQL, green verify, receiptTest).",
+    "riskWordingExemptExpires": "ENDS when CL5-8 (the real-CL5 check) is Done and the app is used at its first show. From then a bad merge reaches a live show: delete riskWordingExempt, benchAskExempt and redShipTicketExempt with their Reason/Expires keys, and put console-control back in shipStops.labels.",
+    "benchAskExempt": [
+      "product-decision"
+    ],
+    "benchAskExemptReason": "Corey's standing decision in chat, 2026-11-03: \"For CL5 ship anything ready. Even red\". The app is not on the show machine and no show uses it yet, so a reviewer-approved PR at its exact head ships without waiting for him, RED included. Observed failure: CL5-4 (#12) was approved at db7464e and sat in My Turn on a needs=red-ship ticket the decision had already answered. Still stops (dev-loop enforces it): review and required checks, needs-human-review, builder escalations, money-path, a person's risk-red, permanent data deletion in the diff, and migrations (they clear only through the exact-head-ci receipt: additive SQL, green verify, receiptTest).",
+    "benchAskExemptExpires": "ENDS when CL5-8 (the real-CL5 check) is Done and the app is used at its first show. From then a bad merge reaches a live show: delete riskWordingExempt, benchAskExempt and redShipTicketExempt with their Reason/Expires keys, and put console-control back in shipStops.labels.",
+    "redShipTicketExempt": [
+      "red-ship"
+    ],
+    "redShipTicketExemptReason": "Corey's standing decision in chat, 2026-11-03: \"For CL5 ship anything ready. Even red\". The app is not on the show machine and no show uses it yet, so a reviewer-approved PR at its exact head ships without waiting for him, RED included. Observed failure: CL5-4 (#12) was approved at db7464e and sat in My Turn on a needs=red-ship ticket the decision had already answered. Still stops (dev-loop enforces it): review and required checks, needs-human-review, builder escalations, money-path, a person's risk-red, permanent data deletion in the diff, and migrations (they clear only through the exact-head-ci receipt: additive SQL, green verify, receiptTest).",
+    "redShipTicketExemptExpires": "ENDS when CL5-8 (the real-CL5 check) is Done and the app is used at its first show. From then a bad merge reaches a live show: delete riskWordingExempt, benchAskExempt and redShipTicketExempt with their Reason/Expires keys, and put console-control back in shipStops.labels."
   },
   "machineMigrations": {
     "ownership": "deploy",
@@ -27,7 +45,13 @@
   "verify": {
     "typecheck": "cargo check --workspace --all-targets",
     "lint": "cargo clippy --workspace --all-targets -- -D warnings",
-    "tests": ["cargo test --workspace", "cargo check -p cl5-web --target wasm32-unknown-unknown"]
+    "tests": [
+      "cargo test --workspace",
+      "cargo check -p cl5-web --target wasm32-unknown-unknown"
+    ]
   },
-  "slack": { "workspace": "lead2client", "channel": "C0CE31KNJ5R" }
+  "slack": {
+    "workspace": "lead2client",
+    "channel": "C0CE31KNJ5R"
+  }
 }
