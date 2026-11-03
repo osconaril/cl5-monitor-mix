@@ -236,14 +236,22 @@ fn admin_portal(props: &AdminPortalProps) -> Html {
             <h1>{"Users"}</h1>
             <p>{format!("Signed in as {}. Console {} at {} · {} phone{} connected.", props.user.name, if overview.console.connected { "connected" } else { "disconnected" }, overview.console.address, overview.console.phones_connected, if overview.console.phones_connected == 1 { "" } else { "s" })}</p>
             <section class="panel"><h2>{"Add user"}</h2><form method="post" action="/api/admin/users"><label>{"Name"}<input name="name" required=true /></label><label>{"Role"}<select name="role"><option value="performer">{"Performer"}</option><option value="admin">{"Admin"}</option></select></label><label>{"4-digit passcode"}<input name="passcode" value="Generate" pattern="([0-9]{4}|Generate)" required=true /></label><button>{"Add user"}</button></form></section>
-            <section class="users"><h2>{"Saved users"}</h2>{for overview.users.iter().map(user_card)}</section>
+            <section class="users"><h2>{"Saved users"}</h2>{for overview.users.iter().cloned().map(|user| html! { <UserCard {user} /> })}</section>
             <section class="panel"><h2>{"History"}</h2><ul class="history">{for overview.history.iter().map(|row| html! { <li><strong>{&row.who}</strong>{": "}{&row.what}<small>{format!(" · {}", row.when)}</small></li> })}</ul></section>
             <form method="post" action="/signout"><button>{"Sign out"}</button></form>
         </>
     }
 }
 
-fn user_card(user: &AdminUser) -> Html {
+#[derive(Properties, PartialEq)]
+struct UserCardProps {
+    user: AdminUser,
+}
+
+#[function_component(UserCard)]
+fn user_card(props: &UserCardProps) -> Html {
+    let user = &props.user;
+    let confirming_delete = use_state(|| false);
     // Names are data, not route syntax. Encode the whole path segment so an
     // admin can safely manage a name containing '/', '#', '?' or spaces.
     let encoded = js_sys::encode_uri_component(&user.name)
@@ -254,7 +262,26 @@ fn user_card(user: &AdminUser) -> Html {
     } else {
         user.mixes.join(", ")
     };
-    html! { <article class="user-card"><h3>{&user.name}</h3><p>{format!("{} · code {}", user.role, user.passcode)}</p><p>{format!("Mixes: {mixes}")}</p><p>{format!("Last sign-in: {}", user.last_sign_in.as_deref().unwrap_or("Never"))}</p><form method="post" action={format!("/api/admin/users/{encoded}/passcode")}><label>{"New passcode"}<input name="passcode" value="Generate" pattern="([0-9]{4}|Generate)" required=true /></label><button>{"Reset passcode"}</button></form><form method="post" action={format!("/api/admin/users/{encoded}/mixes")}><fieldset><legend>{"Mix numbers"}</legend>{for (1..=24).map(|number| { let selected = user.mixes.contains(&format!("Mix {number}")); html! { <label class="mix-choice"><input type="checkbox" name="mixes" value={number.to_string()} checked={selected} />{format!("Mix {number}")}</label> } })}</fieldset><button>{"Save mix assignments"}</button></form><form method="post" action={format!("/api/admin/users/{encoded}")}><p class="delete-note">{format!("Delete {}? Their saved settings go too.", user.name)}</p><button>{"Delete user"}</button></form></article> }
+    let ask_to_delete = {
+        let confirming_delete = confirming_delete.clone();
+        Callback::from(move |_| confirming_delete.set(true))
+    };
+    let cancel_delete = {
+        let confirming_delete = confirming_delete.clone();
+        Callback::from(move |_| confirming_delete.set(false))
+    };
+    let delete_controls = if *confirming_delete {
+        html! {
+            <>
+                <p class="delete-note" role="alert">{format!("Delete {}? Their saved settings go too.", user.name)}</p>
+                <button>{"Confirm delete"}</button>
+                <button type="button" onclick={cancel_delete}>{"Cancel"}</button>
+            </>
+        }
+    } else {
+        html! { <button type="button" onclick={ask_to_delete}>{"Delete user"}</button> }
+    };
+    html! { <article class="user-card"><h3>{&user.name}</h3><p>{format!("{} · code {}", user.role, user.passcode)}</p><p>{format!("Mixes: {mixes}")}</p><p>{format!("Last sign-in: {}", user.last_sign_in.as_deref().unwrap_or("Never"))}</p><form method="post" action={format!("/api/admin/users/{encoded}/passcode")}><label>{"New passcode"}<input name="passcode" value="Generate" pattern="([0-9]{4}|Generate)" required=true /></label><button>{"Reset passcode"}</button></form><form method="post" action={format!("/api/admin/users/{encoded}/mixes")}><fieldset><legend>{"Mix numbers"}</legend>{for (1..=24).map(|number| { let selected = user.mixes.contains(&format!("Mix {number}")); html! { <label class="mix-choice"><input type="checkbox" name="mixes" value={number.to_string()} checked={selected} />{format!("Mix {number}")}</label> } })}</fieldset><button>{"Save mix assignments"}</button></form><form method="post" action={format!("/api/admin/users/{encoded}")}>{delete_controls}</form></article> }
 }
 
 fn document_title(window: &web_sys::Window, title: &str) {
