@@ -12,9 +12,13 @@ local-ip-address.workspace = true
 rand.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 tower-http.workspace = true
 cl5-web = { path = "../web" }
 
 [dev-dependencies]
+fake-console = { path = "../fake-console" }
+futures-util = "0.3"
+tokio-tungstenite = "0.29"
 tower.workspace = true

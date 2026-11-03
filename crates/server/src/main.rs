@@ -1,6 +1,10 @@
-//! Offline LAN sign-in server. Console control is intentionally a later card.
+//! Offline LAN sign-in server and the shared CL5 console bridge.
+mod console;
 use axum::{
-    extract::{Form, State},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Form, State,
+    },
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -11,7 +15,7 @@ use rand::{distr::Alphanumeric, Rng};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env,
     net::SocketAddr,
     path::PathBuf,
@@ -27,6 +31,7 @@ struct App {
     // Login attempts are deliberately process-local: only sessions need to
     // survive a routine server restart.
     attempts: Arc<Mutex<HashMap<String, Attempt>>>,
+    bridge: console::ConsoleBridge,
 }
 #[derive(Clone)]
 struct User {
@@ -54,6 +59,19 @@ struct Credentials {
     name: String,
     passcode: String,
 }
+#[derive(Deserialize)]
+struct ConsoleChange {
+    path: String,
+    input: u8,
+    mix: u8,
+    value: String,
+}
+#[derive(Serialize)]
+struct ConsoleSnapshot {
+    kind: &'static str,
+    connected: bool,
+    state: console::ConsoleState,
+}
 
 #[tokio::main]
 async fn main() {
@@ -62,7 +80,11 @@ async fn main() {
         .unwrap_or_else(|_| "0.0.0.0:8080".into())
         .parse()
         .expect("CL5_LISTEN must be host:port");
-    let app = App::open(&path).expect("open SQLite database");
+    let console_address =
+        env::var("CL5_CONSOLE_ADDRESS").unwrap_or_else(|_| "127.0.0.1:49280".into());
+    let app = App::open(&path)
+        .expect("open SQLite database")
+        .with_console(console_address);
     if !app.has_admin().expect("read users") {
         let lan_address =
             local_ip_address::local_ip().expect("find a reachable LAN address for first-run setup");
@@ -87,6 +109,7 @@ fn routes(app: App) -> Router {
         .route("/signout", post(signout))
         .route("/api/admin/ping", get(admin_ping))
         .route("/api/bootstrap", get(bootstrap))
+        .route("/api/console", get(console_socket).post(console_change))
         .with_state(app)
         .fallback_service(ServeDir::new(web_dist()))
 }
@@ -97,6 +120,7 @@ impl App {
         Ok(Self {
             db: Arc::new(Mutex::new(c)),
             attempts: Default::default(),
+            bridge: console::ConsoleBridge::offline(),
         })
     }
     #[cfg(test)]
@@ -106,7 +130,17 @@ impl App {
         Ok(Self {
             db: Arc::new(Mutex::new(c)),
             attempts: Default::default(),
+            bridge: console::ConsoleBridge::offline(),
         })
+    }
+    fn with_console(mut self, address: String) -> Self {
+        self.bridge = console::ConsoleBridge::start(address);
+        self
+    }
+    #[cfg(test)]
+    fn with_bridge(mut self, bridge: console::ConsoleBridge) -> Self {
+        self.bridge = bridge;
+        self
     }
     fn has_admin(&self) -> rusqlite::Result<bool> {
         Ok(self.db.lock().unwrap().query_row(
@@ -231,6 +265,100 @@ async fn bootstrap(State(a): State<App>, headers: HeaderMap) -> Json<Bootstrap> 
         users: a.user_names().unwrap_or_default(),
     })
 }
+async fn console_socket(
+    ws: WebSocketUpgrade,
+    State(a): State<App>,
+    headers: HeaderMap,
+) -> Response {
+    if session(&a, &headers).is_none() {
+        return (StatusCode::UNAUTHORIZED, "Sign in first.").into_response();
+    }
+    ws.on_upgrade(move |socket| stream_console(socket, a.bridge))
+        .into_response()
+}
+
+async fn stream_console(mut socket: WebSocket, bridge: console::ConsoleBridge) {
+    if send_console_snapshot(&mut socket, &bridge).await.is_err() {
+        return;
+    }
+    let mut events = bridge.subscribe();
+    loop {
+        match events.recv().await {
+            Ok(event) => {
+                if send_socket(&mut socket, &event).await.is_err() {
+                    return;
+                }
+            }
+            // A scene rehydration deliberately emits more individual values
+            // than a slow browser's event buffer can hold. The bridge state is
+            // authoritative, so replace the missed delta with one fresh
+            // snapshot and continue listening for later changes.
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                if send_console_snapshot(&mut socket, &bridge).await.is_err() {
+                    return;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+        }
+    }
+}
+
+async fn send_console_snapshot(
+    socket: &mut WebSocket,
+    bridge: &console::ConsoleBridge,
+) -> Result<(), ()> {
+    send_socket(
+        socket,
+        &ConsoleSnapshot {
+            kind: "snapshot",
+            connected: bridge.is_connected(),
+            state: bridge.state().await,
+        },
+    )
+    .await
+}
+
+async fn send_socket<T: Serialize>(socket: &mut WebSocket, message: &T) -> Result<(), ()> {
+    let json = serde_json::to_string(message).map_err(|_| ())?;
+    socket
+        .send(Message::Text(json.into()))
+        .await
+        .map_err(|_| ())
+}
+
+async fn console_change(
+    State(a): State<App>,
+    headers: HeaderMap,
+    Json(change): Json<ConsoleChange>,
+) -> Response {
+    let Some(user) = session(&a, &headers) else {
+        return (StatusCode::UNAUTHORIZED, "Sign in first.").into_response();
+    };
+    if !may_change_mix(&a, &user, change.mix) {
+        return (StatusCode::FORBIDDEN, "That mix is not assigned to you.").into_response();
+    }
+    let change = console::PhoneChange {
+        path: change.path,
+        input: change.input,
+        mix: change.mix,
+        value: change.value,
+    };
+    match a.bridge.change(change).await {
+        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Err(message) => (StatusCode::BAD_REQUEST, message).into_response(),
+    }
+}
+
+/// The assignment table intentionally starts empty until CL5-4 adds its
+/// administration flow.  That means performers are denied by default; admins
+/// retain emergency control of every mix.
+fn may_change_mix(a: &App, user: &User, mix: u8) -> bool {
+    user.role == "admin" || assigned_mixes(a, &user.name).contains(&mix)
+}
+
+fn assigned_mixes(_a: &App, _user_name: &str) -> HashSet<u8> {
+    HashSet::new()
+}
 async fn setup(State(a): State<App>, Form(f): Form<Credentials>) -> Response {
     match a.add_first_admin(&f.name, &f.passcode) {
         Ok(()) => login(&a, a.user(&f.name, &f.passcode).unwrap().unwrap()),
@@ -348,6 +476,9 @@ mod tests {
         body::{to_bytes, Body},
         http::Request,
     };
+    use futures_util::StreamExt;
+    use tokio::{net::TcpListener, time::timeout};
+    use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest};
     use tower::ServiceExt;
 
     async fn response_text(response: Response) -> String {
@@ -362,6 +493,118 @@ mod tests {
 
     async fn call(app: &App, request: Request<Body>) -> Response {
         routes(app.clone()).oneshot(request).await.unwrap()
+    }
+
+    async fn next_websocket_text<S>(socket: &mut tokio_tungstenite::WebSocketStream<S>) -> String
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        timeout(Duration::from_secs(15), async {
+            loop {
+                match socket.next().await {
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                        break text.to_string()
+                    }
+                    Some(Ok(_)) => continue,
+                    Some(Err(error)) => panic!("websocket read failed: {error}"),
+                    None => panic!("websocket closed"),
+                }
+            }
+        })
+        .await
+        .expect("websocket response arrives")
+    }
+
+    #[tokio::test]
+    async fn websocket_resynchronizes_after_scene_recall_and_stays_live() {
+        use fake_console::FakeConsole;
+
+        let fake = Arc::new(FakeConsole::new());
+        let console_address = fake.clone().listen("127.0.0.1:0").await.unwrap();
+        let bridge = console::ConsoleBridge::start_for_lag_test(console_address.to_string());
+        let app = App::memory().unwrap().with_bridge(bridge.clone());
+        app.add_user("Admin", "1234", "admin").unwrap();
+        timeout(Duration::from_secs(15), async {
+            while !bridge.is_connected() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("bridge connects to fake console");
+
+        let login_response = login(&app, app.user("Admin", "1234").unwrap().unwrap());
+        let cookie = login_response.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, routes(app)).await });
+
+        let mut request = format!("ws://{address}/api/console")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert(header::COOKIE, cookie.parse().unwrap());
+        let (mut socket, _) = connect_async(request).await.unwrap();
+        assert!(next_websocket_text(&mut socket)
+            .await
+            .contains("\"kind\":\"snapshot\""));
+
+        fake.recall_scene(2).await.unwrap();
+        let resynchronized = timeout(Duration::from_secs(5), async {
+            loop {
+                if next_websocket_text(&mut socket)
+                    .await
+                    .contains("\"kind\":\"snapshot\"")
+                {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(
+            resynchronized.is_ok(),
+            "scene recall resynchronizes the WebSocket"
+        );
+
+        timeout(Duration::from_secs(15), async {
+            while !bridge.is_connected() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("bridge rehydrates before accepting the later phone change");
+
+        bridge
+            .change(console::PhoneChange {
+                path: console::LEVEL.into(),
+                input: 0,
+                mix: 0,
+                value: "-2".into(),
+            })
+            .await
+            .unwrap();
+        let later_change = timeout(Duration::from_secs(5), async {
+            loop {
+                if next_websocket_text(&mut socket)
+                    .await
+                    .contains("\"value\":\"-2\"")
+                {
+                    break;
+                }
+            }
+        })
+        .await;
+        server.abort();
+        assert!(
+            later_change.is_ok(),
+            "the same WebSocket receives later console changes"
+        );
     }
 
     #[test]
@@ -405,6 +648,23 @@ mod tests {
         assert!(valid("a", "1234").is_ok());
         assert!(valid("a", "123").is_err());
         assert!(valid("a", "abcd").is_err());
+    }
+
+    #[test]
+    fn performers_are_denied_unassigned_mixes_while_admins_can_operate_any_mix() {
+        let app = App::memory().unwrap();
+        let performer = User {
+            name: "Performer".into(),
+            role: "performer".into(),
+            updated_at: "now".into(),
+        };
+        let admin = User {
+            name: "Admin".into(),
+            role: "admin".into(),
+            updated_at: "now".into(),
+        };
+        assert!(!may_change_mix(&app, &performer, 0));
+        assert!(may_change_mix(&app, &admin, 23));
     }
 
     #[test]
