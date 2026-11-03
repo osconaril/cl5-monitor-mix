@@ -68,8 +68,18 @@ fn refresh_performer_mixes(mixes: UseStateHandle<Option<PerformerMixes>>) {
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum BridgeMessage {
-    Snapshot { kind: String, connected: bool },
+    Snapshot {
+        kind: String,
+        connected: bool,
+        state: BridgeState,
+    },
     Event(BridgeEvent),
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+struct BridgeState {
+    scene_number: Option<u16>,
+    scene_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -220,36 +230,9 @@ fn admin_portal(props: &AdminPortalProps) -> Html {
     let Some(overview) = &*overview else {
         return html! { <p role="status">{"Loading admin portal…"}</p> };
     };
-    let (scene_number, scene_name, title) = match (
-        overview.console.connected,
-        overview.console.scene_number,
-        overview.console.scene_name.as_deref(),
-    ) {
-        (true, Some(number), Some(name)) if !name.is_empty() => (
-            format!("Scene {number}"),
-            name.to_owned(),
-            format!("{name} · Monitor Mix"),
-        ),
-        (true, Some(number), _) => {
-            let scene = format!("Scene {number}");
-            (
-                scene.clone(),
-                scene.clone(),
-                format!("{scene} · Monitor Mix"),
-            )
-        }
-        _ => (
-            "Console".into(),
-            "Console disconnected — scene unknown".into(),
-            "Console disconnected — scene unknown".into(),
-        ),
-    };
-    if let Some(window) = web_sys::window() {
-        document_title(&window, &title);
-    }
     html! {
         <>
-            <header class="scene-bar"><small>{scene_number}</small><strong>{scene_name}</strong></header>
+            <LiveConsole />
             <h1>{"Users"}</h1>
             <p>{format!("Signed in as {}. Console {} at {} · {} phone{} connected.", props.user.name, if overview.console.connected { "connected" } else { "disconnected" }, overview.console.address, overview.console.phones_connected, if overview.console.phones_connected == 1 { "" } else { "s" })}</p>
             <section class="panel"><h2>{"Add user"}</h2><form method="post" action="/api/admin/users"><label>{"Name"}<input name="name" required=true /></label><label>{"Role"}<select name="role"><option value="performer">{"Performer"}</option><option value="admin">{"Admin"}</option></select></label><label>{"4-digit passcode"}<input name="passcode" value="Generate" pattern="([0-9]{4}|Generate)" required=true /></label><button>{"Add user"}</button></form></section>
@@ -283,10 +266,12 @@ fn document_title(window: &web_sys::Window, title: &str) {
 fn live_console() -> Html {
     let notice = use_state(|| "Connecting to console…".to_owned());
     let connected = Rc::new(Cell::new(false));
+    let scene = use_state(BridgeState::default);
     let scene_notice_timeout = Rc::new(RefCell::new(None::<Timeout>));
     {
         let notice = notice.clone();
         let connected = connected.clone();
+        let scene = scene.clone();
         let scene_notice_timeout = scene_notice_timeout.clone();
         use_effect_with((), move |_| -> Box<dyn FnOnce()> {
             let Some(window) = web_sys::window() else {
@@ -306,21 +291,30 @@ fn live_console() -> Html {
             };
             let message_notice = notice.clone();
             let message_connected = connected.clone();
+            let message_scene = scene.clone();
             let message_scene_notice_timeout = scene_notice_timeout.clone();
             let callback = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
                 let Some(text) = event.data().as_string() else {
                     return;
                 };
                 match serde_json::from_str::<BridgeMessage>(&text) {
-                    Ok(BridgeMessage::Snapshot { kind, connected })
-                        if kind == "snapshot" && connected =>
-                    {
+                    Ok(BridgeMessage::Snapshot {
+                        kind,
+                        connected,
+                        state,
+                    }) if kind == "snapshot" && connected => {
                         message_connected.set(true);
+                        message_scene.set(state);
                         message_scene_notice_timeout.borrow_mut().take();
                         message_notice.set(connection_notice(true).into());
                     }
-                    Ok(BridgeMessage::Snapshot { .. })
-                    | Ok(BridgeMessage::Event(BridgeEvent::Disconnected)) => {
+                    Ok(BridgeMessage::Snapshot { state, .. }) => {
+                        message_connected.set(false);
+                        message_scene.set(state);
+                        message_scene_notice_timeout.borrow_mut().take();
+                        message_notice.set(connection_notice(false).into());
+                    }
+                    Ok(BridgeMessage::Event(BridgeEvent::Disconnected)) => {
                         message_connected.set(false);
                         message_scene_notice_timeout.borrow_mut().take();
                         message_notice.set(connection_notice(false).into());
@@ -331,6 +325,10 @@ fn live_console() -> Html {
                         message_notice.set(connection_notice(true).into());
                     }
                     Ok(BridgeMessage::Event(BridgeEvent::SceneRecalled { number, name })) => {
+                        message_scene.set(BridgeState {
+                            scene_number: Some(number),
+                            scene_name: name.clone(),
+                        });
                         let name = name.unwrap_or_else(|| "Unnamed".into());
                         message_notice.set(format!("Scene {number} {name} recalled — mix updated"));
                         let timeout_notice = message_notice.clone();
@@ -356,7 +354,45 @@ fn live_console() -> Html {
             })
         });
     }
-    html! { <p role="status">{(*notice).clone()}</p> }
+    html! { <><SceneBar connected={connected.get()} scene={(*scene).clone()} /><p role="status">{(*notice).clone()}</p></> }
+}
+
+#[derive(Properties, PartialEq)]
+struct SceneBarProps {
+    connected: bool,
+    scene: BridgeState,
+}
+
+#[function_component(SceneBar)]
+fn scene_bar(props: &SceneBarProps) -> Html {
+    let (number, name, title) = match (
+        props.connected,
+        props.scene.scene_number,
+        props.scene.scene_name.as_deref(),
+    ) {
+        (true, Some(number), Some(name)) if !name.is_empty() => (
+            format!("Scene {number}"),
+            name.to_owned(),
+            format!("{name} · Monitor Mix"),
+        ),
+        (true, Some(number), _) => {
+            let scene = format!("Scene {number}");
+            (
+                scene.clone(),
+                scene.clone(),
+                format!("{scene} · Monitor Mix"),
+            )
+        }
+        _ => (
+            "Console".into(),
+            "Console disconnected — scene unknown".into(),
+            "Console disconnected — scene unknown".into(),
+        ),
+    };
+    if let Some(window) = web_sys::window() {
+        document_title(&window, &title);
+    }
+    html! { <header class="scene-bar"><small>{number}</small><strong>{name}</strong></header> }
 }
 
 fn error_notice(search: &str) -> Option<String> {
