@@ -345,9 +345,11 @@ impl PhoneChange {
     pub fn rcp(&self) -> Result<String, &'static str> {
         self.validate()?;
         let value = if self.path == LEVEL && self.value == "Off" {
-            "-32768"
+            "-32768".to_owned()
+        } else if self.path == LEVEL {
+            (self.value.parse::<i16>().expect("validated whole dB") * 100).to_string()
         } else {
-            &self.value
+            self.value.clone()
         };
         Ok(format!(
             "set {} {} {} {value}",
@@ -392,7 +394,7 @@ mod tests {
 
     #[test]
     fn phone_levels_are_whole_db_or_off() {
-        assert_eq!(level("-3").rcp().unwrap(), format!("set {LEVEL} 0 0 -3"));
+        assert_eq!(level("-3").rcp().unwrap(), format!("set {LEVEL} 0 0 -300"));
         assert_eq!(
             level("Off").rcp().unwrap(),
             format!("set {LEVEL} 0 0 -32768")
@@ -401,6 +403,66 @@ mod tests {
             level("-3.5").validate(),
             Err("Send level must be a whole dB value or Off.")
         );
+    }
+
+    #[test]
+    fn whole_db_phone_levels_use_the_consoles_hundredth_db_units() {
+        for db in -138..=10 {
+            assert_eq!(
+                level(&db.to_string()).rcp().unwrap(),
+                format!("set {LEVEL} 0 0 {}", db * 100)
+            );
+        }
+        for invalid in ["-139", "11", "-3.5", "NaN", "1000"] {
+            assert!(level(invalid).rcp().is_err(), "{invalid}");
+        }
+    }
+
+    #[tokio::test]
+    async fn engineer_fractional_level_survives_hydration_and_a_phone_move_uses_db_units() {
+        let fake = Arc::new(FakeConsole::new());
+        let address = fake.clone().listen("127.0.0.1:0").await.unwrap();
+        let engineer = TcpStream::connect(address).await.unwrap();
+        let mut engineer = BufReader::new(engineer);
+        engineer
+            .get_mut()
+            .write_all(format!("set {LEVEL} 0 0 -350\n").as_bytes())
+            .await
+            .unwrap();
+        let mut reply = String::new();
+        engineer.read_line(&mut reply).await.unwrap();
+        assert_eq!(reply.trim(), "OK");
+        let bridge = ConsoleBridge::start(address.to_string());
+        ready(&bridge).await;
+        let key = format!("{LEVEL} 0 0");
+        assert_eq!(
+            bridge.state().await.values.get(&key).map(String::as_str),
+            Some("-350")
+        );
+        bridge.change(level("-3")).await.unwrap();
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if bridge.state().await.values.get(&key).map(String::as_str) == Some("-300") {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the console reports minus three dB, not minus 0.03 dB");
+        engineer
+            .get_mut()
+            .write_all(format!("get {LEVEL} 0 0\n").as_bytes())
+            .await
+            .unwrap();
+        loop {
+            reply.clear();
+            engineer.read_line(&mut reply).await.unwrap();
+            if reply.starts_with("OK get") {
+                break;
+            }
+        }
+        assert_eq!(reply.trim(), format!("OK get {LEVEL} 0 0 -300"));
     }
 
     async fn ready(bridge: &ConsoleBridge) {
@@ -432,7 +494,7 @@ mod tests {
         bridge.change(level("-2")).await.unwrap();
         timeout(Duration::from_secs(1), async {
             loop {
-                if matches!(events.recv().await, Ok(BridgeEvent::Value { value, .. }) if value == "-2") { break; }
+                if matches!(events.recv().await, Ok(BridgeEvent::Value { value, .. }) if value == "-200") { break; }
             }
         }).await.expect("latest coalesced write reaches the fake console");
         assert_eq!(fake.total_connections().await, 1);
@@ -449,7 +511,7 @@ mod tests {
         for browser in &mut browsers {
             timeout(Duration::from_millis(200), async {
                 loop {
-                    if matches!(browser.recv().await, Ok(BridgeEvent::Value { value, .. }) if value == "-3") {
+                    if matches!(browser.recv().await, Ok(BridgeEvent::Value { value, .. }) if value == "-300") {
                         break;
                     }
                 }

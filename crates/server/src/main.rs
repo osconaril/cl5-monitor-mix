@@ -1086,7 +1086,7 @@ mod tests {
             loop {
                 if next_websocket_text(&mut socket)
                     .await
-                    .contains("\"value\":\"-2\"")
+                    .contains("\"value\":\"-200\"")
                 {
                     break;
                 }
