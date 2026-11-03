@@ -2,10 +2,14 @@
   "team": "CL5 Monitor Mix",
   "ship": "review-only",
   "shipStops": {
-    "paths": ["crates/server/migrations/**"],
-    "pathsReason": "SQLite schema changes run on the show machine at startup; a bad migration can lock performers out mid-show.",
+    "paths": [],
+    "pathsReason": "SQLite migrations run idempotently during the show-machine application boot, before the server starts accepting traffic; migration and deploy are one atomic step.",
     "labels": ["console-control"],
     "labelsReason": "Anything that changes what is sent to the live console is checked against the real CL5 before shipping."
+  },
+  "machineMigrations": {
+    "ownership": "deploy",
+    "reason": "The show-machine server applies its bundled SQLite migrations before binding its LAN listener; no separate database worker or manual SQL step exists."
   },
   "verify": {
     "typecheck": "cargo check --workspace --all-targets",

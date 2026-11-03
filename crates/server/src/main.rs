@@ -149,9 +149,17 @@ fn page(title: &str, body: &str) -> Html<String> {
             ),
     )
 }
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
 async fn home(State(a): State<App>, h: HeaderMap) -> Response {
     if let Some(u) = session(&a, &h) {
-        page("Monitor Mix",&format!("<h1>Welcome, {}</h1><p>Signed in as {}.</p><form method=post action=/signout><button>Sign out</button></form>",u.name,u.role)).into_response()
+        page("Monitor Mix",&format!("<h1>Welcome, {}</h1><p>Signed in as {}.</p><form method=post action=/signout><button>Sign out</button></form>",html_escape(&u.name),html_escape(&u.role))).into_response()
     } else if a.has_admin().unwrap_or(false) {
         page("Sign in","<h1>Monitor Mix</h1><form method=post action=/signin><label>Name <input name=name required></label><label>4-digit passcode <input name=passcode inputmode=numeric pattern='[0-9]{4}' maxlength=4 required></label><button>Sign in</button></form>").into_response()
     } else {
@@ -454,5 +462,34 @@ mod tests {
             signed_out.headers().get(header::LOCATION).unwrap(),
             "/setup"
         );
+    }
+
+    #[tokio::test]
+    async fn signed_in_display_name_is_html_escaped() {
+        let app = App::memory().unwrap();
+        let name = "<svg onload=alert(1)>";
+        app.add_user(name, "1234", "admin").unwrap();
+        let login_response = login(&app, app.user(name, "1234").unwrap().unwrap());
+        let cookie = login_response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let home = call(
+            &app,
+            Request::get("/")
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        let body = response_text(home).await;
+        assert!(body.contains("&lt;svg onload=alert(1)&gt;"));
+        assert!(!body.contains("<svg onload=alert(1)>"));
     }
 }
