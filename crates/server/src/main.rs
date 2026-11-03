@@ -19,7 +19,10 @@ use std::{
     env,
     net::SocketAddr,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 use tower_http::services::ServeDir;
@@ -32,6 +35,109 @@ struct App {
     // survive a routine server restart.
     attempts: Arc<Mutex<HashMap<String, Attempt>>>,
     bridge: console::ConsoleBridge,
+    live_connections: LiveConnections,
+}
+
+/// A phone counts as connected only while its signed-in browser has an open
+/// console subscription. Sessions intentionally survive server restarts, but
+/// a browser which has gone away must not remain visible as a live phone.
+#[derive(Clone, Default)]
+struct LiveConnections {
+    entries: Arc<Mutex<HashMap<String, Vec<LiveConnection>>>>,
+    active: Arc<AtomicUsize>,
+    next_id: Arc<AtomicU64>,
+}
+
+struct LiveConnection {
+    id: u64,
+    user_name: String,
+    shutdown: tokio::sync::broadcast::Sender<()>,
+}
+
+impl LiveConnections {
+    fn connect(
+        &self,
+        token: String,
+        user_name: String,
+    ) -> (u64, tokio::sync::broadcast::Receiver<()>) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (shutdown, receiver) = tokio::sync::broadcast::channel(1);
+        self.entries
+            .lock()
+            .unwrap()
+            .entry(token)
+            .or_default()
+            .push(LiveConnection {
+                id,
+                user_name,
+                shutdown,
+            });
+        self.active.fetch_add(1, Ordering::Relaxed);
+        (id, receiver)
+    }
+
+    fn disconnect(&self, token: &str, id: u64) {
+        let removed = {
+            let mut entries = self.entries.lock().unwrap();
+            let Some(connections) = entries.get_mut(token) else {
+                return;
+            };
+            let before = connections.len();
+            connections.retain(|connection| connection.id != id);
+            let removed = before != connections.len();
+            if connections.is_empty() {
+                entries.remove(token);
+            }
+            removed
+        };
+        if removed {
+            self.active.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    fn disconnect_user(&self, user_name: &str) {
+        let shutdown = {
+            let mut entries = self.entries.lock().unwrap();
+            let mut shutdown = Vec::new();
+            for connections in entries.values_mut() {
+                connections.retain(|connection| {
+                    if connection.user_name == user_name {
+                        shutdown.push(connection.shutdown.clone());
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+            entries.retain(|_, connections| !connections.is_empty());
+            shutdown
+        };
+        if !shutdown.is_empty() {
+            self.active.fetch_sub(shutdown.len(), Ordering::Relaxed);
+            for connection in shutdown {
+                let _ = connection.send(());
+            }
+        }
+    }
+
+    fn disconnect_token(&self, token: &str) {
+        let shutdown = self
+            .entries
+            .lock()
+            .unwrap()
+            .remove(token)
+            .unwrap_or_default();
+        if !shutdown.is_empty() {
+            self.active.fetch_sub(shutdown.len(), Ordering::Relaxed);
+            for connection in shutdown {
+                let _ = connection.shutdown.send(());
+            }
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.active.load(Ordering::Relaxed)
+    }
 }
 #[derive(Clone)]
 struct User {
@@ -177,6 +283,7 @@ impl App {
             db: Arc::new(Mutex::new(c)),
             attempts: Default::default(),
             bridge: console::ConsoleBridge::offline(),
+            live_connections: Default::default(),
         })
     }
     #[cfg(test)]
@@ -187,6 +294,7 @@ impl App {
             db: Arc::new(Mutex::new(c)),
             attempts: Default::default(),
             bridge: console::ConsoleBridge::offline(),
+            live_connections: Default::default(),
         })
     }
     fn with_console(mut self, address: String) -> Self {
@@ -298,8 +406,7 @@ impl App {
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            let phones_connected =
-                c.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get::<_, i64>(0))? as usize;
+            let phones_connected = self.live_connections.count();
             (users, history, phones_connected)
         };
         let state = self.bridge.state().await;
@@ -367,6 +474,7 @@ impl App {
         if changed == 0 {
             return Err("That user no longer exists.".into());
         }
+        self.live_connections.disconnect_user(name);
         self.audit(actor, &format!("Reset passcode for {name}"))
             .map_err(|_| "Could not save history.".to_string())?;
         Ok(passcode)
@@ -400,6 +508,7 @@ impl App {
             return Err("That user no longer exists.".into());
         }
         drop(c);
+        self.live_connections.disconnect_user(name);
         self.audit(actor, &format!("Deleted {name} and their saved settings"))
             .map_err(|_| "Could not save history.".to_string())
     }
@@ -519,23 +628,40 @@ async fn console_socket(
     State(a): State<App>,
     headers: HeaderMap,
 ) -> Response {
-    if session(&a, &headers).is_none() {
+    let Some(token) = cookie(&headers).map(str::to_owned) else {
         return (StatusCode::UNAUTHORIZED, "Sign in first.").into_response();
-    }
-    ws.on_upgrade(move |socket| stream_console(socket, a.bridge))
-        .into_response()
+    };
+    let Some(user) = session(&a, &headers) else {
+        return (StatusCode::UNAUTHORIZED, "Sign in first.").into_response();
+    };
+    ws.on_upgrade(move |socket| {
+        stream_console(socket, a.bridge, a.live_connections, token, user.name)
+    })
+    .into_response()
 }
 
-async fn stream_console(mut socket: WebSocket, bridge: console::ConsoleBridge) {
+async fn stream_console(
+    mut socket: WebSocket,
+    bridge: console::ConsoleBridge,
+    live_connections: LiveConnections,
+    token: String,
+    user_name: String,
+) {
+    let (connection_id, mut shutdown) = live_connections.connect(token.clone(), user_name);
     if send_console_snapshot(&mut socket, &bridge).await.is_err() {
+        live_connections.disconnect(&token, connection_id);
         return;
     }
     let mut events = bridge.subscribe();
     loop {
-        match events.recv().await {
+        let event = tokio::select! {
+            _ = shutdown.recv() => break,
+            event = events.recv() => event,
+        };
+        match event {
             Ok(event) => {
                 if send_socket(&mut socket, &event).await.is_err() {
-                    return;
+                    break;
                 }
             }
             // A scene rehydration deliberately emits more individual values
@@ -544,12 +670,13 @@ async fn stream_console(mut socket: WebSocket, bridge: console::ConsoleBridge) {
             // snapshot and continue listening for later changes.
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                 if send_console_snapshot(&mut socket, &bridge).await.is_err() {
-                    return;
+                    break;
                 }
             }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
     }
+    live_connections.disconnect(&token, connection_id);
 }
 
 async fn send_console_snapshot(
@@ -608,7 +735,9 @@ fn assigned_mixes(a: &App, user_name: &str) -> HashSet<u8> {
     a.user_mixes(user_name)
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|mix| mix.strip_prefix("Mix ")?.parse().ok())
+        // The UI stores the one-based display number, while Yamaha's protocol
+        // uses zero-based mix indices. Keep that conversion at this boundary.
+        .filter_map(|mix| mix.strip_prefix("Mix ")?.parse::<u8>().ok()?.checked_sub(1))
         .collect()
 }
 async fn setup(State(a): State<App>, Form(f): Form<Credentials>) -> Response {
@@ -665,6 +794,7 @@ async fn signout(State(a): State<App>, h: HeaderMap) -> Response {
             a.db.lock()
                 .unwrap()
                 .execute("DELETE FROM sessions WHERE token=?1", [t]);
+        a.live_connections.disconnect_token(t);
     }
     Redirect::to("/").into_response()
 }
@@ -1003,6 +1133,9 @@ mod tests {
     #[test]
     fn performers_are_denied_unassigned_mixes_while_admins_can_operate_any_mix() {
         let app = App::memory().unwrap();
+        app.add_user("Performer", "1234", "performer").unwrap();
+        app.assign_mixes("Admin", "Performer", &["1".into(), "24".into()])
+            .unwrap();
         let performer = User {
             name: "Performer".into(),
             role: "performer".into(),
@@ -1013,8 +1146,87 @@ mod tests {
             role: "admin".into(),
             updated_at: "now".into(),
         };
-        assert!(!may_change_mix(&app, &performer, 0));
+        assert!(
+            may_change_mix(&app, &performer, 0),
+            "Mix 1 is protocol index 0"
+        );
+        assert!(!may_change_mix(&app, &performer, 1));
+        assert!(
+            may_change_mix(&app, &performer, 23),
+            "Mix 24 is protocol index 23"
+        );
         assert!(may_change_mix(&app, &admin, 23));
+    }
+
+    #[tokio::test]
+    async fn reserved_characters_in_user_names_reach_admin_actions() {
+        let app = App::memory().unwrap();
+        app.add_user("Admin", "1234", "admin").unwrap();
+        app.add_user("A/B#?", "5678", "performer").unwrap();
+        let login_response = login(&app, app.user("Admin", "1234").unwrap().unwrap());
+        let cookie = login_response.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+
+        let response = call(
+            &app,
+            Request::post("/api/admin/users/A%2FB%23%3F/passcode")
+                .header(header::COOKIE, cookie)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("passcode=4321"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(app.user("A/B#?", "4321").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn resetting_a_user_closes_their_open_console_socket() {
+        let app = App::memory().unwrap();
+        app.add_user("Admin", "1234", "admin").unwrap();
+        app.add_user("Performer", "5678", "performer").unwrap();
+        let login_response = login(&app, app.user("Performer", "5678").unwrap().unwrap());
+        let cookie = login_response.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_app = app.clone();
+        let server = tokio::spawn(async move { axum::serve(listener, routes(server_app)).await });
+
+        let mut request = format!("ws://{address}/api/console")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert(header::COOKIE, cookie.parse().unwrap());
+        let (mut socket, _) = connect_async(request).await.unwrap();
+        assert!(next_websocket_text(&mut socket)
+            .await
+            .contains("\"kind\":\"snapshot\""));
+        assert_eq!(app.live_connections.count(), 1);
+
+        app.reset_passcode("Admin", "Performer", "9999").unwrap();
+        let closed = timeout(Duration::from_secs(5), socket.next()).await;
+        server.abort();
+        assert!(matches!(
+            closed,
+            Ok(None)
+                | Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))))
+                // Axum drops a server-side socket without a close frame here;
+                // tungstenite reports that peer closure as a protocol error.
+                | Ok(Some(Err(_)))
+        ));
+        assert_eq!(app.live_connections.count(), 0);
     }
 
     #[test]

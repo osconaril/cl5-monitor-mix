@@ -244,7 +244,11 @@ fn admin_portal(props: &AdminPortalProps) -> Html {
 }
 
 fn user_card(user: &AdminUser) -> Html {
-    let encoded = user.name.replace(' ', "%20");
+    // Names are data, not route syntax. Encode the whole path segment so an
+    // admin can safely manage a name containing '/', '#', '?' or spaces.
+    let encoded = js_sys::encode_uri_component(&user.name)
+        .as_string()
+        .unwrap_or_else(|| user.name.clone());
     let mixes = if user.mixes.is_empty() {
         "No mixes assigned".into()
     } else {
