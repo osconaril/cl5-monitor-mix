@@ -3,10 +3,7 @@
 use gloo_net::http::Request;
 use gloo_timers::callback::{Interval, Timeout};
 use serde::Deserialize;
-use std::{
-    cell::{Cell, RefCell},
-    rc::Rc,
-};
+use std::{cell::RefCell, rc::Rc};
 use wasm_bindgen::{closure::Closure, JsCast};
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{MessageEvent, WebSocket};
@@ -44,6 +41,7 @@ struct ConsoleStatus {
     address: String,
     scene_number: Option<u16>,
     scene_name: Option<String>,
+    mix_labels: Vec<String>,
     phones_connected: usize,
 }
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -236,7 +234,7 @@ fn admin_portal(props: &AdminPortalProps) -> Html {
             <h1>{"Users"}</h1>
             <p>{format!("Signed in as {}. Console {} at {} · {} phone{} connected.", props.user.name, if overview.console.connected { "connected" } else { "disconnected" }, overview.console.address, overview.console.phones_connected, if overview.console.phones_connected == 1 { "" } else { "s" })}</p>
             <section class="panel"><h2>{"Add user"}</h2><form method="post" action="/api/admin/users"><label>{"Name"}<input name="name" required=true /></label><label>{"Role"}<select name="role"><option value="performer">{"Performer"}</option><option value="admin">{"Admin"}</option></select></label><label>{"4-digit passcode"}<input name="passcode" value="Generate" pattern="([0-9]{4}|Generate)" required=true /></label><button>{"Add user"}</button></form></section>
-            <section class="users"><h2>{"Saved users"}</h2>{for overview.users.iter().cloned().map(|user| html! { <UserCard {user} /> })}</section>
+            <section class="users"><h2>{"Saved users"}</h2>{for overview.users.iter().cloned().map(|user| html! { <UserCard {user} mix_labels={overview.console.mix_labels.clone()} /> })}</section>
             <section class="panel"><h2>{"History"}</h2><ul class="history">{for overview.history.iter().map(|row| html! { <li><strong>{&row.who}</strong>{": "}{&row.what}<small>{format!(" · {}", row.when)}</small></li> })}</ul></section>
             <form method="post" action="/signout"><button>{"Sign out"}</button></form>
         </>
@@ -246,6 +244,7 @@ fn admin_portal(props: &AdminPortalProps) -> Html {
 #[derive(Properties, PartialEq)]
 struct UserCardProps {
     user: AdminUser,
+    mix_labels: Vec<String>,
 }
 
 #[function_component(UserCard)]
@@ -281,7 +280,7 @@ fn user_card(props: &UserCardProps) -> Html {
     } else {
         html! { <button type="button" onclick={ask_to_delete}>{"Delete user"}</button> }
     };
-    html! { <article class="user-card"><h3>{&user.name}</h3><p>{format!("{} · code {}", user.role, user.passcode)}</p><p>{format!("Mixes: {mixes}")}</p><p>{format!("Last sign-in: {}", user.last_sign_in.as_deref().unwrap_or("Never"))}</p><form method="post" action={format!("/api/admin/users/{encoded}/passcode")}><label>{"New passcode"}<input name="passcode" value="Generate" pattern="([0-9]{4}|Generate)" required=true /></label><button>{"Reset passcode"}</button></form><form method="post" action={format!("/api/admin/users/{encoded}/mixes")}><fieldset><legend>{"Mix numbers"}</legend>{for (1..=24).map(|number| { let selected = user.mixes.contains(&format!("Mix {number}")); html! { <label class="mix-choice"><input type="checkbox" name="mixes" value={number.to_string()} checked={selected} />{format!("Mix {number}")}</label> } })}</fieldset><button>{"Save mix assignments"}</button></form><form method="post" action={format!("/api/admin/users/{encoded}")}>{delete_controls}</form></article> }
+    html! { <article class="user-card"><h3>{&user.name}</h3><p>{format!("{} · code {}", user.role, user.passcode)}</p><p>{format!("Mixes: {mixes}")}</p><p>{format!("Last sign-in: {}", user.last_sign_in.as_deref().unwrap_or("Never"))}</p><form method="post" action={format!("/api/admin/users/{encoded}/passcode")}><label>{"New passcode"}<input name="passcode" value="Generate" pattern="([0-9]{4}|Generate)" required=true /></label><button>{"Reset passcode"}</button></form><form method="post" action={format!("/api/admin/users/{encoded}/mixes")}><fieldset><legend>{"Console mixes"}</legend>{for props.mix_labels.iter().enumerate().map(|(index, label)| { let number = index + 1; let selected = user.mixes.contains(&format!("Mix {number}")); html! { <label class="mix-choice"><input type="checkbox" name="mixes" value={number.to_string()} checked={selected} />{format!("Mix {number}: {label}")}</label> } })}</fieldset><button>{"Save mix assignments"}</button></form><form method="post" action={format!("/api/admin/users/{encoded}")}>{delete_controls}</form></article> }
 }
 
 fn document_title(window: &web_sys::Window, title: &str) {
@@ -296,7 +295,7 @@ fn document_title(window: &web_sys::Window, title: &str) {
 #[function_component(LiveConsole)]
 fn live_console() -> Html {
     let notice = use_state(|| "Connecting to console…".to_owned());
-    let connected = Rc::new(Cell::new(false));
+    let connected = use_state(|| false);
     let scene = use_state(BridgeState::default);
     let scene_notice_timeout = Rc::new(RefCell::new(None::<Timeout>));
     {
@@ -366,8 +365,7 @@ fn live_console() -> Html {
                         let timeout_connected = message_connected.clone();
                         *message_scene_notice_timeout.borrow_mut() =
                             Some(Timeout::new(SCENE_RECALL_NOTICE_MS, move || {
-                                timeout_notice
-                                    .set(connection_notice(timeout_connected.get()).into())
+                                timeout_notice.set(connection_notice(*timeout_connected).into())
                             }));
                     }
                     Ok(BridgeMessage::Event(BridgeEvent::Value { key, value })) => {
@@ -385,7 +383,7 @@ fn live_console() -> Html {
             })
         });
     }
-    html! { <><SceneBar connected={connected.get()} scene={(*scene).clone()} /><p role="status">{(*notice).clone()}</p></> }
+    html! { <><SceneBar connected={*connected} scene={(*scene).clone()} /><p role="status">{(*notice).clone()}</p></> }
 }
 
 #[derive(Properties, PartialEq)]

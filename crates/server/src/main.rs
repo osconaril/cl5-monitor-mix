@@ -177,6 +177,7 @@ struct ConsoleStatus {
     address: String,
     scene_number: Option<u16>,
     scene_name: Option<String>,
+    mix_labels: Vec<String>,
     phones_connected: usize,
 }
 #[derive(Serialize)]
@@ -410,6 +411,17 @@ impl App {
             (users, history, phones_connected)
         };
         let state = self.bridge.state().await;
+        let mix_labels = (0..24)
+            .map(|mix| {
+                let key = format!("MIXER:Current/Mix/Label/Name {mix} 0");
+                state
+                    .values
+                    .get(&key)
+                    .filter(|label| !label.is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| format!("Mix {}", mix + 1))
+            })
+            .collect();
         Ok(AdminOverview {
             users,
             history,
@@ -419,6 +431,7 @@ impl App {
                     .unwrap_or_else(|_| "Not configured".into()),
                 scene_number: state.scene_number,
                 scene_name: state.scene_name,
+                mix_labels,
                 phones_connected,
             },
         })
