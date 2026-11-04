@@ -45,6 +45,15 @@ fn level_text(wire: i16) -> String {
     }
 }
 
+fn solo_notice_text(notice: &str) -> &str {
+    match notice {
+        "Scene changed — solo cleared" => {
+            "New scene, so Solo turned off. Your mix now has the new scene's levels."
+        }
+        _ => notice,
+    }
+}
+
 /// Native range positions are dB, with one extra position for Off. Keep an
 /// engineer's fractional value intact until a deliberate phone movement.
 fn snap_level(wire: i16, position: f64) -> Option<String> {
@@ -92,6 +101,7 @@ pub(super) fn performer(props: &PerformerProps) -> Html {
     let open_channel = use_state(|| None::<u8>);
     let menu_open = use_state(|| false);
     let confirm_sign_out = use_state(|| false);
+    let dismissed_notice = use_state(|| None::<String>);
     let reordering = use_state(|| false);
     let reorder_pending = use_mut_ref(|| false);
     let layout_error = use_state(String::new);
@@ -489,7 +499,18 @@ pub(super) fn performer(props: &PerformerProps) -> Html {
                     }
                     </section>
                 }
-                if let Some(notice) = &live.console.solo_notice { <p role="status">{notice}</p> }
+                if let Some(notice) = &live.console.solo_notice {
+                    if dismissed_notice.as_deref() != Some(notice.as_str()) {
+                        <section class="solo-notice" role="status">
+                            <p>{solo_notice_text(notice)}</p>
+                            <button onclick={{
+                                let dismissed_notice = dismissed_notice.clone();
+                                let notice = notice.clone();
+                                Callback::from(move |_| dismissed_notice.set(Some(notice.clone())))
+                            }}>{"OK"}</button>
+                        </section>
+                    }
+                }
                 <p role="alert">{(*layout_error).clone()}</p>
                 if !layout_error.is_empty() { <button onclick={retry_layout} disabled={*reordering}>{"Retry loading layout"}</button> }
                 <div class="arrange-controls">
@@ -645,7 +666,7 @@ fn channel_strip(props: &ChannelStripProps) -> Html {
         <article class="channel-strip" data-channel={props.input.to_string()}>
             <div class="strip-heading">
             <span class="channel-color" role="img" aria-label={format!("Channel color: {color_name}")} title={format!("Channel color: {color_name}")} style={format!("background-color: {color}")}></span>
-            <h3><button type="button" class="channel-name" onclick={open_panel}>{&props.name}</button></h3>
+            <h3><button type="button" class="channel-name" onclick={open_panel} disabled={!props.connected}>{&props.name}</button></h3>
             if props.arranging {
                 <button class="reorder-handle" aria-label={format!("Drag {} to reorder", props.name)} disabled={!props.reorder_allowed}>{"⠿"}</button>
                 <button onclick={hide}>{"Hide"}</button>
@@ -653,12 +674,16 @@ fn channel_strip(props: &ChannelStripProps) -> Html {
             </div>
             if !props.arranging {
             <label class="send-control">
-                <span>{props.level.map(level_text).unwrap_or_else(|| "Level unavailable".into())}</span>
+                <span>{if props.paused {
+                    format!("{} · Paused", props.level.map(level_text).unwrap_or_else(|| "Level unavailable".into()))
+                } else {
+                    props.level.map(level_text).unwrap_or_else(|| "Level unavailable".into())
+                }}</span>
                 <input type="range" aria-label={format!("{} send level", props.name)} aria-valuetext={props.level.map(level_text)}
                     min="-139" max="10" step="any" value={position.to_string()} {oninput} disabled={!props.connected || props.level.is_none() || props.paused} />
             </label>
             <button data-action="mute" onclick={mute} disabled={!props.connected || props.on.is_none() || props.paused} aria-pressed={props.on.map(|on| (!on).to_string())}>
-                {if props.on == Some(false) { "Muted — unmute" } else { "Mute" }}
+                {if props.paused { "Paused" } else if props.on == Some(false) { "Muted — unmute" } else { "Mute" }}
             </button>
             <button data-action="solo" onclick={solo} disabled={!props.connected || !props.solo_allowed || props.level.is_none()} aria-pressed={props.soloed.to_string()}>
                 {if props.paused { "+ Add" } else { "Solo" }}

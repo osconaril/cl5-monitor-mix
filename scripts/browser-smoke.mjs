@@ -383,7 +383,9 @@ try {
     await expectBrowser("document.querySelector('.performer').innerText.includes('not assigned')", 'Actual assignment refusal was not shown');
     await sleep(100);
   }
-  await rcp('get MIXER:Current/InCh/ToMix/Level 0 0', 'OK get MIXER:Current/InCh/ToMix/Level 0 0 -150');
+  // The earlier fractional-input assertion deliberately moved this channel to
+  // -4 dB. Keep the later authorization check aligned with that real value.
+  await rcp('get MIXER:Current/InCh/ToMix/Level 0 0', 'OK get MIXER:Current/InCh/ToMix/Level 0 0 -400');
   await rcp('get MIXER:Current/InCh/ToMix/On 0 0', 'OK get MIXER:Current/InCh/ToMix/On 0 0 0');
   await evaluate('window.fetch=window.assignmentFetch');
   await expectBrowser("!document.querySelector('.channel-strip') && document.body.innerText.includes('no longer assigned')", 'Revocation silently switched the performer to another mix');
@@ -493,7 +495,7 @@ try {
   await command(ws,'Page.navigate',{url:`http://127.0.0.1:${port}/`});
   await expectBrowser("document.querySelectorAll('.mix-picker button').length===2", 'Performer picker missing after recovery checks');
   await stop(fake); fake = null;
-  await expectBrowser("document.querySelector('.scene-bar').innerText.includes('Console disconnected — scene unknown')", 'Disconnected console left stale scene name');
+  await expectBrowser("document.querySelector('.scene-bar').innerText.includes('Lost the sound desk. Trying again…')", 'Disconnected console left stale scene name');
   await evaluate("document.querySelector('.mix-picker button').click()");
   await expectBrowser("[...document.querySelectorAll('.channel-strip input, .channel-strip button:not(.reorder-handle)')].every(e=>e.disabled)", 'Disconnected controls remained enabled');
   ws.close();
