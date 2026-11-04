@@ -115,6 +115,20 @@ impl FakeConsole {
         let _ = self.notifications.send("__FAKE_DROP__".into());
     }
 
+    /// Test-only desk-side edit while the bridge is disconnected. It deliberately
+    /// sends no notification: the reconnect snapshot is the bridge's first
+    /// opportunity to learn about this change.
+    pub async fn set_level_during_outage(&self, input: u8, mix: u8, value: i16) {
+        self.state.lock().await.values.insert(
+            send_key(
+                "MIXER:Current/InCh/ToMix/Level",
+                input as usize,
+                mix as usize,
+            ),
+            value.to_string(),
+        );
+    }
+
     /// Test-only stand-in for an engineer recalling a scene on the desk.
     /// Phones never receive a scene-recall command path.
     pub async fn recall_scene(&self, number: u16) -> Result<(), &'static str> {

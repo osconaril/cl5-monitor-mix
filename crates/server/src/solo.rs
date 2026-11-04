@@ -17,6 +17,7 @@ pub struct SoloStatus {
 struct ActiveSolo {
     status: SoloStatus,
     saved: Vec<i16>,
+    scene_number: Option<u16>,
 }
 
 #[derive(Default)]
@@ -60,6 +61,7 @@ impl Solos {
         owner: &str,
         channels: BTreeSet<u8>,
         values: &HashMap<String, String>,
+        scene_number: Option<u16>,
     ) -> Result<Vec<(u8, i16)>, &'static str> {
         if mix >= 24 || channels.iter().any(|input| *input >= 80) {
             return Err("That channel or mix is not available.");
@@ -92,6 +94,7 @@ impl Solos {
                     },
                     saved: saved
                         .ok_or("Mix levels are unavailable. Wait for the console to reconnect.")?,
+                    scene_number,
                 },
             );
         }
@@ -119,6 +122,35 @@ impl Solos {
         }
         Ok(changes)
     }
+
+    /// Completes active solos after a new connection has hydrated its current
+    /// console state. A desk-side change wins unless the channel is still Off;
+    /// a recalled scene never receives levels captured from the old scene.
+    pub fn restore_after_reconnect(
+        &mut self,
+        values: &HashMap<String, String>,
+        scene_number: Option<u16>,
+    ) -> (Vec<(u8, u8, i16)>, bool) {
+        let mut writes = Vec::new();
+        let mut scene_changed = false;
+        for (&mix, solo) in &self.active {
+            if solo.scene_number != scene_number {
+                scene_changed = true;
+                continue;
+            }
+            for input in 0..80 {
+                let current = values
+                    .get(&format!("{LEVEL} {input} {mix}"))
+                    .and_then(|value| value.parse::<i16>().ok());
+                if current == Some(OFF) {
+                    writes.push((input, mix, solo.saved[input as usize]));
+                }
+            }
+        }
+        self.active.clear();
+        self.expected.clear();
+        (writes, scene_changed)
+    }
 }
 
 #[cfg(test)]
@@ -131,22 +163,30 @@ mod tests {
             .map(|input| (format!("{LEVEL} {input} 0"), "-350".into()))
             .collect();
         let mut solos = Solos::default();
-        let writes = solos.set(0, "Singer", [0].into(), &values).unwrap();
+        let writes = solos
+            .set(0, "Singer", [0].into(), &values, Some(1))
+            .unwrap();
         assert_eq!(writes.len(), 79);
         assert!(writes
             .iter()
             .all(|(input, value)| *input != 0 && *value == OFF));
-        assert!(solos.set(0, "Singer", BTreeSet::new(), &values).is_err());
+        assert!(solos
+            .set(0, "Singer", BTreeSet::new(), &values, Some(1))
+            .is_err());
         for (input, value) in writes {
             solos.observe(input, 0, value);
         }
         solos.observe(1, 0, -725);
         solos.observe(0, 0, -125);
-        assert!(solos.set(0, "Other", [2].into(), &values).is_err());
-        let writes = solos.set(0, "Singer", [0, 2].into(), &values).unwrap();
+        assert!(solos.set(0, "Other", [2].into(), &values, Some(1)).is_err());
+        let writes = solos
+            .set(0, "Singer", [0, 2].into(), &values, Some(1))
+            .unwrap();
         assert_eq!(writes, vec![(2, -350)]);
         solos.observe(2, 0, -350);
-        let writes = solos.set(0, "Singer", BTreeSet::new(), &values).unwrap();
+        let writes = solos
+            .set(0, "Singer", BTreeSet::new(), &values, Some(1))
+            .unwrap();
         assert_eq!(writes.len(), 78);
         assert!(writes.contains(&(1, -725)));
         assert!(writes.contains(&(3, -350)));
@@ -158,8 +198,44 @@ mod tests {
     fn unavailable_levels_and_invalid_channels_do_not_start_solo() {
         let mut solos = Solos::default();
         for (mix, channels) in [(24, [0].into()), (0, [80].into()), (0, [0].into())] {
-            assert!(solos.set(mix, "Singer", channels, &HashMap::new()).is_err());
+            assert!(solos
+                .set(mix, "Singer", channels, &HashMap::new(), Some(1))
+                .is_err());
             assert!(solos.statuses().is_empty());
         }
+    }
+
+    #[test]
+    fn reconnect_restores_only_off_channels_and_discards_a_changed_scene() {
+        let values = (0..80)
+            .map(|input| (format!("{LEVEL} {input} 0"), "-350".into()))
+            .collect();
+        let mut solos = Solos::default();
+        solos
+            .set(0, "Singer", [0].into(), &values, Some(1))
+            .unwrap();
+        let current = (0..80)
+            .map(|input| {
+                (
+                    format!("{LEVEL} {input} 0"),
+                    if input == 1 {
+                        "-625".into()
+                    } else {
+                        OFF.to_string()
+                    },
+                )
+            })
+            .collect();
+        let (writes, scene_changed) = solos.restore_after_reconnect(&current, Some(1));
+        assert!(!scene_changed);
+        assert!(writes.contains(&(2, 0, -350)));
+        assert!(!writes.iter().any(|(input, _, _)| *input == 1));
+
+        solos
+            .set(0, "Singer", [0].into(), &values, Some(1))
+            .unwrap();
+        let (writes, scene_changed) = solos.restore_after_reconnect(&current, Some(2));
+        assert!(writes.is_empty());
+        assert!(scene_changed);
     }
 }

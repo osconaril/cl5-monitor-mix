@@ -222,12 +222,13 @@ async fn run_bridge(
     mut writes: mpsc::Receiver<BridgeCommand>,
 ) {
     let mut retry = Duration::from_millis(100);
+    let mut solos = Solos::default();
     loop {
         let _ = connected.send(false);
-        if !state.read().await.solos.is_empty() {
+        if !solos.statuses().is_empty() {
             publish_solos(
-                &Solos::default(),
-                Some("Console disconnected — solo cleared. Check your mix levels.".into()),
+                &solos,
+                Some("Console disconnected — reconnecting. Your full mix will return when the sound desk reconnects.".into()),
                 &state,
                 &events,
             )
@@ -238,7 +239,9 @@ async fn run_bridge(
         let _ = events.send(BridgeEvent::Disconnected);
         if let Ok(stream) = TcpStream::connect(&address).await {
             retry = Duration::from_millis(100);
-            let clean = serve_connection(stream, &state, &connected, &events, &mut writes).await;
+            let clean =
+                serve_connection(stream, &state, &connected, &events, &mut writes, &mut solos)
+                    .await;
             let _ = connected.send(false);
             if clean {
                 let _ = events.send(BridgeEvent::Disconnected);
@@ -255,6 +258,7 @@ async fn serve_connection(
     connected: &watch::Sender<bool>,
     events: &broadcast::Sender<BridgeEvent>,
     writes: &mut mpsc::Receiver<BridgeCommand>,
+    solos: &mut Solos,
 ) -> bool {
     let (read, mut write) = stream.into_split();
     let mut lines = BufReader::new(read).lines();
@@ -267,7 +271,6 @@ async fn serve_connection(
         }
     }
     let mut in_flight: HashMap<String, VecDeque<String>> = HashMap::new();
-    let mut solos = Solos::default();
     let mut outstanding = snapshot.len();
     let mut pending = HashMap::<String, PhoneChange>::new();
     let mut flush = interval(Duration::from_millis(50));
@@ -286,8 +289,8 @@ async fn serve_connection(
                         in_flight.clear();
                         while writes.try_recv().is_ok() {}
                         let had_solo = !solos.statuses().is_empty();
-                        solos = Solos::default();
-                        publish_solos(&solos, had_solo.then(|| "Scene changed — solo cleared".into()), state, events).await;
+                        *solos = Solos::default();
+                        publish_solos(solos, had_solo.then(|| "Scene changed — solo cleared".into()), state, events).await;
                         let _ = connected.send(false);
                         for command in snapshot_commands() {
                             if write.write_all(command.as_bytes()).await.is_err() || write.write_all(b"\n").await.is_err() { return false; }
@@ -299,7 +302,7 @@ async fn serve_connection(
                         if let Some(queue) = in_flight.get_mut(&key) {
                             if queue.front().is_some_and(|sent| sent == value) { queue.pop_front(); }
                         }
-                        if path == LEVEL {
+                        if path == LEVEL && *connected.borrow() {
                             if let (Ok(input), Ok(mix), Ok(value)) = (input.parse::<u8>(), mix.parse::<u8>(), value.parse::<i16>()) {
                                 if input < 80 && mix < 24 { solos.observe(input, mix, value); }
                             }
@@ -307,6 +310,27 @@ async fn serve_connection(
                     }
                     apply_line(&line, state, events).await;
                     if outstanding == 0 && !*connected.borrow() {
+                        if !solos.statuses().is_empty() {
+                            let state_snapshot = state.read().await.clone();
+                            let (restore, scene_changed) = solos.restore_after_reconnect(
+                                &state_snapshot.values,
+                                state_snapshot.scene_number,
+                            );
+                            for (input, mix, value) in restore {
+                                let command = format!("set {LEVEL} {input} {mix} {value}\n");
+                                if write.write_all(command.as_bytes()).await.is_err() { return false; }
+                            }
+                            publish_solos(
+                                solos,
+                                Some(if scene_changed {
+                                    "Scene changed — solo cleared".into()
+                                } else {
+                                    "Sound desk reconnected — your full mix is back.".into()
+                                }),
+                                state,
+                                events,
+                            ).await;
+                        }
                         let _ = connected.send(true);
                         let _ = events.send(BridgeEvent::Connected);
                     }
@@ -349,20 +373,21 @@ async fn serve_connection(
                         let _ = reply.send(Err("Mix levels are still updating. Try again in a moment."));
                         continue;
                     }
-                    let values = state.read().await.values.clone();
+                    let state_snapshot = state.read().await.clone();
+                    let values = state_snapshot.values.clone();
                     // Resolve ownership in the worker, in order with scene readback.
                     // A recalled scene has already discarded its restoration snapshot.
                     let owner = if admin_clear {
                         solos.statuses().get(&mix).map(|s| s.owner.clone()).unwrap_or(owner)
                     } else { owner };
-                    match solos.set(mix, &owner, channels, &values) {
+                    match solos.set(mix, &owner, channels, &values, state_snapshot.scene_number) {
                         Err(error) => { let _ = reply.send(Err(error)); }
                         Ok(changes) => {
                             for (input, value) in changes {
                                 let command = format!("set {LEVEL} {input} {mix} {value}\n");
                                 if write.write_all(command.as_bytes()).await.is_err() { return false; }
                             }
-                            publish_solos(&solos, None, state, events).await;
+                            publish_solos(solos, None, state, events).await;
                             let _ = reply.send(Ok(()));
                         }
                     }
@@ -926,6 +951,59 @@ mod tests {
             bridge.state().await.values[&format!("{LEVEL} 0 0")],
             "-1200"
         );
+    }
+
+    #[tokio::test]
+    async fn reconnect_restores_saved_solo_levels_but_keeps_desk_changes() {
+        let fake = Arc::new(FakeConsole::new());
+        let address = fake.clone().listen("127.0.0.1:0").await.unwrap();
+        let bridge = ConsoleBridge::start(address.to_string());
+        ready(&bridge).await;
+        let mut engineer = TcpStream::connect(address).await.unwrap();
+        engineer
+            .write_all(
+                format!(
+                    "set {LEVEL} 0 0 -350\nset {LEVEL} 1 0 -725\nset {LEVEL} 2 0 -950\nset {LEVEL} 79 0 -500\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        wait_level(&bridge, 79, 0, "-500").await;
+        bridge.solo(0, "Singer".into(), [0].into()).await.unwrap();
+        wait_level(&bridge, 79, 0, "-32768").await;
+
+        fake.drop_connections();
+        timeout(Duration::from_secs(5), async {
+            while bridge.is_connected() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("bridge observes the dropped connection");
+        fake.set_level_during_outage(1, 0, -625).await;
+
+        timeout(Duration::from_secs(30), async {
+            while !bridge.is_connected()
+                || bridge.state().await.values.get(&format!("{LEVEL} 79 0")) != Some(&"-500".into())
+            {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("bridge restores the saved mix after hydration");
+        let state = bridge.state().await;
+        assert_eq!(state.values[&format!("{LEVEL} 0 0")], "-350");
+        assert_eq!(state.values[&format!("{LEVEL} 1 0")], "-625");
+        assert_eq!(state.values[&format!("{LEVEL} 2 0")], "-950");
+        assert_eq!(state.values[&format!("{LEVEL} 79 0")], "-500");
+        assert!(state.solos.is_empty());
+        assert_eq!(
+            state.solo_notice.as_deref(),
+            Some("Sound desk reconnected — your full mix is back.")
+        );
+        // One bridge reconnect plus the one desk-side test client.
+        assert_eq!(fake.total_connections().await, 3);
     }
 
     async fn ready(bridge: &ConsoleBridge) {
