@@ -77,7 +77,11 @@
         source: handle.closest('.channel-strip').dataset.channel,
         area: handle.closest('.channel-strips'), x: event.clientX, y: event.clientY,
         target: null };
-      handle.setPointerCapture(event.pointerId);
+      // Real browser pointers are captured so a drag continues across strips.
+      // Synthetic PointerEvents used by the browser harness are deliberately
+      // not active pointers, and Chromium rejects capture for those events.
+      // They still exercise the delegated reorder path below.
+      try { handle.setPointerCapture(event.pointerId); } catch (_) {}
       reorder.timer = setInterval(reorderTarget, 40);
       return;
     }
