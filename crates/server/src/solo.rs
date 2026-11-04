@@ -26,6 +26,9 @@ pub struct Solos {
     // A console echoes our own writes. Those echoes must not replace the
     // pre-solo level with Off; other values are engineer/phone changes.
     expected: HashMap<(u8, u8), VecDeque<i16>>,
+    // Restore writes are deliberately retained across a dropped reconnect. A
+    // generic RCP `OK` is the acknowledgement for one restore command.
+    restore_acks_remaining: usize,
 }
 
 impl Solos {
@@ -51,6 +54,33 @@ impl Solos {
         self.expected
             .iter()
             .any(|((_, m), values)| *m == mix && !values.is_empty())
+    }
+
+    pub fn restoring(&self) -> bool {
+        self.restore_acks_remaining > 0
+    }
+
+    /// Records an RCP acknowledgement for a restore command. Returns true
+    /// exactly once, when the last restore command has been acknowledged.
+    pub fn acknowledge_restore(&mut self) -> bool {
+        if self.restore_acks_remaining == 0 {
+            return false;
+        }
+        self.restore_acks_remaining -= 1;
+        if self.restore_acks_remaining == 0 {
+            self.active.clear();
+            self.expected.clear();
+            return true;
+        }
+        false
+    }
+
+    /// A hydrated desk may already have every saved level. There is then no
+    /// command to acknowledge, but the recovery is still complete.
+    pub fn complete_restore_without_writes(&mut self) {
+        debug_assert_eq!(self.restore_acks_remaining, 0);
+        self.active.clear();
+        self.expected.clear();
     }
 
     /// Returns exact wire levels, including fractional levels on restoration.
@@ -131,6 +161,11 @@ impl Solos {
         values: &HashMap<String, String>,
         scene_number: Option<u16>,
     ) -> (Vec<(u8, u8, i16)>, bool) {
+        // A connection can drop partway through a prior restore. Its queued
+        // acknowledgements belong to that dead connection, so hydrate and
+        // recompute from the desk again rather than treating them as complete.
+        self.expected.clear();
+        self.restore_acks_remaining = 0;
         let mut writes = Vec::new();
         let mut scene_changed = false;
         for (&mix, solo) in &self.active {
@@ -147,8 +182,11 @@ impl Solos {
                 }
             }
         }
-        self.active.clear();
-        self.expected.clear();
+        if scene_changed {
+            self.active.clear();
+        } else {
+            self.restore_acks_remaining = writes.len();
+        }
         (writes, scene_changed)
     }
 }

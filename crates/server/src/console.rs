@@ -279,6 +279,7 @@ async fn serve_connection(
             line = lines.next_line() => match line {
                 Ok(Some(line)) => {
                     if line.starts_with("OK ") { outstanding = outstanding.saturating_sub(1); }
+                    let restore_complete = line == "OK" && solos.acknowledge_restore();
                     if let Some(number) = scene_number_reply(&line) {
                         let command = format!("ssinfo_ex {SCENE} {number}\n");
                         if write.write_all(command.as_bytes()).await.is_err() { return false; }
@@ -309,6 +310,16 @@ async fn serve_connection(
                         }
                     }
                     apply_line(&line, state, events).await;
+                    if restore_complete {
+                        publish_solos(
+                            solos,
+                            Some("Sound desk reconnected — your full mix is back.".into()),
+                            state,
+                            events,
+                        ).await;
+                        let _ = connected.send(true);
+                        let _ = events.send(BridgeEvent::Connected);
+                    }
                     if outstanding == 0 && !*connected.borrow() {
                         if !solos.statuses().is_empty() {
                             let state_snapshot = state.read().await.clone();
@@ -320,19 +331,26 @@ async fn serve_connection(
                                 let command = format!("set {LEVEL} {input} {mix} {value}\n");
                                 if write.write_all(command.as_bytes()).await.is_err() { return false; }
                             }
-                            publish_solos(
-                                solos,
-                                Some(if scene_changed {
-                                    "Scene changed — solo cleared".into()
-                                } else {
-                                    "Sound desk reconnected — your full mix is back.".into()
-                                }),
-                                state,
-                                events,
-                            ).await;
+                            if scene_changed || !solos.restoring() {
+                                if !scene_changed {
+                                    solos.complete_restore_without_writes();
+                                }
+                                publish_solos(
+                                    solos,
+                                    Some(if scene_changed {
+                                        "Scene changed — solo cleared".into()
+                                    } else {
+                                        "Sound desk reconnected — your full mix is back.".into()
+                                    }),
+                                    state,
+                                    events,
+                                ).await;
+                            }
                         }
-                        let _ = connected.send(true);
-                        let _ = events.send(BridgeEvent::Connected);
+                        if !solos.restoring() {
+                            let _ = connected.send(true);
+                            let _ = events.send(BridgeEvent::Connected);
+                        }
                     }
                 }
                 _ => return true,
@@ -1004,6 +1022,52 @@ mod tests {
         );
         // One bridge reconnect plus the one desk-side test client.
         assert_eq!(fake.total_connections().await, 3);
+    }
+
+    #[tokio::test]
+    async fn reconnect_retries_remaining_solo_restores_after_a_restore_drop() {
+        let fake = Arc::new(FakeConsole::new());
+        let address = fake.clone().listen("127.0.0.1:0").await.unwrap();
+        let bridge = ConsoleBridge::start(address.to_string());
+        ready(&bridge).await;
+        let values = (0..80)
+            .map(|input| format!("set {LEVEL} {input} 0 -350\n"))
+            .collect::<String>();
+        let mut engineer = TcpStream::connect(address).await.unwrap();
+        engineer.write_all(values.as_bytes()).await.unwrap();
+        wait_level(&bridge, 79, 0, "-350").await;
+        bridge.solo(0, "Singer".into(), [0].into()).await.unwrap();
+        wait_level(&bridge, 79, 0, "-32768").await;
+
+        fake.drop_connections();
+        timeout(Duration::from_secs(5), async {
+            while bridge.is_connected() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("bridge observes the initial drop");
+        fake.drop_after_set_commands(1).await;
+
+        timeout(Duration::from_secs(30), async {
+            while !bridge.is_connected()
+                || bridge.state().await.values.get(&format!("{LEVEL} 79 0")) != Some(&"-350".into())
+            {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a second reconnect restores sends left Off by the interrupted restore");
+        let state = bridge.state().await;
+        assert!(state.solos.is_empty());
+        assert_eq!(
+            state.solo_notice.as_deref(),
+            Some("Sound desk reconnected — your full mix is back.")
+        );
+        assert!(
+            fake.total_connections().await >= 4,
+            "bridge made a retry after the restore drop"
+        );
     }
 
     async fn ready(bridge: &ConsoleBridge) {
