@@ -61,7 +61,7 @@
     const start = sideways ? bounds.left : bounds.top;
     const end = sideways ? bounds.right : bounds.bottom;
     const delta = position < start + 30 ? -12 : position > end - 30 ? 12 : 0;
-    if (sideways) r.area.scrollLeft += delta;
+    if (landscape()) r.area.scrollLeft += delta;
     else r.area.scrollTop += delta;
     const target = document.elementFromPoint(r.x, r.y)?.closest('.channel-strip');
     r.target = target?.parentElement === r.area && !target.classList.contains('group-strip') ? target : null;
@@ -127,7 +127,7 @@
         g.scrolling = true;
       }
       if (g.scrolling) {
-        if (sideways) g.area.scrollLeft += g.x - event.clientX;
+        if (landscape()) g.area.scrollLeft += g.x - event.clientX;
         else g.area.scrollTop += g.y - event.clientY;
       }
     } else if (event.clientX !== g.x || event.clientY !== g.y) {
@@ -168,6 +168,10 @@
   window.addEventListener('blur', cancel);
   window.addEventListener('resize', () => {
     cancel();
+    // Programmatic scrolling (including browser history/layout restoration)
+    // need not emit the element scroll event before rotation. Snapshot the
+    // current leading strip here so turning always preserves what is in view.
+    remember();
     const next = landscape();
     if (next === sideways) return;
     sideways = next;

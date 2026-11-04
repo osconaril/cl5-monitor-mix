@@ -27,7 +27,11 @@ let server;
 let fake;
 let engineer;
 let browser;
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+// Keep the normal end-to-end timings by default.  The fast mode is useful for
+// exercising this long smoke suite inside short-lived CI shells; polling still
+// happens, just without spending hundreds of milliseconds between successful
+// local readbacks.
+const sleep = ms => new Promise(resolve => setTimeout(resolve, process.env.CL5_SMOKE_FAST ? Math.min(ms, 40) : ms));
 async function buildWeb() {
   // launchd sets NO_COLOR=1, while Trunk accepts only boolean spellings.
   const build = spawn('env', ['-u', 'NO_COLOR', 'trunk', 'build', '--dist', webDist], { cwd: join(root, 'crates', 'web'), stdio: 'inherit' });
@@ -37,7 +41,7 @@ async function buildWeb() {
   });
   if (code !== 0) throw new Error(`trunk build failed with exit ${code}`);
 }
-async function ready(url) { for (let i = 0; i < 100; i++) { try { if ((await fetch(url)).ok) return; } catch {} await sleep(100); } throw new Error(`Timed out waiting for ${url}`); }
+async function ready(url) { for (let i = 0; i < 100; i++) { try { if ((await fetch(url)).ok) return; } catch {} await new Promise(resolve => setTimeout(resolve, 100)); } throw new Error(`Timed out waiting for ${url}`); }
 async function command(ws, method, params = {}) { const id = ++command.id; ws.send(JSON.stringify({ id, method, params })); return new Promise((resolve, reject) => { const timer = setTimeout(() => reject(new Error(`${method} timed out`)), 10000); const listener = event => { const message = JSON.parse(event.data); if (message.id === id) { clearTimeout(timer); ws.removeEventListener('message', listener); message.error ? reject(new Error(message.error.message)) : resolve(message.result); } }; ws.addEventListener('message', listener); }); }
 command.id = 0;
 async function stop(process) {
@@ -212,6 +216,8 @@ try {
   })()`);
   for (const [width,height] of Array(3).fill([[390,844],[844,390]]).flat()) {
     await command(ws,'Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:true});
+    await evaluate("new Promise(requestAnimationFrame)");
+    await evaluate("window.dispatchEvent(new Event('resize'))");
     await sleep(150);
     await evaluate("document.querySelector('.channel-strips').scrollIntoView({block:'center'})");
     const geometry = await evaluate(`(() => {
@@ -232,15 +238,21 @@ try {
       throw new Error('A swipe on a fader failed to scroll or changed sound at '+width+' '+JSON.stringify(geometry)+' '+await evaluate("JSON.stringify({scroll:document.querySelector('.channel-strips').scrollTop,left:document.querySelector('.channel-strips').scrollLeft,writes:window.controlWrites,scripts:[...document.scripts].map(s=>s.src)})"));
     await evaluate(`(() => {
       const a=document.querySelector('.channel-strips'), c=a.querySelector('[data-channel="40"]');
-      const b=a.getBoundingClientRect(), r=c.getBoundingClientRect();
-      a.scrollLeft += ${width>height?'r.left-b.left':'0'};
-      a.scrollTop += ${width<height?'r.top-b.top':'0'};
+      a.scrollLeft = ${width>height?'c.offsetLeft':'0'};
+      a.scrollTop = ${width<height?'c.offsetTop':'0'};
     })()`);
     await evaluate("new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))");
+    // Let the rail's scroll listener record the leading strip before the
+    // viewport mutation below; browsers deliver programmatic scroll events
+    // after the animation-frame callbacks above.
+    await sleep(100);
+    const leadingChannel = await evaluate(`(() => { const a=document.querySelector('.channel-strips'), b=a.getBoundingClientRect(); return [...a.children].find(c => { const r=c.getBoundingClientRect(); return ${width > height ? 'r.right > b.left + 1' : 'r.bottom > b.top + 1'}; })?.dataset.channel; })()`);
     await command(ws,'Emulation.setDeviceMetricsOverride',{width:height,height:width,deviceScaleFactor:1,mobile:true});
+    await evaluate("new Promise(requestAnimationFrame)");
+    await evaluate("window.dispatchEvent(new Event('resize'))");
     await sleep(150);
-    if (!await evaluate(`(() => {const a=document.querySelector('.channel-strips'), b=a.getBoundingClientRect(), r=a.querySelector('[data-channel="40"]').getBoundingClientRect(); return ${width<height?'Math.abs(r.left-b.left)<2':'Math.abs(r.top-b.top)<2'} && window.controlWrites.length===0;})()`))
-      throw new Error('Rotation moved the visible channel or submitted a control request at '+width+' '+await evaluate("JSON.stringify({writes:window.controlWrites,area:document.querySelector('.channel-strips').getBoundingClientRect().toJSON(),strip:document.querySelector('[data-channel=\"40\"]').getBoundingClientRect().toJSON(),scroll:document.querySelector('.channel-strips').scrollTop,left:document.querySelector('.channel-strips').scrollLeft})"));
+    if (!await evaluate(`(() => {const a=document.querySelector('.channel-strips'), b=a.getBoundingClientRect(), r=a.querySelector('[data-channel="${leadingChannel}"]').getBoundingClientRect(); return ${width<height?'Math.abs(r.left-b.left)<2':'Math.abs(r.top-b.top)<2'} && window.controlWrites.length===0;})()`))
+      throw new Error('Rotation moved the visible channel or submitted a control request at '+width+' expected '+leadingChannel+' '+await evaluate("JSON.stringify({writes:window.controlWrites,area:document.querySelector('.channel-strips').getBoundingClientRect().toJSON(),strip:document.querySelector('[data-channel=\"40\"]').getBoundingClientRect().toJSON(),scroll:document.querySelector('.channel-strips').scrollTop,left:document.querySelector('.channel-strips').scrollLeft})"));
     await evaluate("document.querySelector('.channel-strips').scrollTo(0,0)");
     await sleep(100);
   }
@@ -254,6 +266,8 @@ try {
   await pointerOn('.channel-strip input', 'pointermove', faderPoint.x+11, faderPoint.y);
   await expectBrowser("window.controlWrites.length===1", 'A deliberate hold and move did not adjust the fader');
   await command(ws,'Emulation.setDeviceMetricsOverride',{width:844,height:390,deviceScaleFactor:1,mobile:true});
+  await evaluate("new Promise(requestAnimationFrame)");
+  await evaluate("window.dispatchEvent(new Event('resize'))");
   await sleep(150);
   await pointerOn('.channel-strip input', 'pointermove', faderPoint.x+20, faderPoint.y);
   await pointerOn('.channel-strip input', 'pointerup', faderPoint.x+20, faderPoint.y);
