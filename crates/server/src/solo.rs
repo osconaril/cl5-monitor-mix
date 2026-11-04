@@ -60,6 +60,16 @@ impl Solos {
         self.restore_acks_remaining > 0
     }
 
+    /// A dropped connection cannot deliver any remaining restore acknowledgements.
+    /// Forget that connection's in-flight count so the next hydrated connection
+    /// can determine which sends still need restoring.
+    pub fn reconnect_after_drop(&mut self) {
+        if self.restoring() {
+            self.expected.clear();
+            self.restore_acks_remaining = 0;
+        }
+    }
+
     /// Records an RCP acknowledgement for a restore command. Returns true
     /// exactly once, when the last restore command has been acknowledged.
     pub fn acknowledge_restore(&mut self) -> bool {

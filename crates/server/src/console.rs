@@ -242,6 +242,7 @@ async fn run_bridge(
             let clean =
                 serve_connection(stream, &state, &connected, &events, &mut writes, &mut solos)
                     .await;
+            solos.reconnect_after_drop();
             let _ = connected.send(false);
             if clean {
                 let _ = events.send(BridgeEvent::Disconnected);
