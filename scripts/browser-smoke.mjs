@@ -333,105 +333,27 @@ try {
     throw new Error('Reorder changed sound or a refused reorder changed the displayed order');
   // Presentation settings must survive a fresh session without changing sound.
   const clickText = text => evaluate(`(() => { const b=[...document.querySelectorAll('button')].find(b=>b.textContent===${JSON.stringify(text)}); if(!b) throw new Error('Missing button'); b.click(); })()`);
-  // Pan is horizontal in either orientation and uses the same deliberate hold.
-  for (const [width,height] of [[390,844],[844,390]]) {
-    await command(ws,'Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:true});
-    await sleep(150);
-    await evaluate("document.querySelector('.channel-strips').scrollTo(0,0);document.querySelector('.pan-control').scrollIntoView({block:'center'})");
-    const point=await evaluate(`(() => {const f=document.querySelector('.pan-control input'),r=f.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2,horizontal:getComputedStyle(f).writingMode==='horizontal-tb'};})()`);
-    if (!point.horizontal) throw new Error('Pan must read left/right in both orientations');
-    const before=await evaluate('window.controlWrites.length');
-    await touch('touchStart',point.x,point.y);
-    await touch('touchMove',point.x-20,point.y-20);
-    await touch('touchEnd');
-    if (await evaluate('window.controlWrites.length')!==before) throw new Error('Pan swipe sent a control');
-    await evaluate("document.querySelector('.channel-strips').scrollTo(0,0);document.querySelector('.pan-control').scrollIntoView({block:'center'})");
-    const held=await evaluate(`(() => {const r=document.querySelector('.pan-control input').getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2};})()`);
-    await touch('touchStart',held.x,held.y);
-    await sleep(260);
-    await touch('touchMove',held.x+12,held.y);
-    await expectBrowser(`window.controlWrites.length===${before+1}`, 'Held pan did not submit at '+width+' '+JSON.stringify(held)+' before='+before);
-    await command(ws,'Emulation.setDeviceMetricsOverride',{width:height,height:width,deviceScaleFactor:1,mobile:true});
-    await touch('touchEnd');
-    await sleep(150);
-    if (await evaluate('window.controlWrites.length')!==before+1) throw new Error('Rotation submitted pan');
-  }
   await rcp('set MIXER:Current/Mix/Role 0 0 "Mono"', 'OK');
   await expectBrowser("document.querySelectorAll('.pan-control').length===0", 'Unlink did not hide pan');
   const monoRefusal=await evaluate("fetch('/api/console',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({path:'MIXER:Current/InCh/ToMix/Pan',input:0,mix:0,value:'12'})}).then(async r=>!r.ok && (await r.text()).includes('stereo-linked'))");
   if (!monoRefusal) throw new Error('Server accepted pan on mono mix');
-  await clickText('Edit channel layout');
-  await expectBrowser("document.querySelectorAll('.layout-channel').length===80", 'Layout editor did not load');
-  for (const [width,height] of [[390,844],[844,390]]) {
-    await command(ws,'Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:true});
-    if (!await evaluate("Math.max(document.documentElement.scrollWidth,document.body.scrollWidth)<=innerWidth && [...document.querySelectorAll('.layout-editor button')].every(b=>b.getBoundingClientRect().height>=44)"))
-      throw new Error('Layout editor overflow or small touch targets');
-  }
-  await evaluate(`(() => {
-    const source=document.querySelector('[data-layout-channel="1"]');
-    const target=document.querySelector('[data-layout-channel="0"]');
-    source.dispatchEvent(new DragEvent('dragstart',{bubbles:true}));
-    target.dispatchEvent(new DragEvent('drop',{bubbles:true,cancelable:true}));
-  })()`);
-  await expectBrowser("document.querySelector('.layout-channel').dataset.layoutChannel==='1'", 'Drag reorder did not move channel');
-  await evaluate(`[...document.querySelector('[data-layout-channel="2"]').querySelectorAll('button')].find(b=>b.textContent==='Hide channel').click()`);
-  await evaluate(`(() => { const name=document.querySelector('[aria-label="New group name"]'); name.value='Drums'; name.dispatchEvent(new Event('input',{bubbles:true})); })()`);
-  await evaluate(`document.querySelector('.group-member input[value="0"]').click()`);
-  await evaluate(`document.querySelector('.group-member input[value="1"]').click()`);
-  await clickText('Add group');
-  await expectBrowser("document.querySelector('.layout-group input')?.value==='Drums'", 'Named group was not created');
-  await clickText('Save layout');
-  await expectBrowser("!document.querySelector('.layout-editor') && document.querySelectorAll('.channel-strip:not(.group-strip)').length===79 && document.querySelector('.channel-strip:not(.group-strip)').dataset.channel==='1'", 'Saved order/visibility was not rendered');
-  if (!await evaluate("(async()=>{const l=await fetch('/api/performer/layout').then(r=>r.json()); return l.order[0]===1 && l.hidden.includes(2) && l.groups[0].name==='Drums' && l.groups[0].channels.join(',')==='0,1';})()"))
-    throw new Error('Layout persistence readback failed');
-  // Group faders submit a whole-dB delta, retaining fractional member offsets.
-  await rcp('set MIXER:Current/InCh/ToMix/Level 0 0 -350', 'OK');
-  await rcp('set MIXER:Current/InCh/ToMix/Level 1 0 -725', 'OK');
-  await expectBrowser("document.querySelector('[data-channel=\"1\"]').innerText.includes('-7.25 dB')", 'Group baseline missing');
-  for (const [width,height] of [[390,844],[844,390]]) {
-    await command(ws,'Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:true});
-    await sleep(150);
-    await evaluate("document.querySelector('.channel-strips').scrollTo(0,0); document.querySelector('.group-strip').scrollIntoView({block:'center'})");
-    const point = await evaluate(`(() => { const f=document.querySelector('[data-group-fader]'), r=f.getBoundingClientRect(); return {x:r.x+r.width/2,y:r.y+r.height/2,vertical:getComputedStyle(f).writingMode==='vertical-lr'}; })()`);
-    if (point.vertical !== (width>height)) throw new Error('Group orientation incorrect');
-    const before = await evaluate('window.controlWrites.length');
-    await touch('touchStart',point.x,point.y);
-    await touch('touchMove',point.x-(width>height?40:0),point.y-(width<height?40:0));
-    await touch('touchEnd');
-    if (await evaluate('window.controlWrites.length') !== before) throw new Error('Group swipe submitted a command');
-    await evaluate("document.querySelector('.channel-strips').scrollTo(0,0)");
-    await sleep(100);
-    await touch('touchStart',point.x,point.y);
-    await sleep(260);
-    await touch('touchMove',point.x+(width<height?5:0),point.y-(width>height?5:0));
-    await command(ws,'Emulation.setDeviceMetricsOverride',{width:height,height:width,deviceScaleFactor:1,mobile:true});
-    await sleep(150);
-    await touch('touchEnd');
-    if (!await evaluate(`window.controlWrites.length===${before} && document.querySelector('[data-group-fader]').value==='0'`)) throw new Error('Rotation committed group movement');
-  }
-  await command(ws,'Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
-  await sleep(150);
-  await evaluate("document.querySelector('.channel-strips').scrollTo(0,0);document.querySelector('.group-strip').scrollIntoView({block:'center'})");
-  const groupPoint = await evaluate(`(() => {const r=document.querySelector('[data-group-fader]').getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2};})()`);
-  const groupWrites = await evaluate('window.controlWrites.length');
-  await touch('touchStart',groupPoint.x,groupPoint.y);
-  await sleep(260);
-  await touch('touchMove',groupPoint.x+3,groupPoint.y);
-  const groupDelta = await evaluate("Number(document.querySelector('[data-group-fader]').value)");
-  if (!Number.isInteger(groupDelta) || groupDelta<=0 || await evaluate('window.controlWrites.length')!==groupWrites) throw new Error('Group delta was not staged in whole dB');
-  await touch('touchEnd');
-  await expectBrowser(`window.controlWrites.length===${groupWrites+1} && document.querySelector('[data-channel="0"]').innerText.includes('${(-350+groupDelta*100)/100} dB')`, 'Touch release failed to apply group movement exactly once');
-  await rcp('get MIXER:Current/InCh/ToMix/Level 1 0',`OK get MIXER:Current/InCh/ToMix/Level 1 0 ${-725+groupDelta*100}`);
-  await rcp('set MIXER:Current/InCh/ToMix/Level 0 0 -350','OK');
-  await rcp('set MIXER:Current/InCh/ToMix/Level 1 0 -725','OK');
-  await expectBrowser("document.querySelector('[data-channel=\"1\"]').innerText.includes('-7.25 dB')", 'Group touch reset missing');
-  await evaluate(`(() => {const f=document.querySelector('[data-group-fader]');f.value='2';f.dispatchEvent(new Event('input',{bubbles:true}));f.dispatchEvent(new Event('change',{bubbles:true}));})()`);
-  await expectBrowser("document.querySelector('[data-channel=\"0\"]').innerText.includes('-1.5 dB') && document.querySelector('[data-channel=\"1\"]').innerText.includes('-5.25 dB')", 'Group movement lost balance or fractional offsets');
-  await rcp('get MIXER:Current/InCh/ToMix/Level 0 0','OK get MIXER:Current/InCh/ToMix/Level 0 0 -150');
-  await rcp('get MIXER:Current/InCh/ToMix/Level 1 0','OK get MIXER:Current/InCh/ToMix/Level 1 0 -525');
-  await evaluate(`(() => {window.groupFetch=window.fetch;window.fetch=function(input,init){const url=typeof input==='string'?input:input.url;if(url.includes('/api/performer/group'))return Promise.resolve(new Response('That mix is not assigned to you.',{status:403}));return window.groupFetch.apply(this,arguments);}; const f=document.querySelector('[data-group-fader]');f.value='1';f.dispatchEvent(new Event('change',{bubbles:true}));})()`);
-  await expectBrowser("document.querySelector('.group-strip [role=alert]').textContent.includes('not assigned')", 'Group refusal message missing');
-  await evaluate('window.fetch=window.groupFetch');
+  // Arrange replaces the legacy layout page. It saves each drag/hide directly,
+  // keeps groups in the layout data without rendering group controls, and never
+  // changes console values merely because a strip is hidden.
+  await expectBrowser("document.querySelector('.reorder-handle') && document.body.innerText.includes('Hidden. You still hear these in your mix.')", 'Arrange mode did not replace the legacy layout editor');
+  await evaluate("document.querySelector('[data-channel=\"2\"] [data-action=\"hide\"]').click()");
+  await expectBrowser("!document.querySelector('[data-channel=\"2\"]') && document.querySelector('.hidden-channels')", 'Hide did not move a strip to the hidden tray');
+  await rcp('get MIXER:Current/InCh/ToMix/Level 2 0', 'OK get MIXER:Current/InCh/ToMix/Level 2 0 -350');
+  if (!await evaluate("fetch('/api/performer/layout').then(r=>r.json()).then(l=>l.hidden.includes(2))"))
+    throw new Error('Hide was not persisted');
+  await clickText('Show Channel 3');
+  await expectBrowser("document.querySelector('[data-channel=\"2\"]')", 'Show did not restore the hidden strip');
+  if (!await evaluate(`(async()=>{const l=await fetch('/api/performer/layout').then(r=>r.json());l.groups=[{id:'saved-group',name:'Band',channels:[0,1]}];const r=await fetch('/api/performer/layout',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify(l)});return r.ok;})()`))
+    throw new Error('Could not seed a saved group for the performer persistence check');
+  if (!await evaluate("fetch('/api/performer/layout').then(r=>r.json()).then(l=>l.groups[0]?.name==='Band')"))
+    throw new Error('Saved layout groups were not retained');
+  await clickText('Done');
+  await expectBrowser("!document.querySelector('.reorder-handle') && !document.querySelector('.group-strip') && !document.body.innerText.includes('Edit channel layout')", 'Arrange mode left legacy performer controls visible');
   // Hold only the assignment refresh so actual controls can hit server-side
   // revocation before the UI learns of it. No refusal response is fabricated.
   await evaluate(`(async()=>{const assignments=await fetch('/api/performer/mixes').then(r=>r.json());window.assignmentFetch=window.fetch;window.fetch=function(input,init){const url=typeof input==='string'?input:input.url;if(url.includes('/api/performer/mixes'))return Promise.resolve(new Response(JSON.stringify(assignments),{headers:{'content-type':'application/json'}}));return window.assignmentFetch.apply(this,arguments);};})()`);
@@ -443,15 +365,15 @@ try {
     if (response.status!==303) throw new Error('Assignment update failed: '+response.status);
   }
   await rcp('set MIXER:Current/Mix/Role 0 0 "StereoL"', 'OK');
-  await expectBrowser("document.querySelectorAll('.pan-control').length===79", 'Stereo pan missing before revocation');
+  await evaluate("document.querySelector('[data-channel=\"0\"] .channel-name').click()");
+  await expectBrowser("document.querySelectorAll('.channel-panel input[aria-label$=pan]').length===1", 'Stereo pan missing from the channel panel before revocation');
   await evaluate(`(()=>{window.refusalResults=[];const original=window.fetch;window.fetch=async function(input,init){const response=await original.apply(this,arguments);const url=typeof input==='string'?input:input.url;if(init?.method==='POST' || input?.method==='POST')window.refusalResults.push({url,status:response.status,body:await response.clone().text()});return response;};})()`);
   await assignSinger('mixes=2');
   for (const action of [
     `document.querySelector('[data-channel="0"] [data-action="mute"]').click()`,
     `document.querySelector('[data-channel="0"] [data-action="solo"]').click()`,
     `(()=>{const f=document.querySelector('[data-channel="0"] .send-control input');f.value='-3';f.dispatchEvent(new Event('input',{bubbles:true}));})()`,
-    `(()=>{const f=document.querySelector('[data-group-fader]');f.value='1';f.dispatchEvent(new Event('change',{bubbles:true}));})()`,
-    `(()=>{const f=document.querySelector('[data-channel="0"] .pan-control input');f.value='12';f.dispatchEvent(new Event('input',{bubbles:true}));})()`
+    `(()=>{const f=document.querySelector('.channel-panel input[aria-label$=pan]');f.value='12';f.dispatchEvent(new Event('input',{bubbles:true}));})()`
   ]) {
     const count=await evaluate('window.refusalResults.length');
     await evaluate(action);
@@ -473,34 +395,9 @@ try {
   await command(ws,'Page.navigate',{url:`http://127.0.0.1:${port}/`});
   await expectBrowser("document.querySelectorAll('.mix-picker button').length===2", 'New session picker missing');
   await evaluate("document.querySelector('.mix-picker button').click()");
-  await expectBrowser("document.querySelectorAll('.channel-strip:not(.group-strip)').length===79 && document.querySelector('.channel-strip:not(.group-strip)').dataset.channel==='1' && document.querySelector('.hidden-channels')", 'Saved layout did not return on new sign-in');
-  await clickText('Edit channel layout');
-  await expectBrowser("document.querySelector('.layout-group input')?.value==='Drums'", 'Saved group did not return');
-  // A refused save keeps the draft open and leaves persisted data untouched.
-  await evaluate("(() => {const n=document.querySelector('.layout-group input'); n.value=''; n.dispatchEvent(new Event('input',{bubbles:true}));})()");
-  await clickText('Save layout');
-  await expectBrowser("document.querySelector('.layout-editor [role=alert]').textContent.includes('Give each group a name')", 'Refused save has no readable message');
-  if (!await evaluate("fetch('/api/performer/layout').then(r=>r.json()).then(l=>l.groups[0].name==='Drums')"))
-    throw new Error('Invalid draft replaced saved group');
-  await evaluate("(() => {const n=document.querySelector('.layout-group input'); n.value='Band'; n.dispatchEvent(new Event('input',{bubbles:true}));})()");
-  await clickText('Save layout');
-  await expectBrowser("!document.querySelector('.layout-editor')", 'Group rename did not save');
-  if (!await evaluate("fetch('/api/performer/layout').then(r=>r.json()).then(l=>l.groups[0].name==='Band')"))
-    throw new Error('Group rename did not persist');
-  await clickText('Edit channel layout');
-  await expectBrowser("document.querySelector('.layout-group input')?.value==='Band'", 'Renamed group did not load');
-  await clickText('Delete group');
-  await evaluate(`[...document.querySelector('[data-layout-channel="2"]').querySelectorAll('button')].find(b=>b.textContent==='Show channel').click()`);
-  await clickText('Save layout');
-  await expectBrowser("!document.querySelector('.layout-editor') && document.querySelectorAll('.channel-strip').length===80", 'Show channel did not restore strip');
-  if (!await evaluate("fetch('/api/performer/layout').then(r=>r.json()).then(l=>l.groups.length===0 && l.hidden.length===0)"))
-    throw new Error('Group deletion/show channel did not persist');
-  // Cancel discards staged ordering, and layout edits preserve console values.
-  await clickText('Edit channel layout');
-  await expectBrowser("document.querySelector('.layout-channel')?.dataset.layoutChannel==='1'", 'Editor order missing');
-  await evaluate("document.querySelector('.layout-channel button:nth-of-type(2)').click()");
-  await clickText('Cancel layout changes');
-  await expectBrowser("!document.querySelector('.layout-editor') && document.querySelector('.channel-strip:not(.group-strip)').dataset.channel==='1'", 'Cancel changed displayed order');
+  await expectBrowser("document.querySelectorAll('.channel-strip').length===80 && !document.querySelector('.group-strip')", 'Performer layout did not return without group UI');
+  if (!await evaluate("fetch('/api/performer/layout').then(r=>r.json()).then(l=>l.groups[0]?.name==='Band')"))
+    throw new Error('Performer reload discarded saved groups');
   await rcp('get MIXER:Current/InCh/ToMix/Level 0 0', 'OK get MIXER:Current/InCh/ToMix/Level 0 0 -400');
   await rcp('get MIXER:Current/InCh/ToMix/On 0 0', 'OK get MIXER:Current/InCh/ToMix/On 0 0 0');
   // Personal solo restores exact wire levels and keeps engineer changes.
@@ -508,19 +405,19 @@ try {
   await expectBrowser("document.querySelector('[data-channel=\"2\"]').innerText.includes('-3.5 dB')", 'Solo baseline did not reach the browser');
   const soloButton = input => `document.querySelector('[data-channel="${input}"]').querySelector('[data-action="solo"]')`;
   await evaluate(`${soloButton(0)}.click()`);
-  await expectBrowser("document.body.innerText.includes('Solo active (by ') && document.querySelector('[data-channel=\"2\"]').innerText.includes('Off')", 'Solo did not turn the other send off');
+  await expectBrowser("document.querySelector('.solo-banner')?.innerText.includes('Solo: Lead Vocal') && document.querySelector('.solo-banner button')?.textContent==='Clear solo' && document.querySelector('[data-channel=\"2\"]').innerText.includes('Paused')", 'Solo did not show its persistent banner or pause other channels');
   await rcp('get MIXER:Current/InCh/ToMix/Level 2 0', 'OK get MIXER:Current/InCh/ToMix/Level 2 0 -32768');
   await rcp('set MIXER:Current/InCh/ToMix/Level 3 0 -725', 'OK');
   await expectBrowser("document.querySelector('[data-channel=\"3\"]').innerText.includes('-7.25 dB')", 'Engineer change during solo missing');
-  await evaluate(`${soloButton(0)}.click()`);
-  await expectBrowser("!document.body.innerText.includes('Solo active (by ') && document.querySelector('[data-channel=\"2\"]').innerText.includes('-3.5 dB')", 'Solo did not restore fractional level');
+  await evaluate("document.querySelector('.solo-banner button').click()");
+  await expectBrowser("!document.querySelector('.solo-banner') && document.querySelector('[data-channel=\"2\"]').innerText.includes('-3.5 dB')", 'Clear solo did not restore fractional level');
   await rcp('get MIXER:Current/InCh/ToMix/Level 3 0', 'OK get MIXER:Current/InCh/ToMix/Level 3 0 -725');
   await sleep(300); // Let restoration readbacks drain before starting another solo.
   await evaluate(`${soloButton(1)}.click()`);
-  await expectBrowser("document.body.innerText.includes('Solo active (by ')", 'Second solo did not start');
+  await expectBrowser("document.querySelector('.solo-banner')?.innerText.includes('Solo: Channel 2')", 'Second solo did not start');
   await rcp('ssrecall_ex MIXER:Lib/Scene 2', 'OK');
   await expectBrowser("document.title === 'Show · Monitor Mix' && document.querySelector('.scene-bar').innerText.includes('Show')", 'Scene recall did not update mix page/title');
-  await expectBrowser("document.body.innerText.includes('Scene changed — solo cleared') && !document.body.innerText.includes('Solo active (by ')", 'Scene recall did not clear solo and explain why');
+  await expectBrowser("document.body.innerText.includes('New scene, so Solo turned off.') && !document.querySelector('.solo-banner')", 'Scene recall did not clear solo and explain why');
   await rcp('get MIXER:Current/InCh/ToMix/Level 0 0', 'OK get MIXER:Current/InCh/ToMix/Level 0 0 -1200');
   await evaluate("[...document.querySelectorAll('button')].find(b=>b.textContent==='Choose another mix').click()");
   await expectBrowser("document.querySelectorAll('.mix-picker button').length === 2 && document.title === 'Show · Monitor Mix'", 'Picker lost current scene');
