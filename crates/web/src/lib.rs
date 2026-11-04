@@ -179,6 +179,9 @@ pub fn app() -> Html {
         },
         Screen::SignIn(users) => html! { <SignIn users={users.clone()} notice={notice} /> },
         Screen::SignedIn(user) => {
+            // A name becomes "last time" only after the server has accepted
+            // its code and restored a signed-in session.
+            store_name("cl5.lastName", &user.name, false);
             if user.role == "admin" {
                 html! { <AdminPortal user={user.clone()} /> }
             } else {
@@ -198,17 +201,33 @@ struct SignInProps {
 /// small four-digit keypad, which submits as soon as the fourth digit is tapped.
 #[function_component(SignIn)]
 fn sign_in(props: &SignInProps) -> Html {
-    let selected = use_state(|| None::<String>);
+    // The server redirects back after a failed code. Keep the selected name in
+    // session storage so the performer lands back on the keypad, not the name
+    // picker, after that normal form submission.
+    let selected = use_state(pending_name);
     let digits = use_state(String::new);
+    let seconds_left = use_state(|| lock_seconds_from_notice(props.notice.as_deref()));
     let form = use_node_ref();
-    let locked = props
-        .notice
-        .as_deref()
-        .is_some_and(|notice| notice.starts_with("This name is locked."));
+    let locked = seconds_left.is_some_and(|seconds| seconds > 0);
+    {
+        let seconds_left = seconds_left.clone();
+        use_effect_with(*seconds_left, move |seconds| {
+            let timer = seconds.filter(|seconds| *seconds > 0).map(|_| {
+                Interval::new(1_000, {
+                    let seconds_left = seconds_left.clone();
+                    move || {
+                        seconds_left.set((*seconds_left).map(|seconds| seconds.saturating_sub(1)))
+                    }
+                })
+            });
+            move || drop(timer)
+        });
+    }
     let choose = {
         let selected = selected.clone();
         let digits = digits.clone();
         Callback::from(move |name: String| {
+            store_name("cl5.pendingName", &name, true);
             selected.set(Some(name));
             digits.set(String::new());
         })
@@ -248,20 +267,47 @@ fn sign_in(props: &SignInProps) -> Html {
     };
     let change_name = {
         let selected = selected.clone();
-        Callback::from(move |_| selected.set(None))
+        Callback::from(move |_| {
+            remove_name("cl5.pendingName", true);
+            selected.set(None)
+        })
+    };
+    let keypad_key = {
+        let digit = digit.clone();
+        let digits = digits.clone();
+        Callback::from(move |event: KeyboardEvent| match event.key().as_str() {
+            "Backspace" => {
+                let mut next = (*digits).clone();
+                next.pop();
+                digits.set(next);
+            }
+            key if key.len() == 1 && key.bytes().all(|byte| byte.is_ascii_digit()) => {
+                digit.emit(key.into())
+            }
+            _ => {}
+        })
     };
     html! {
         <section class="sign-in" aria-label="Sign in">
             <h1>{"Monitor Mix"}</h1>
-            {props.notice.as_ref().map(|text| html! { <p role="alert">{text}</p> }).unwrap_or_default()}
+            if selected.is_none() {
+                {props.notice.as_ref().map(|text| html! { <p role="alert">{text}</p> }).unwrap_or_default()}
+            }
             if let Some(name) = selected.as_ref() {
                 <form method="post" action="/signin" ref={form}>
                     <input type="hidden" name="name" value={name.clone()} />
                     <input type="hidden" name="passcode" value={(*digits).clone()} />
                 </form>
                 <h2>{format!("Hi, {}", first_name(name))}</h2>
-                <p aria-live="polite">{format!("Code: {}", "●".repeat(digits.len()))}</p>
-                <div class="keypad" aria-label="4-digit passcode keypad">
+                <p>{"Enter your 4-digit code"}</p>
+                <p aria-live="polite">{format!("{}{}", "●".repeat(digits.len()), "○".repeat(4 - digits.len()))}</p>
+                <p role="alert">{
+                    if let Some(seconds) = *seconds_left {
+                        if seconds == 0 { "You can try that code again now.".into() }
+                        else { format!("Too many wrong codes. Try again in {seconds}, or ask the sound engineer.") }
+                    } else { props.notice.clone().unwrap_or_default() }
+                }</p>
+                <div class="keypad" aria-label="4-digit passcode keypad" tabindex="0" onkeydown={keypad_key}>
                     {for (1..=9).map(|number| {
                         let digit = digit.clone();
                         let value = number.to_string();
@@ -271,9 +317,18 @@ fn sign_in(props: &SignInProps) -> Html {
                     <button type="button" onclick={erase} disabled={locked || digits.is_empty()}>{"Delete"}</button>
                     <button type="button" onclick={zero} disabled={locked}>{"0"}</button>
                 </div>
-                <button type="button" class="change-name" onclick={change_name}>{"Choose a different name"}</button>
+                <button type="button" class="change-name" onclick={change_name}>{format!("‹ Not {}?", first_name(name))}</button>
             } else {
-                <p>{"Tap your name, then enter your 4-digit code."}</p>
+                <h1>{"Tap your name"}</h1>
+                if let Some(last_name) = last_name(&props.users) {
+                    <section class="last-name"><p>{"Last time on this phone"}</p>
+                    {{
+                        let choose = choose.clone();
+                        let name = last_name.clone();
+                        let onclick = Callback::from(move |_| choose.emit(name.clone()));
+                        html! { <button type="button" {onclick}>{last_name}</button> }
+                    }}</section>
+                }
                 <div class="name-picker" aria-label="Choose your name">
                     {for props.users.iter().map(|name| {
                         let choose = choose.clone();
@@ -290,6 +345,45 @@ fn sign_in(props: &SignInProps) -> Html {
 
 fn first_name(name: &str) -> &str {
     name.split_whitespace().next().unwrap_or(name)
+}
+
+fn storage(session: bool) -> Option<web_sys::Storage> {
+    let window = web_sys::window()?;
+    (if session {
+        window.session_storage()
+    } else {
+        window.local_storage()
+    })
+    .ok()
+    .flatten()
+}
+
+fn stored_name(key: &str, session: bool) -> Option<String> {
+    storage(session)?
+        .get_item(key)
+        .ok()
+        .flatten()
+        .filter(|name| !name.is_empty())
+}
+
+fn store_name(key: &str, name: &str, session: bool) {
+    if let Some(storage) = storage(session) {
+        let _ = storage.set_item(key, name);
+    }
+}
+
+fn remove_name(key: &str, session: bool) {
+    if let Some(storage) = storage(session) {
+        let _ = storage.remove_item(key);
+    }
+}
+
+fn pending_name() -> Option<String> {
+    stored_name("cl5.pendingName", true)
+}
+
+fn last_name(users: &[String]) -> Option<String> {
+    stored_name("cl5.lastName", false).filter(|name| users.contains(name))
 }
 
 #[derive(Properties, PartialEq)]
@@ -614,20 +708,34 @@ fn scene_bar(props: &SceneBarProps) -> Html {
 }
 
 fn error_notice(search: &str) -> Option<String> {
-    if search.contains("error=locked") {
-        let seconds = search
-            .split('&')
-            .find_map(|part| part.strip_prefix("seconds=")?.parse::<u64>().ok())?;
+    if let Some(seconds) = lock_seconds(search) {
         Some(format!(
-            "This name is locked. Try again in {seconds} seconds."
+            "Too many wrong codes. Try again in {seconds}, or ask the sound engineer."
         ))
     } else if search.contains("error=wrong") {
-        Some("Wrong passcode. Check the 4 digits and try again.".into())
+        Some("That code didn't match. Try again.".into())
     } else if search.contains("error=setup") {
         Some("The first admin could not be created. Check the details and try again.".into())
     } else {
         None
     }
+}
+
+fn lock_seconds(search: &str) -> Option<u64> {
+    search
+        .contains("error=locked")
+        .then(|| {
+            search
+                .split('&')
+                .find_map(|part| part.strip_prefix("seconds=")?.parse::<u64>().ok())
+        })
+        .flatten()
+}
+
+fn lock_seconds_from_notice(notice: Option<&str>) -> Option<u64> {
+    let notice = notice?;
+    let prefix = "Too many wrong codes. Try again in ";
+    notice.strip_prefix(prefix)?.split_once(',')?.0.parse().ok()
 }
 
 #[cfg(test)]
@@ -695,7 +803,7 @@ mod tests {
     fn lockout_notice_uses_the_server_reported_time_left() {
         assert_eq!(
             error_notice("?error=locked&seconds=137"),
-            Some("This name is locked. Try again in 137 seconds.".into())
+            Some("Too many wrong codes. Try again in 137, or ask the sound engineer.".into())
         );
     }
 
