@@ -36,6 +36,13 @@
       button[aria-pressed="true"] { background: #ffb454; }
       button:disabled, input:disabled { opacity: .55; }
       @media (orientation: landscape) { #app { width: min(100%, 48rem); } }
+      .layout-editor fieldset { display: block; min-width: 0; }
+      .layout-channel, .layout-group { margin: .5rem 0; padding: .5rem; background: #222; border-radius: .5rem; }
+      .layout-channel strong { display: block; overflow-wrap: anywhere; }
+      .layout-channel button { margin: .25rem; }
+      .layout-editor .group-member { display: flex; align-items: center; min-height: 44px; gap: .5rem; overflow-wrap: anywhere; }
+      .layout-editor input[type=checkbox] { width: 24px; min-height: 24px; flex-shrink: 0; }
+      .layout-editor input:not([type=checkbox]) { width: 100%; box-sizing: border-box; }
     </style>
   </head>
   <body><main id="app"></main></body>

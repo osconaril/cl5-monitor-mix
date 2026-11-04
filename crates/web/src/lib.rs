@@ -5,6 +5,7 @@ use gloo_timers::callback::{Interval, Timeout};
 use serde::Deserialize;
 use std::{collections::HashMap, rc::Rc};
 
+mod layout;
 mod performer;
 use wasm_bindgen::{closure::Closure, JsCast};
 use wasm_bindgen_futures::spawn_local;

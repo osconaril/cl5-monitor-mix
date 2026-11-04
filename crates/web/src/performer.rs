@@ -1,4 +1,5 @@
 //! Performer controls use console readback as the displayed source of truth.
+use super::layout::{Layout, LayoutEditor};
 use super::{refresh_performer_mixes, LiveState, PerformerMixes, User};
 use gloo_net::http::Request;
 use gloo_timers::callback::Interval;
@@ -68,6 +69,78 @@ pub(super) fn performer(props: &PerformerProps) -> Html {
     let mixes = use_state(|| None::<PerformerMixes>);
     let selected = use_state(|| None::<String>);
     let message = use_state(String::new);
+    let layout = use_state(|| None::<Layout>);
+    let editing = use_state(|| false);
+    let layout_error = use_state(String::new);
+    let load_generation = use_state(|| 0u32);
+    {
+        let layout = layout.clone();
+        let layout_error = layout_error.clone();
+        use_effect_with(*load_generation, move |_| {
+            spawn_local(async move {
+                let result = async {
+                    let response =
+                        Request::get("/api/performer/layout")
+                            .send()
+                            .await
+                            .map_err(|_| {
+                                "Could not load your layout. Check your connection.".to_owned()
+                            })?;
+                    if !response.ok() {
+                        return Err(response
+                            .text()
+                            .await
+                            .unwrap_or_else(|_| "Could not load your layout.".into()));
+                    }
+                    response
+                        .json::<Layout>()
+                        .await
+                        .map_err(|_| "Could not read your layout.".to_owned())
+                }
+                .await;
+                match result {
+                    Ok(saved) => {
+                        layout.set(Some(saved));
+                        layout_error.set(String::new());
+                    }
+                    Err(error) => layout_error.set(error),
+                }
+            });
+            || ()
+        });
+    }
+    let channel_names: Vec<String> = (0..80)
+        .map(|input| {
+            live.console
+                .values
+                .get(&format!("MIXER:Current/InCh/Label/Name {input} 0"))
+                .map(|name| name.trim_matches('"'))
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("Channel {}", input + 1))
+        })
+        .collect();
+    let shown_layout = layout.as_ref().cloned().unwrap_or_default();
+    let edit_layout = {
+        let editing = editing.clone();
+        Callback::from(move |_| editing.set(true))
+    };
+    let cancel_layout = {
+        let editing = editing.clone();
+        Callback::from(move |_| editing.set(false))
+    };
+    let saved_layout = {
+        let layout = layout.clone();
+        let editing = editing.clone();
+        Callback::from(move |saved| {
+            layout.set(Some(saved));
+            editing.set(false);
+        })
+    };
+    let retry_layout = {
+        let load_generation = load_generation.clone();
+        Callback::from(move |_| load_generation.set(*load_generation + 1))
+    };
     {
         let mixes = mixes.clone();
         use_effect_with((), move |_| {
@@ -131,17 +204,27 @@ pub(super) fn performer(props: &PerformerProps) -> Html {
                 <div class="mix-heading"><h2>{active.clone().unwrap_or_default()}</h2>
                 if assignments.len() > 1 { <button onclick={back}>{"Choose another mix"}</button> }</div>
                 if !live.connected { <p role="alert">{"Console disconnected — controls are unavailable until it reconnects."}</p> }
+                <p role="alert">{(*layout_error).clone()}</p>
+                if !layout_error.is_empty() { <button onclick={retry_layout}>{"Retry loading layout"}</button> }
+                if *editing {
+                    <LayoutEditor layout={shown_layout.clone()} names={channel_names.clone()} saved={saved_layout} cancel={cancel_layout} />
+                } else {
+                <button onclick={edit_layout} disabled={layout.is_none()}>{"Edit channel layout"}</button>
                 <div class="channel-strips">
-                {for (0u8..80).map(|input| {
+                {for shown_layout.order.iter().copied().filter(|input| !shown_layout.hidden.contains(input)).map(|input| {
                     let value = |path| live.console.values.get(&format!("{path} {input} {mix}"));
                     let level = value(LEVEL).and_then(|v| v.parse::<i16>().ok()).filter(|v| *v == OFF || (-13800..=1000).contains(v));
                     let on = value(ON).and_then(|v| match v.as_str() { "1" => Some(true), "0" => Some(false), _ => None });
-                    let name = live.console.values.get(&format!("MIXER:Current/InCh/Label/Name {input} 0"))
-                        .map(|name| name.trim_matches('"')).filter(|name| !name.is_empty())
-                        .map(str::to_owned).unwrap_or_else(|| format!("Channel {}", input + 1));
+                    let name = channel_names[input as usize].clone();
                     html! { <ChannelStrip key={format!("{mix}-{input}")} {mix} {input} {name} {level} {on} connected={live.connected} change={change.clone()} /> }
                 })}
                 </div>
+                if !shown_layout.hidden.is_empty() {
+                    <section class="hidden-channels"><h2>{"Hidden"}</h2>
+                    <p>{shown_layout.hidden.iter().map(|input| channel_names[*input as usize].clone()).collect::<Vec<_>>().join(", ")}</p>
+                    <p>{"Use Edit channel layout to show these channels again."}</p></section>
+                }
+                }
             } else {
                 <p>{if mixes.is_none() { "Loading your mix assignments…" } else if assignments.is_empty() { "No mixes assigned yet. Ask the engineer to assign your mix." } else { "Choose your mix." }}</p>
                 <div class="mix-picker">{for assignments.iter().filter(|name| mix_index(name).is_some()).map(|name| {

@@ -165,6 +165,66 @@ try {
   await evaluate(`${strip}.querySelector('button').click()`);
   await expectBrowser(`${strip}.querySelector('button').getAttribute('aria-pressed') === 'true'`, 'Mute readback did not reach the browser');
   await rcp('get MIXER:Current/InCh/ToMix/On 0 0', 'OK get MIXER:Current/InCh/ToMix/On 0 0 0');
+  // Presentation settings must survive a fresh session without changing sound.
+  const clickText = text => evaluate(`(() => { const b=[...document.querySelectorAll('button')].find(b=>b.textContent===${JSON.stringify(text)}); if(!b) throw new Error('Missing button'); b.click(); })()`);
+  await clickText('Edit channel layout');
+  await expectBrowser("document.querySelectorAll('.layout-channel').length===80", 'Layout editor did not load');
+  for (const [width,height] of [[390,844],[844,390]]) {
+    await command(ws,'Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:true});
+    if (!await evaluate("Math.max(document.documentElement.scrollWidth,document.body.scrollWidth)<=innerWidth && [...document.querySelectorAll('.layout-editor button')].every(b=>b.getBoundingClientRect().height>=44)"))
+      throw new Error('Layout editor overflow or small touch targets');
+  }
+  await evaluate(`(() => {
+    const source=document.querySelector('[data-layout-channel="1"]');
+    const target=document.querySelector('[data-layout-channel="0"]');
+    source.dispatchEvent(new DragEvent('dragstart',{bubbles:true}));
+    target.dispatchEvent(new DragEvent('drop',{bubbles:true,cancelable:true}));
+  })()`);
+  await expectBrowser("document.querySelector('.layout-channel').dataset.layoutChannel==='1'", 'Drag reorder did not move channel');
+  await evaluate(`[...document.querySelector('[data-layout-channel="2"]').querySelectorAll('button')].find(b=>b.textContent==='Hide channel').click()`);
+  await evaluate(`(() => { const name=document.querySelector('[aria-label="New group name"]'); name.value='Drums'; name.dispatchEvent(new Event('input',{bubbles:true})); })()`);
+  await evaluate(`document.querySelector('.group-member input[value="0"]').click()`);
+  await evaluate(`document.querySelector('.group-member input[value="1"]').click()`);
+  await clickText('Add group');
+  await expectBrowser("document.querySelector('.layout-group input')?.value==='Drums'", 'Named group was not created');
+  await clickText('Save layout');
+  await expectBrowser("!document.querySelector('.layout-editor') && document.querySelectorAll('.channel-strip').length===79 && document.querySelector('.channel-strip').dataset.channel==='1'", 'Saved order/visibility was not rendered');
+  if (!await evaluate("(async()=>{const l=await fetch('/api/performer/layout').then(r=>r.json()); return l.order[0]===1 && l.hidden.includes(2) && l.groups[0].name==='Drums' && l.groups[0].channels.join(',')==='0,1';})()"))
+    throw new Error('Layout persistence readback failed');
+  await evaluate("fetch('/signout',{method:'POST'}).then(()=>fetch('/signin',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:'name=Singer&passcode=5678'}))");
+  await command(ws,'Page.navigate',{url:`http://127.0.0.1:${port}/`});
+  await expectBrowser("document.querySelectorAll('.mix-picker button').length===2", 'New session picker missing');
+  await evaluate("document.querySelector('.mix-picker button').click()");
+  await expectBrowser("document.querySelectorAll('.channel-strip').length===79 && document.querySelector('.channel-strip').dataset.channel==='1' && document.querySelector('.hidden-channels')", 'Saved layout did not return on new sign-in');
+  await clickText('Edit channel layout');
+  await expectBrowser("document.querySelector('.layout-group input')?.value==='Drums'", 'Saved group did not return');
+  // A refused save keeps the draft open and leaves persisted data untouched.
+  await evaluate("(() => {const n=document.querySelector('.layout-group input'); n.value=''; n.dispatchEvent(new Event('input',{bubbles:true}));})()");
+  await clickText('Save layout');
+  await expectBrowser("document.querySelector('.layout-editor [role=alert]').textContent.includes('Give each group a name')", 'Refused save has no readable message');
+  if (!await evaluate("fetch('/api/performer/layout').then(r=>r.json()).then(l=>l.groups[0].name==='Drums')"))
+    throw new Error('Invalid draft replaced saved group');
+  await evaluate("(() => {const n=document.querySelector('.layout-group input'); n.value='Band'; n.dispatchEvent(new Event('input',{bubbles:true}));})()");
+  await clickText('Save layout');
+  await expectBrowser("!document.querySelector('.layout-editor')", 'Group rename did not save');
+  if (!await evaluate("fetch('/api/performer/layout').then(r=>r.json()).then(l=>l.groups[0].name==='Band')"))
+    throw new Error('Group rename did not persist');
+  await clickText('Edit channel layout');
+  await expectBrowser("document.querySelector('.layout-group input')?.value==='Band'", 'Renamed group did not load');
+  await clickText('Delete group');
+  await evaluate(`[...document.querySelector('[data-layout-channel="2"]').querySelectorAll('button')].find(b=>b.textContent==='Show channel').click()`);
+  await clickText('Save layout');
+  await expectBrowser("!document.querySelector('.layout-editor') && document.querySelectorAll('.channel-strip').length===80", 'Show channel did not restore strip');
+  if (!await evaluate("fetch('/api/performer/layout').then(r=>r.json()).then(l=>l.groups.length===0 && l.hidden.length===0)"))
+    throw new Error('Group deletion/show channel did not persist');
+  // Cancel discards staged ordering, and layout edits preserve console values.
+  await clickText('Edit channel layout');
+  await expectBrowser("document.querySelector('.layout-channel')?.dataset.layoutChannel==='1'", 'Editor order missing');
+  await evaluate("document.querySelector('.layout-channel button:nth-of-type(2)').click()");
+  await clickText('Cancel layout changes');
+  await expectBrowser("!document.querySelector('.layout-editor') && document.querySelector('.channel-strip').dataset.channel==='1'", 'Cancel changed displayed order');
+  await rcp('get MIXER:Current/InCh/ToMix/Level 0 0', 'OK get MIXER:Current/InCh/ToMix/Level 0 0 -400');
+  await rcp('get MIXER:Current/InCh/ToMix/On 0 0', 'OK get MIXER:Current/InCh/ToMix/On 0 0 0');
   await rcp('ssrecall_ex MIXER:Lib/Scene 2', 'OK');
   await expectBrowser("document.title === 'Show · Monitor Mix' && document.querySelector('.scene-bar').innerText.includes('Show')", 'Scene recall did not update mix page/title');
   await evaluate("[...document.querySelectorAll('button')].find(b=>b.textContent==='Choose another mix').click()");
@@ -174,7 +234,7 @@ try {
   await evaluate("document.querySelector('.mix-picker button').click()");
   await expectBrowser("[...document.querySelectorAll('.channel-strip input, .channel-strip button')].every(e=>e.disabled)", 'Disconnected controls remained enabled');
   ws.close();
-  console.log('Browser smoke passed at 390x844 and 844x390, including performer picker, live faders/mute and scenes.');
+  console.log('Browser smoke passed at 390x844 and 844x390, including performer picker, live faders/mute, saved layouts/groups and scenes.');
 } finally {
   engineer?.destroy();
   await Promise.all([stop(server), stop(browser), stop(fake)]);
