@@ -279,10 +279,13 @@ try {
       const t=document.querySelector('[data-channel="${target}"]').getBoundingClientRect();
       return {sx:s.x+s.width/2,sy:s.y+s.height/2,tx:t.x+t.width*(${after}?0.75:0.25),ty:matchMedia("(orientation: landscape)").matches?t.y+22:t.y+t.height*(${after}?0.75:0.1)};
     })()`);
-    const handle = `[data-channel="${source}"] .reorder-handle`;
-    await pointerOn(handle, 'pointerdown', points.sx, points.sy);
-    await pointerOn(handle, 'pointermove', points.tx, points.ty);
-    await pointerOn(handle, 'pointerup', points.tx, points.ty);
+    // Use CDP's real touch injection for reorder handles. Synthetic
+    // PointerEvents are not active pointers, so setPointerCapture() correctly
+    // rejects them; the production handler must retain the real touch pointer
+    // while a drag crosses another strip.
+    await command(ws, 'Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x: points.sx, y: points.sy, id: 71 }] });
+    await command(ws, 'Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x: points.tx, y: points.ty, id: 71 }] });
+    await command(ws, 'Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
   }
   const writesBeforeReorder = await evaluate("window.controlWrites.length");
   for (const [width,height] of [[390,844],[844,390]]) {
