@@ -77,6 +77,7 @@ enum BridgeCommand {
         mix: u8,
         owner: String,
         channels: BTreeSet<u8>,
+        admin_clear: bool,
         reply: oneshot::Sender<Result<(), &'static str>>,
     },
 }
@@ -143,6 +144,22 @@ impl ConsoleBridge {
         owner: String,
         channels: BTreeSet<u8>,
     ) -> Result<(), &'static str> {
+        self.request_solo(mix, owner, channels, false).await
+    }
+
+    /// Called only after the HTTP handler authenticates an administrator.
+    pub async fn clear_solo(&self, mix: u8) -> Result<(), &'static str> {
+        self.request_solo(mix, String::new(), BTreeSet::new(), true)
+            .await
+    }
+
+    async fn request_solo(
+        &self,
+        mix: u8,
+        owner: String,
+        channels: BTreeSet<u8>,
+        admin_clear: bool,
+    ) -> Result<(), &'static str> {
         if !self.is_connected() {
             return Err("Console disconnected — reconnecting.");
         }
@@ -152,6 +169,7 @@ impl ConsoleBridge {
                 mix,
                 owner,
                 channels,
+                admin_clear,
                 reply,
             })
             .await
@@ -322,7 +340,7 @@ async fn serve_connection(
                         }
                     }
                 }
-                Some(BridgeCommand::Solo { mix, owner, channels, reply }) => {
+                Some(BridgeCommand::Solo { mix, owner, channels, admin_clear, reply }) => {
                     if !*connected.borrow() {
                         let _ = reply.send(Err("Console disconnected — reconnecting."));
                         continue;
@@ -332,6 +350,11 @@ async fn serve_connection(
                         continue;
                     }
                     let values = state.read().await.values.clone();
+                    // Resolve ownership in the worker, in order with scene readback.
+                    // A recalled scene has already discarded its restoration snapshot.
+                    let owner = if admin_clear {
+                        solos.statuses().get(&mix).map(|s| s.owner.clone()).unwrap_or(owner)
+                    } else { owner };
                     match solos.set(mix, &owner, channels, &values) {
                         Err(error) => { let _ = reply.send(Err(error)); }
                         Ok(changes) => {
@@ -850,11 +873,11 @@ mod tests {
         let bridge = ConsoleBridge::start(address.to_string());
         ready(&bridge).await;
         let mut engineer = TcpStream::connect(address).await.unwrap();
-        engineer.write_all(format!("set {LEVEL} 0 0 -350\nset {LEVEL} 1 0 -725\nset {LEVEL} 2 0 -950\nset {LEVEL} 1 1 -1234\n").as_bytes()).await.unwrap();
+        engineer.write_all(format!("set {LEVEL} 0 0 -350\nset {LEVEL} 1 0 -725\nset {LEVEL} 2 0 -950\nset {LEVEL} 79 0 -500\nset {LEVEL} 1 1 -1234\n").as_bytes()).await.unwrap();
         wait_level(&bridge, 1, 1, "-1234").await;
         bridge.solo(0, "Singer".into(), [0].into()).await.unwrap();
-        wait_level(&bridge, 2, 0, "-32768").await;
-        sleep(Duration::from_millis(100)).await;
+        // Wait for the final write's readback, not a fixed delay after channel 3.
+        wait_level(&bridge, 79, 0, "-32768").await;
         assert_eq!(bridge.state().await.solos[&0].owner, "Singer");
         assert!(bridge
             .solo(0, "Other singer".into(), [2].into())
@@ -873,7 +896,7 @@ mod tests {
         wait_level(&bridge, 1, 0, "-625").await;
         wait_level(&bridge, 0, 0, "-350").await;
         wait_level(&bridge, 1, 1, "-1234").await;
-        sleep(Duration::from_millis(100)).await;
+        wait_level(&bridge, 79, 0, "-500").await;
         bridge.solo(0, "Singer".into(), [1].into()).await.unwrap();
         wait_level(&bridge, 0, 0, "-32768").await;
         fake.recall_scene(2).await.unwrap();

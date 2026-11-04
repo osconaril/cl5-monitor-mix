@@ -479,6 +479,70 @@ try {
   await evaluate("document.querySelector('.mix-picker button').click()");
   await expectBrowser("document.querySelectorAll('.channel-strip').length===80 && document.title==='Scene 3 · Monitor Mix' && document.querySelector('.scene-bar').innerText.includes('Scene 3')", 'Unnamed scene missing on mix screen');
   await evaluate("[...document.querySelectorAll('button')].find(b=>b.textContent==='Choose another mix').click()");
+  // Regression: losing the solo owner must still leave an authorized recovery
+  // path. Exercise real HTTP authorization, admin UI and TCP console readback.
+  async function adminPost(path, body) {
+    const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+      method:'POST', headers:{cookie:adminCookie,'content-type':'application/x-www-form-urlencoded'},
+      body, redirect:'manual'
+    });
+    if (response.status !== 303) throw new Error(`Admin action failed: ${path} ${response.status}`);
+  }
+  async function soloRequest(cookie, channels) {
+    return fetch(`http://127.0.0.1:${port}/api/performer/solo`, {
+      method:'POST', headers:{cookie,'content-type':'application/json'},
+      body:JSON.stringify({mix:0,channels})
+    });
+  }
+  await evaluate("fetch('/signout',{method:'POST'}).then(()=>fetch('/signin',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:'name=Browser&passcode=1234'}))");
+  await command(ws,'Page.navigate',{url:`http://127.0.0.1:${port}/`});
+  await expectBrowser("document.querySelector('h1')?.textContent==='Users'", 'Recovery admin portal missing');
+  for (const scenario of ['unassigned','deleted','scene']) {
+    const name = `Recovery-${scenario}`;
+    await adminPost('/api/admin/users', `name=${name}&passcode=9876&role=performer`);
+    await adminPost(`/api/admin/users/${name}/mixes`, 'mixes=1');
+    const login = await fetch(`http://127.0.0.1:${port}/signin`, {
+      method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},
+      body:`name=${name}&passcode=9876`,redirect:'manual'
+    });
+    const cookie = login.headers.get('set-cookie')?.split(';')[0];
+    if (!cookie) throw new Error('Recovery performer login failed');
+    await expectBrowser("fetch('/api/admin/overview').then(r=>r.json()).then(o=>o.console.connected)", 'Console hydration did not finish before recovery test');
+    await rcp('set MIXER:Current/InCh/ToMix/Level 2 0 -350', 'OK');
+    await sleep(300);
+    const start = await soloRequest(cookie,[0]);
+    if (start.status !== 202) throw new Error('Recovery solo start refused: '+await start.text());
+    await expectBrowser("document.body.innerText.includes('Clear solo on Mix 1')", 'Admin recovery button missing');
+    await rcp('get MIXER:Current/InCh/ToMix/Level 2 0', 'OK get MIXER:Current/InCh/ToMix/Level 2 0 -32768');
+    await rcp('set MIXER:Current/InCh/ToMix/Level 3 0 -725', 'OK');
+    await sleep(300);
+    if (scenario === 'deleted') {
+      await adminPost(`/api/admin/users/${name}`, '');
+    } else {
+      await adminPost(`/api/admin/users/${name}/mixes`, 'mixes=2');
+    }
+    const refused = await soloRequest(cookie,[]);
+    if (refused.status !== (scenario === 'deleted' ? 401 : 403)) throw new Error('Removed owner retained solo authority');
+    // An admin may clear, but cannot take over or change another user's selection.
+    if ((await soloRequest(adminCookie,[1])).status !== 400) throw new Error('Admin stole active solo');
+    if (scenario === 'scene') {
+      await rcp('ssrecall_ex MIXER:Lib/Scene 2', 'OK');
+      await expectBrowser("!document.body.innerText.includes('Clear solo on Mix 1')", 'Scene left stale admin recovery');
+      await expectBrowser("fetch('/api/admin/overview').then(r=>r.json()).then(o=>o.console.connected)", 'Scene recovery hydration did not finish');
+      const cleared = await soloRequest(adminCookie,[]);
+      if (cleared.status !== 202) throw new Error('Post-scene clear refused');
+      await rcp('get MIXER:Current/InCh/ToMix/Level 2 0', 'OK get MIXER:Current/InCh/ToMix/Level 2 0 -32768');
+    } else {
+      await clickText('Clear solo on Mix 1');
+      await expectBrowser("!document.body.innerText.includes('Clear solo on Mix 1')", 'Admin could not recover stranded solo');
+      await rcp('get MIXER:Current/InCh/ToMix/Level 2 0', 'OK get MIXER:Current/InCh/ToMix/Level 2 0 -350');
+      await rcp('get MIXER:Current/InCh/ToMix/Level 3 0', 'OK get MIXER:Current/InCh/ToMix/Level 3 0 -725');
+    }
+    await sleep(300);
+  }
+  await evaluate("fetch('/signout',{method:'POST'}).then(()=>fetch('/signin',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:'name=Singer&passcode=5678'}))");
+  await command(ws,'Page.navigate',{url:`http://127.0.0.1:${port}/`});
+  await expectBrowser("document.querySelectorAll('.mix-picker button').length===2", 'Performer picker missing after recovery checks');
   await stop(fake); fake = null;
   await expectBrowser("document.querySelector('.scene-bar').innerText.includes('Console disconnected — scene unknown')", 'Disconnected console left stale scene name');
   await evaluate("document.querySelector('.mix-picker button').click()");

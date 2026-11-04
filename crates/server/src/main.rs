@@ -740,11 +740,14 @@ async fn performer_solo(
     if !may_change_mix(&a, &user, request.mix) {
         return (StatusCode::FORBIDDEN, "That mix is not assigned to you.").into_response();
     }
-    match a
-        .bridge
-        .solo(request.mix, user.name, request.channels)
-        .await
-    {
+    let result = if user.role == "admin" && request.channels.is_empty() {
+        a.bridge.clear_solo(request.mix).await
+    } else {
+        a.bridge
+            .solo(request.mix, user.name, request.channels)
+            .await
+    };
+    match result {
         Ok(()) => StatusCode::ACCEPTED.into_response(),
         Err(message) => (StatusCode::BAD_REQUEST, message).into_response(),
     }

@@ -231,7 +231,7 @@ fn admin_portal(props: &AdminPortalProps) -> Html {
     };
     html! {
         <>
-            <LiveConsole />
+            <LiveConsole><SoloRecovery /></LiveConsole>
             <h1>{"Users"}</h1>
             <p>{format!("Signed in as {}. Console {} at {} · {} phone{} connected.", props.user.name, if overview.console.connected { "connected" } else { "disconnected" }, overview.console.address, overview.console.phones_connected, if overview.console.phones_connected == 1 { "" } else { "s" })}</p>
             <section class="panel"><h2>{"Add user"}</h2><form method="post" action="/api/admin/users"><label>{"Name"}<input name="name" required=true /></label><label>{"Role"}<select name="role"><option value="performer">{"Performer"}</option><option value="admin">{"Admin"}</option></select></label><label>{"4-digit passcode"}<input name="passcode" value="Generate" pattern="([0-9]{4}|Generate)" required=true /></label><button>{"Add user"}</button></form></section>
@@ -240,6 +240,47 @@ fn admin_portal(props: &AdminPortalProps) -> Html {
             <form method="post" action="/signout"><button>{"Sign out"}</button></form>
         </>
     }
+}
+
+/// Admin recovery remains available after a solo owner is removed or unassigned.
+#[function_component(SoloRecovery)]
+fn solo_recovery() -> Html {
+    let live = use_context::<LiveState>().expect("admin has console context");
+    let message = use_state(String::new);
+    let pending = use_state(|| false);
+    let mut solos: Vec<_> = live.console.solos.iter().collect();
+    solos.sort_by_key(|(mix, _)| mix.parse::<u8>().unwrap_or_default());
+    html! { <section aria-label="Solo recovery">
+        if !message.is_empty() { <p role="alert">{&*message}</p> }
+        {for solos.into_iter().map(|(mix, status)| {
+            let mix = mix.parse::<u8>().unwrap_or_default();
+            let message = message.clone();
+            let pending = pending.clone();
+            let disabled = !live.connected || *pending;
+            let onclick = Callback::from(move |_| {
+                let message = message.clone();
+                let pending = pending.clone();
+                pending.set(true);
+                spawn_local(async move {
+                    let result = Request::post("/api/performer/solo")
+                        .json(&serde_json::json!({"mix": mix, "channels": []}));
+                    let text = match result {
+                        Ok(request) => match request.send().await {
+                            Ok(response) if response.ok() => String::new(),
+                            Ok(response) => response.text().await.unwrap_or_else(|_| "Solo recovery was refused.".into()),
+                            Err(_) => "Could not reach the server. Try again.".into(),
+                        },
+                        Err(_) => "Could not prepare solo recovery.".into(),
+                    };
+                    message.set(text);
+                    pending.set(false);
+                });
+            });
+            html! { <p>{format!("Mix {}: solo active (by {}) ", mix + 1, status.owner)}
+                <button {onclick} {disabled}>{format!("Clear solo on Mix {}", mix + 1)}</button>
+            </p> }
+        })}
+    </section> }
 }
 
 #[derive(Properties, PartialEq)]
