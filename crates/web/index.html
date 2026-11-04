@@ -38,6 +38,10 @@
       .solo-banner button { width: auto; background: #15110a; color: var(--solo); }
       .arrange-controls { display: flex; align-items: center; gap: .5rem; }
       .arrange-controls button { width: auto; }
+      .performer-menu { position: relative; display: flex; justify-content: flex-end; }
+      .name-menu { width: auto; background: var(--raise); color: var(--text); }
+      .name-menu-popover { position: absolute; z-index: 4; top: calc(100% + .25rem); right: 0; width: min(20rem, 100vw - 2rem); padding: .75rem; background: var(--raise); border: 1px solid var(--line); border-radius: .5rem; box-shadow: 0 .5rem 2rem #000a; }
+      .name-menu-popover form { margin-top: .5rem; }
       .channel-strips { display: grid; gap: .75rem; margin-bottom: 1rem; max-height: 65dvh; overflow: auto; overscroll-behavior: contain; overflow-anchor: none; }
       .channel-strip { min-width: 0; padding: .75rem; background: #222; border-radius: .5rem; }
       .channel-strip h3 { margin: 0 0 .5rem; overflow-wrap: anywhere; }
@@ -45,6 +49,7 @@
       .pan-control input { min-height: 44px; }
       .strip-heading { display: flex; align-items: center; gap: .25rem; }
       .strip-heading h3 { flex: 1; min-width: 0; }
+      .channel-name { width: auto; min-height: 44px; padding: 0; color: var(--text); background: transparent; border: 0; text-align: left; font: inherit; }
       .reorder-handle { width: 44px; flex-shrink: 0; touch-action: none; cursor: grab; }
       .channel-strip[data-drop-target] { outline: 3px solid #4cf; outline-offset: -3px; }
       .send-control { margin-bottom: .5rem; }
@@ -53,6 +58,11 @@
       .fader-hint { font-size: .8rem; color: #ccc; }
       button[aria-pressed="true"] { background: #ffb454; }
       button:disabled, input:disabled { opacity: .55; }
+      .channel-panel { position: fixed; z-index: 5; right: 0; bottom: 0; left: 0; max-width: 42rem; margin: auto; padding: 1rem; background: var(--raise); border: 1px solid var(--line); border-radius: .75rem .75rem 0 0; box-shadow: 0 -.5rem 2rem #000a; }
+      .channel-panel header, .panel-level { display: flex; align-items: center; justify-content: space-between; gap: .75rem; }
+      .channel-panel header h2 { margin: 0; }
+      .channel-panel header button, .panel-level button { width: auto; }
+      .channel-panel input { margin: .5rem 0; }
       @media (orientation: landscape) {
         body:has(.performer) { padding: .35rem; }
         #app { width: min(100%, 48rem); }

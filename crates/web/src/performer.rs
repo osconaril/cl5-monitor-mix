@@ -89,6 +89,9 @@ pub(super) fn performer(props: &PerformerProps) -> Html {
     let message = use_state(String::new);
     let layout = use_state(|| None::<Layout>);
     let editing = use_state(|| false);
+    let open_channel = use_state(|| None::<u8>);
+    let menu_open = use_state(|| false);
+    let confirm_sign_out = use_state(|| false);
     let reordering = use_state(|| false);
     let reorder_pending = use_mut_ref(|| false);
     let layout_error = use_state(String::new);
@@ -417,6 +420,54 @@ pub(super) fn performer(props: &PerformerProps) -> Html {
         let selected = selected.clone();
         Callback::from(move |_| selected.set(None))
     };
+    let open_panel = {
+        let open_channel = open_channel.clone();
+        Callback::from(move |input| open_channel.set(Some(input)))
+    };
+    let close_panel = {
+        let open_channel = open_channel.clone();
+        Callback::from(move |_| open_channel.set(None))
+    };
+    let toggle_menu = {
+        let menu_open = menu_open.clone();
+        let confirm_sign_out = confirm_sign_out.clone();
+        Callback::from(move |_| {
+            menu_open.set(!*menu_open);
+            confirm_sign_out.set(false);
+        })
+    };
+    let ask_sign_out = {
+        let confirm_sign_out = confirm_sign_out.clone();
+        Callback::from(move |_| confirm_sign_out.set(true))
+    };
+    let stay_signed_in = {
+        let confirm_sign_out = confirm_sign_out.clone();
+        Callback::from(move |_| confirm_sign_out.set(false))
+    };
+    let channel_panel = if let (Some(mix), Some(input)) =
+        (active.as_deref().and_then(mix_index), *open_channel)
+    {
+        let value = |path| live.console.values.get(&format!("{path} {input} {mix}"));
+        let level = value(LEVEL)
+            .and_then(|v| v.parse::<i16>().ok())
+            .filter(|v| *v == OFF || (-13800..=1000).contains(v));
+        let stereo = live
+            .console
+            .values
+            .get(&format!("MIXER:Current/Mix/Role {mix} 0"))
+            .is_some_and(|r| matches!(r.trim_matches('"'), "StereoL" | "StereoR"));
+        let pan = value(PAN)
+            .and_then(|v| v.parse::<i16>().ok())
+            .filter(|v| (-63..=63).contains(v));
+        let paused = live
+            .console
+            .solos
+            .get(&mix.to_string())
+            .is_some_and(|status| !status.channels.contains(&input));
+        html! { <ChannelPanel {mix} {input} name={channel_names[input as usize].clone()} {level} {stereo} {pan} connected={live.connected} {paused} change={change.clone()} close={close_panel.clone()} /> }
+    } else {
+        Html::default()
+    };
     html! {
         <section class="performer">
             <h1>{format!("{}’s in-ear mix", props.user.name)}</h1>
@@ -449,6 +500,21 @@ pub(super) fn performer(props: &PerformerProps) -> Html {
                     <button onclick={edit_layout} disabled={layout.is_none() || *reordering}>{"Arrange"}</button>
                 }
                 </div>
+                <div class="performer-menu">
+                    <button class="name-menu" onclick={toggle_menu}>{format!("{} ▾", props.user.name.split_whitespace().next().unwrap_or(&props.user.name))}</button>
+                    if *menu_open {
+                        <section class="name-menu-popover" aria-label="Account menu">
+                            <p>{format!("Signed in as {}", props.user.name)}</p>
+                            if *confirm_sign_out {
+                                <p>{"Sign out? Your mix keeps playing as it is."}</p>
+                                <button type="button" onclick={stay_signed_in}>{"Stay"}</button>
+                                <form method="post" action="/signout"><button>{"Sign out"}</button></form>
+                            } else {
+                                <button type="button" onclick={ask_sign_out}>{"Sign out"}</button>
+                            }
+                        </section>
+                    }
+                </div>
                 if *reordering { <p role="status">{"Saving channel order…"}</p> }
                 <div class="channel-strips" tabindex="0" aria-label="Mix channels">
                 {for shown_layout.order.iter().copied().filter(|input| !shown_layout.hidden.contains(input)).map(|input| {
@@ -462,11 +528,12 @@ pub(super) fn performer(props: &PerformerProps) -> Html {
                     let solo_status = live.console.solos.get(&mix.to_string());
                     let mine = solo_status.is_some_and(|status| status.owner == props.user.name);
                     let paused = solo_status.is_some_and(|status| !status.channels.contains(&input));
-                    html! { <ChannelStrip key={format!("{mix}-{input}")} {mix} {input} {name} {color} {level} {on} {stereo} {pan} connected={live.connected} reorder_allowed={*editing && !*reordering} arranging={*editing} paused={paused} toggle_hidden={toggle_hidden.clone()} change={change.clone()} solo={solo.clone()}
+                    html! { <ChannelStrip key={format!("{mix}-{input}")} {mix} {input} {name} {color} {level} {on} {stereo} {pan} connected={live.connected} reorder_allowed={*editing && !*reordering} arranging={*editing} paused={paused} toggle_hidden={toggle_hidden.clone()} open_panel={open_panel.clone()} change={change.clone()} solo={solo.clone()}
                         soloed={live.console.solos.get(&mix.to_string()).is_some_and(|s| s.channels.contains(&input))}
                         solo_allowed={solo_status.is_none() || mine} /> }
                 })}
                 </div>
+                {channel_panel}
                 if !shown_layout.hidden.is_empty() {
                     <section class="hidden-channels"><h2>{"Hidden. You still hear these in your mix."}</h2>
                     if *editing { {for shown_layout.hidden.iter().copied().map(|input| { let toggle_hidden = toggle_hidden.clone(); html! { <button onclick={Callback::from(move |_| toggle_hidden.emit(input))}>{format!("Show {}", channel_names[input as usize])}</button> } })} }
@@ -481,7 +548,6 @@ pub(super) fn performer(props: &PerformerProps) -> Html {
                     html! { <button {onclick}>{name}</button> }
                 })}</div>
             }
-            <form method="post" action="/signout"><button>{"Sign out"}</button></form>
         </section>
     }
 }
@@ -501,6 +567,7 @@ struct ChannelStripProps {
     arranging: bool,
     paused: bool,
     toggle_hidden: Callback<u8>,
+    open_panel: Callback<u8>,
     change: Callback<(u8, u8, &'static str, String)>,
     solo: Callback<(u8, u8)>,
     soloed: bool,
@@ -539,16 +606,6 @@ fn channel_strip(props: &ChannelStripProps) -> Html {
             }
         })
     };
-    let pan_input = {
-        let change = props.change.clone();
-        let (mix, input) = (props.mix, props.input);
-        Callback::from(move |event: InputEvent| {
-            let target: web_sys::HtmlInputElement = event.target_unchecked_into();
-            let value = target.value_as_number().round().clamp(-63.0, 63.0) as i16;
-            target.set_value(&value.to_string());
-            change.emit((mix, input, PAN, value.to_string()));
-        })
-    };
     let mute = {
         let change = props.change.clone();
         let (mix, input, on) = (props.mix, props.input, props.on);
@@ -568,6 +625,11 @@ fn channel_strip(props: &ChannelStripProps) -> Html {
         let input = props.input;
         Callback::from(move |_| toggle_hidden.emit(input))
     };
+    let open_panel = {
+        let callback = props.open_panel.clone();
+        let input = props.input;
+        Callback::from(move |_| callback.emit(input))
+    };
     let (color, color_name) = channel_color(props.color.as_deref());
     let position = props
         .level
@@ -583,7 +645,7 @@ fn channel_strip(props: &ChannelStripProps) -> Html {
         <article class="channel-strip" data-channel={props.input.to_string()}>
             <div class="strip-heading">
             <span class="channel-color" role="img" aria-label={format!("Channel color: {color_name}")} title={format!("Channel color: {color_name}")} style={format!("background-color: {color}")}></span>
-            <h3>{&props.name}</h3>
+            <h3><button type="button" class="channel-name" onclick={open_panel}>{&props.name}</button></h3>
             if props.arranging {
                 <button class="reorder-handle" aria-label={format!("Drag {} to reorder", props.name)} disabled={!props.reorder_allowed}>{"⠿"}</button>
                 <button onclick={hide}>{"Hide"}</button>
@@ -595,13 +657,6 @@ fn channel_strip(props: &ChannelStripProps) -> Html {
                 <input type="range" aria-label={format!("{} send level", props.name)} aria-valuetext={props.level.map(level_text)}
                     min="-139" max="10" step="any" value={position.to_string()} {oninput} disabled={!props.connected || props.level.is_none() || props.paused} />
             </label>
-            if props.stereo {
-                <label class="send-control pan-control">
-                    <span>{props.pan.map(|v| if v == 0 { "Pan: center".into() } else { format!("Pan: {} {}", if v < 0 { "L" } else { "R" }, v.abs()) }).unwrap_or_else(|| "Pan unavailable".into())}</span>
-                    <input type="range" aria-label={format!("{} pan", props.name)} min="-63" max="63" step="1"
-                        value={props.pan.unwrap_or(0).to_string()} oninput={pan_input} disabled={!props.connected || props.pan.is_none() || props.paused} />
-                </label>
-            }
             <button data-action="mute" onclick={mute} disabled={!props.connected || props.on.is_none() || props.paused} aria-pressed={props.on.map(|on| (!on).to_string())}>
                 {if props.on == Some(false) { "Muted — unmute" } else { "Mute" }}
             </button>
@@ -611,6 +666,104 @@ fn channel_strip(props: &ChannelStripProps) -> Html {
             }
         </article>
     }
+}
+
+#[derive(Properties, PartialEq)]
+struct ChannelPanelProps {
+    mix: u8,
+    input: u8,
+    name: String,
+    level: Option<i16>,
+    stereo: bool,
+    pan: Option<i16>,
+    connected: bool,
+    paused: bool,
+    change: Callback<(u8, u8, &'static str, String)>,
+    close: Callback<()>,
+}
+
+#[function_component(ChannelPanel)]
+fn channel_panel(props: &ChannelPanelProps) -> Html {
+    let level_input = {
+        let change = props.change.clone();
+        let (mix, input, level) = (props.mix, props.input, props.level);
+        Callback::from(move |event: InputEvent| {
+            let target: web_sys::HtmlInputElement = event.target_unchecked_into();
+            if let Some(current) = level {
+                if let Some(value) = snap_level(current, target.value_as_number()) {
+                    target.set_value(if value == "Off" { "-139" } else { &value });
+                    change.emit((mix, input, LEVEL, value));
+                }
+            }
+        })
+    };
+    let level_change = {
+        let change = props.change.clone();
+        let (mix, input, level) = (props.mix, props.input, props.level);
+        Callback::from(move |up: bool| {
+            let current = level.unwrap_or(OFF);
+            let next = if current == OFF {
+                up.then(|| "-60".to_owned())
+            } else if up {
+                snap_level(current, f64::from(current) / 100.0 + 1.0)
+            } else {
+                snap_level(current, f64::from(current) / 100.0 - 1.0)
+            };
+            if let Some(value) = next {
+                change.emit((mix, input, LEVEL, value));
+            }
+        })
+    };
+    let pan_input = {
+        let change = props.change.clone();
+        let (mix, input) = (props.mix, props.input);
+        Callback::from(move |event: InputEvent| {
+            let target: web_sys::HtmlInputElement = event.target_unchecked_into();
+            let value = target.value_as_number().round().clamp(-63.0, 63.0) as i16;
+            target.set_value(&value.to_string());
+            change.emit((mix, input, PAN, value.to_string()));
+        })
+    };
+    let center_pan = {
+        let change = props.change.clone();
+        let (mix, input) = (props.mix, props.input);
+        Callback::from(move |_| change.emit((mix, input, PAN, "0".into())))
+    };
+    let disabled = !props.connected || props.paused || props.level.is_none();
+    let level_position = props
+        .level
+        .map(|level| {
+            if level == OFF {
+                -139.0
+            } else {
+                f64::from(level) / 100.0
+            }
+        })
+        .unwrap_or(-139.0);
+    let done = {
+        let close = props.close.clone();
+        Callback::from(move |_| close.emit(()))
+    };
+    let escape = {
+        let close = props.close.clone();
+        Callback::from(move |event: KeyboardEvent| {
+            if event.key() == "Escape" {
+                close.emit(());
+            }
+        })
+    };
+    html! { <section class="channel-panel" role="dialog" aria-label={format!("{} controls", props.name)} tabindex="0" onkeydown={escape}>
+        <header><h2>{&props.name}</h2><button onclick={done}>{"Done"}</button></header>
+        if props.paused { <p>{"Solo is on. This channel is paused until it is added or cleared."}</p> }
+        if !props.connected { <p>{"Lost the sound desk. Trying again…"}</p> }
+        <h3>{"How loud in your ears"}</h3>
+        <div class="panel-level"><button disabled={disabled} onclick={{ let level_change = level_change.clone(); Callback::from(move |_| level_change.emit(false)) }}>{"−1"}</button><input type="range" aria-label={format!("{} send level", props.name)} min="-139" max="10" step="any" value={level_position.to_string()} oninput={level_input} disabled={disabled} /><strong>{props.level.map(level_text).unwrap_or_else(|| "Level unavailable".into())}</strong><button disabled={disabled} onclick={Callback::from(move |_| level_change.emit(true))}>{"+1"}</button></div>
+        if props.stereo {
+            <h3>{"Left or right in your ears"}</h3>
+            <input type="range" aria-label={format!("{} pan", props.name)} min="-63" max="63" step="1" value={props.pan.unwrap_or(0).to_string()} oninput={pan_input} disabled={!props.connected || props.paused || props.pan.is_none()} />
+            <button disabled={!props.connected || props.paused || props.pan.is_none()} onclick={center_pan}>{"Center"}</button>
+        }
+    </section> }
 }
 
 #[derive(Properties, PartialEq)]

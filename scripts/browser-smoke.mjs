@@ -68,9 +68,9 @@ try {
     await command(ws, 'Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: true });
     await command(ws, 'Page.navigate', { url: `http://127.0.0.1:${port}/` });
     await sleep(200);
-    const result = await command(ws, 'Runtime.evaluate', { expression: 'JSON.stringify({scroll: Math.max(document.documentElement.scrollWidth, document.body.scrollWidth), width: innerWidth, buttons: [...document.querySelectorAll("button")].map(b => b.getBoundingClientRect().height), picker: document.querySelector("input[name=name]")?.list?.querySelectorAll("option").length, text: document.body.innerText})', returnByValue: true });
+    const result = await command(ws, 'Runtime.evaluate', { expression: 'JSON.stringify({scroll: Math.max(document.documentElement.scrollWidth, document.body.scrollWidth), width: innerWidth, buttons: [...document.querySelectorAll("button")].map(b => b.getBoundingClientRect().height), picker: document.querySelectorAll(".name-picker button").length, text: document.body.innerText})', returnByValue: true });
     const page = JSON.parse(result.result.value);
-    if (page.scroll > page.width || page.buttons.some(height => height < 44) || page.picker !== 1 || !page.text.includes('Sign in')) throw new Error(`Sign-in phone layout failed at ${width}x${height}: ${JSON.stringify(page)}`);
+    if (page.scroll > page.width || page.buttons.some(height => height < 44) || page.picker !== 1 || !page.text.includes('Tap your name')) throw new Error(`Sign-in phone layout failed at ${width}x${height}: ${JSON.stringify(page)}`);
   }
   await command(ws, 'Runtime.evaluate', { expression: "fetch('/signin', {method: 'POST', headers: {'content-type': 'application/x-www-form-urlencoded'}, body: 'name=Browser&passcode=1234'})", awaitPromise: true });
   await command(ws, 'Runtime.evaluate', { expression: "fetch('/api/admin/users', {method: 'POST', headers: {'content-type': 'application/x-www-form-urlencoded'}, body: 'name=Delete+Me&role=performer&passcode=1234'})", awaitPromise: true });
@@ -153,11 +153,13 @@ try {
   await expectBrowser(`${strip}.querySelector('.channel-color').getAttribute('aria-label')==='Channel color: Red' && getComputedStyle(${strip}.querySelector('.channel-color')).backgroundColor==='rgb(244, 67, 54)'`, 'Live console color missing');
   await rcp('set MIXER:Current/InCh/Label/Color 0 0 "Off"', 'OK');
   await expectBrowser(`${strip}.querySelector('.channel-color').getAttribute('aria-label')==='Channel color: Off' && getComputedStyle(${strip}.querySelector('.channel-color')).backgroundColor==='rgba(0, 0, 0, 0)'`, 'Off color was not cleared');
-  if (!await evaluate("document.querySelectorAll('.pan-control').length===0")) throw new Error('Mono mix offered pan');
+  if (!await evaluate("document.querySelectorAll('.channel-panel input[type=range]').length===0")) throw new Error('Mono mix offered pan');
   await rcp('set MIXER:Current/Mix/Role 0 0 "StereoL"', 'OK');
-  await expectBrowser("document.querySelectorAll('.pan-control').length===80", 'Stereo role did not show pan');
+  await evaluate(`${strip}.querySelector('.channel-name').click()`);
+  await expectBrowser("document.querySelectorAll('.channel-panel input[aria-label$=pan]').length===1", 'Stereo role did not show pan in the channel panel');
   await rcp('set MIXER:Current/InCh/ToMix/Pan 0 0 -17', 'OK');
-  await expectBrowser(`${strip}.querySelector('.pan-control').innerText.includes('L 17')`, 'Engineer pan missing');
+  await expectBrowser("document.querySelector('.channel-panel').innerText.includes('Left or right in your ears')", 'Stereo channel panel missing');
+  await evaluate("[...document.querySelectorAll('.channel-panel button')].find(button => button.textContent === 'Done').click()");
   // A resize or readback cannot send a rounded level back to the console.
   for (const [width,height] of [[390,844],[844,390]]) {
     await command(ws, 'Emulation.setDeviceMetricsOverride', {width,height,deviceScaleFactor:1,mobile:true});
