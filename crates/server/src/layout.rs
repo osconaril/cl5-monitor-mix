@@ -1,4 +1,5 @@
-//! Per-user presentation settings. None of these writes touch the console.
+//! Per-user presentation settings and group moves resolved from saved membership.
+//! Saving a layout never touches the console; only move_group sends level changes.
 use crate::{session, App};
 use axum::{
     extract::State,
@@ -131,6 +132,65 @@ pub async fn save(
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupMove {
+    mix: u8,
+    group: String,
+    delta: i16,
+}
+
+pub async fn move_group(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(request): Json<GroupMove>,
+) -> Response {
+    let Some(user) = session(&app, &headers) else {
+        return (StatusCode::UNAUTHORIZED, "Sign in first.").into_response();
+    };
+    if !crate::may_change_mix(&app, &user, request.mix) {
+        return (StatusCode::FORBIDDEN, "That mix is not assigned to you.").into_response();
+    }
+    // Resolve membership from this user's saved layout, never browser-supplied
+    // members, levels or owner. Drop the SQLite guard before awaiting the bridge.
+    let channels = app
+        .db
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT layout_json FROM performer_layouts WHERE user_name=?1",
+            [&user.name],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map(|json| {
+            json.and_then(|json| serde_json::from_str::<Layout>(&json).ok())
+                .and_then(|layout| layout.groups.into_iter().find(|g| g.id == request.group))
+                .map(|group| group.channels)
+        });
+    let channels = match channels {
+        Ok(Some(channels)) => channels,
+        Ok(None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "That saved group is not available. Reload your layout.",
+            )
+                .into_response()
+        }
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Could not load your saved group.",
+            )
+                .into_response()
+        }
+    };
+    match app.bridge.group(request.mix, channels, request.delta).await {
+        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Err(message) => (StatusCode::BAD_REQUEST, message).into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,6 +238,61 @@ mod tests {
             channels: vec![0, 1, 2],
         }];
         layout
+    }
+
+    #[tokio::test]
+    async fn group_moves_require_own_saved_group_session_and_current_assignment() {
+        let app = App::memory().unwrap();
+        app.add_user("Singer", "1234", "performer").unwrap();
+        app.add_user("Drummer", "1234", "performer").unwrap();
+        app.assign_mixes("Admin", "Singer", &["1".into()]).unwrap();
+        app.assign_mixes("Admin", "Drummer", &["1".into()]).unwrap();
+        let singer = cookie(&app, "Singer");
+        call(&app, request(&singer, Some(&customized()))).await;
+        async fn send(app: &App, cookie: &str, body: &str) -> Response {
+            call(
+                app,
+                Request::post("/api/performer/group")
+                    .header(header::COOKIE, cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_owned()))
+                    .unwrap(),
+            )
+            .await
+        }
+        let body = r#"{"mix":0,"group":"drums","delta":2}"#;
+        assert_eq!(
+            send(&app, "", body).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let response = send(&app, &singer, body).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(response_text(response)
+            .await
+            .contains("Console disconnected"));
+        let response = send(&app, &cookie(&app, "Drummer"), body).await;
+        assert!(response_text(response)
+            .await
+            .contains("saved group is not available"));
+        for invalid in [
+            r#"{"mix":0,"group":"drums","delta":0.5}"#,
+            r#"{"mix":0,"group":"drums","delta":2,"channels":[79]}"#,
+            r#"{"mix":0,"group":"drums","delta":2,"owner":"Drummer"}"#,
+        ] {
+            assert_eq!(
+                send(&app, &singer, invalid).await.status(),
+                StatusCode::UNPROCESSABLE_ENTITY
+            );
+        }
+        app.assign_mixes("Admin", "Singer", &[]).unwrap();
+        let response = send(&app, &singer, body).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(response_text(response).await.contains("not assigned"));
+        app.reset_passcode("Admin", "Singer", "5678").unwrap();
+        assert_eq!(
+            send(&app, &singer, body).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     #[tokio::test]

@@ -31,6 +31,10 @@
     if (!gesture) return;
     clearTimeout(gesture.timer);
     gesture.fader.removeAttribute('data-adjusting');
+    if (gesture.fader.dataset.groupFader) {
+      gesture.fader.value = '0';
+      gesture.fader.dispatchEvent(new Event('cl5-cancel'));
+    }
     if (gesture.fader.hasPointerCapture(gesture.id)) {
       gesture.fader.releasePointerCapture(gesture.id);
     }
@@ -60,7 +64,7 @@
     if (sideways) r.area.scrollLeft += delta;
     else r.area.scrollTop += delta;
     const target = document.elementFromPoint(r.x, r.y)?.closest('.channel-strip');
-    r.target = target?.parentElement === r.area ? target : null;
+    r.target = target?.parentElement === r.area && !target.classList.contains('group-strip') ? target : null;
     r.target?.setAttribute('data-drop-target', '');
   }
   document.addEventListener('pointerdown', event => {
@@ -147,7 +151,11 @@
         }
         cancel();
       }
-      if (gesture?.id === event.pointerId) cancel();
+      if (gesture?.id === event.pointerId) {
+        if (type === 'pointerup' && gesture.armed && gesture.fader.dataset.groupFader)
+          gesture.fader.dispatchEvent(new Event('change', { bubbles: true }));
+        cancel();
+      }
       if (type === 'pointerup' || type === 'pointercancel') nativeRange = null;
     });
   }
@@ -161,7 +169,7 @@
     requestAnimationFrame(() => {
       const area = document.querySelector('.channel-strips');
       const strip = anchor === null ? area?.firstElementChild
-        : area?.querySelector(`[data-channel="${anchor}"]`);
+        : area?.querySelector(`[data-channel="${CSS.escape(anchor)}"]`);
       if (strip && area) {
         const bounds = area.getBoundingClientRect();
         const box = strip.getBoundingClientRect();

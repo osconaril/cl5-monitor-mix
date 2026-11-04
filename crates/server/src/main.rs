@@ -272,6 +272,7 @@ fn routes(app: App) -> Router {
         .route("/api/bootstrap", get(bootstrap))
         .route("/api/console", get(console_socket).post(console_change))
         .route("/api/performer/solo", post(performer_solo))
+        .route("/api/performer/group", post(layout::move_group))
         .with_state(app)
         .fallback_service(ServeDir::new(web_dist()))
 }

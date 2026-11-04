@@ -346,6 +346,10 @@ pub(super) fn performer(props: &PerformerProps) -> Html {
                 if *reordering { <p role="status">{"Saving channel order…"}</p> }
                 <p class="fader-hint">{"Touch and hold a fader to adjust. Swipe to scroll."}</p>
                 <div class="channel-strips" tabindex="0" aria-label="Mix channels">
+                {for shown_layout.groups.iter().map(|group| html! {
+                    <GroupStrip key={format!("{mix}-{}", group.id)} mix={mix} group={group.clone()} connected={live.connected}
+                        levels={group.channels.iter().map(|input| live.console.values.get(&format!("{LEVEL} {input} {mix}")).and_then(|v| v.parse::<i16>().ok())).collect::<Vec<_>>()} />
+                })}
                 {for shown_layout.order.iter().copied().filter(|input| !shown_layout.hidden.contains(input)).map(|input| {
                     let value = |path| live.console.values.get(&format!("{path} {input} {mix}"));
                     let level = value(LEVEL).and_then(|v| v.parse::<i16>().ok()).filter(|v| *v == OFF || (-13800..=1000).contains(v));
@@ -462,6 +466,118 @@ fn channel_strip(props: &ChannelStripProps) -> Html {
             <button data-action="solo" onclick={solo} disabled={!props.connected || !props.solo_allowed || props.level.is_none()} aria-pressed={props.soloed.to_string()}>
                 {if props.soloed { "Un-solo" } else { "Solo" }}
             </button>
+        </article>
+    }
+}
+
+#[derive(Properties, PartialEq)]
+struct GroupStripProps {
+    mix: u8,
+    group: super::layout::Group,
+    connected: bool,
+    levels: Vec<Option<i16>>,
+}
+
+#[function_component(GroupStrip)]
+fn group_strip(props: &GroupStripProps) -> Html {
+    let draft = use_state(|| 0i16);
+    let pending = use_state(|| false);
+    let sending = use_mut_ref(|| false);
+    let message = use_state(String::new);
+    let node = use_node_ref();
+    {
+        let draft = draft.clone();
+        let node = node.clone();
+        use_effect_with((), move |_| {
+            let input = node
+                .cast::<web_sys::HtmlInputElement>()
+                .expect("group range");
+            let reset = Closure::<dyn Fn(web_sys::Event)>::new(move |_| draft.set(0));
+            input
+                .add_event_listener_with_callback("cl5-cancel", reset.as_ref().unchecked_ref())
+                .expect("cancel listener");
+            move || {
+                let _ = input.remove_event_listener_with_callback(
+                    "cl5-cancel",
+                    reset.as_ref().unchecked_ref(),
+                );
+            }
+        });
+    }
+    let oninput = {
+        let draft = draft.clone();
+        Callback::from(move |event: InputEvent| {
+            let input: web_sys::HtmlInputElement = event.target_unchecked_into();
+            let value = input.value_as_number().round().clamp(-149.0, 149.0) as i16;
+            input.set_value(&value.to_string());
+            draft.set(value);
+        })
+    };
+    let onchange = {
+        let draft = draft.clone();
+        let pending = pending.clone();
+        let sending = sending.clone();
+        let message = message.clone();
+        let mix = props.mix;
+        let group = props.group.id.clone();
+        Callback::from(move |event: Event| {
+            let input: web_sys::HtmlInputElement = event.target_unchecked_into();
+            let delta = input.value_as_number().round() as i16;
+            input.set_value("0");
+            draft.set(0);
+            if delta == 0 || *sending.borrow() {
+                return;
+            }
+            *sending.borrow_mut() = true;
+            pending.set(true);
+            let (pending, sending, message, group) = (
+                pending.clone(),
+                sending.clone(),
+                message.clone(),
+                group.clone(),
+            );
+            spawn_local(async move {
+                let result = async {
+                    let response = Request::post("/api/performer/group")
+                        .json(&serde_json::json!({"mix":mix,"group":group,"delta":delta}))
+                        .map_err(|_| "Could not prepare group movement.".to_owned())?
+                        .send()
+                        .await
+                        .map_err(|_| {
+                            "The show machine could not be reached. Check your connection."
+                                .to_owned()
+                        })?;
+                    if response.ok() {
+                        Ok(())
+                    } else {
+                        Err(response
+                            .text()
+                            .await
+                            .unwrap_or_else(|_| "Group movement was refused.".into()))
+                    }
+                }
+                .await;
+                message.set(result.err().unwrap_or_default());
+                *sending.borrow_mut() = false;
+                pending.set(false);
+            });
+        })
+    };
+    let available = props
+        .levels
+        .iter()
+        .all(|v| v.is_some_and(|v| v == OFF || (-13800..=1000).contains(&v)));
+    html! {
+        <article class="channel-strip group-strip" data-channel={format!("group-{}", props.group.id)}>
+            <h3>{&props.group.name}</h3>
+            <label class="send-control">
+                <span>{format!("{:+} dB on release", *draft)}</span>
+                <input ref={node} data-group-fader="true" type="range" min="-149" max="149" step="1" value={draft.to_string()}
+                    aria-label={format!("{} group level change", props.group.name)} {oninput} {onchange}
+                    disabled={!props.connected || !available || *pending} />
+            </label>
+            <small>{"Whole-dB change; Off stays Off."}</small>
+            <p role="alert">{(*message).clone()}</p>
         </article>
     }
 }

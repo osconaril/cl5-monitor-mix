@@ -164,7 +164,7 @@ try {
     const original = window.fetch;
     window.fetch = function(input, init) {
       const url = typeof input === 'string' ? input : input.url;
-      if (url.includes('/api/console') || url.includes('/api/performer/solo'))
+      if (url.includes('/api/console') || url.includes('/api/performer/solo') || url.includes('/api/performer/group'))
         window.controlWrites.push(url);
       return original.apply(this, arguments);
     };
@@ -248,7 +248,7 @@ try {
     await sleep(150);
     await evaluate("document.querySelector('.channel-strips').scrollTo(0,0); document.querySelector('.channel-strips').scrollIntoView({block:'center'})");
     await dragStrip(1,0);
-    await expectBrowser("document.querySelector('.channel-strip').dataset.channel==='1' && !document.querySelector('.reorder-handle').disabled", 'Touch drag did not reorder actual strips');
+    await expectBrowser("document.querySelector('.channel-strip:not(.group-strip)').dataset.channel==='1' && !document.querySelector('.reorder-handle').disabled", 'Touch drag did not reorder actual strips');
     if (!await evaluate("fetch('/api/performer/layout').then(r=>r.json()).then(l=>l.order[0]===1 && l.order[1]===0)"))
       throw new Error('Touch drag order was not persisted');
     await dragStrip(1,0,true);
@@ -294,14 +294,64 @@ try {
   await clickText('Add group');
   await expectBrowser("document.querySelector('.layout-group input')?.value==='Drums'", 'Named group was not created');
   await clickText('Save layout');
-  await expectBrowser("!document.querySelector('.layout-editor') && document.querySelectorAll('.channel-strip').length===79 && document.querySelector('.channel-strip').dataset.channel==='1'", 'Saved order/visibility was not rendered');
+  await expectBrowser("!document.querySelector('.layout-editor') && document.querySelectorAll('.channel-strip:not(.group-strip)').length===79 && document.querySelector('.channel-strip:not(.group-strip)').dataset.channel==='1'", 'Saved order/visibility was not rendered');
   if (!await evaluate("(async()=>{const l=await fetch('/api/performer/layout').then(r=>r.json()); return l.order[0]===1 && l.hidden.includes(2) && l.groups[0].name==='Drums' && l.groups[0].channels.join(',')==='0,1';})()"))
     throw new Error('Layout persistence readback failed');
+  // Group faders submit a whole-dB delta, retaining fractional member offsets.
+  await rcp('set MIXER:Current/InCh/ToMix/Level 0 0 -350', 'OK');
+  await rcp('set MIXER:Current/InCh/ToMix/Level 1 0 -725', 'OK');
+  await expectBrowser("document.querySelector('[data-channel=\"1\"]').innerText.includes('-7.25 dB')", 'Group baseline missing');
+  for (const [width,height] of [[390,844],[844,390]]) {
+    await command(ws,'Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:true});
+    await sleep(150);
+    await evaluate("document.querySelector('.channel-strips').scrollTo(0,0); document.querySelector('.group-strip').scrollIntoView({block:'center'})");
+    const point = await evaluate(`(() => { const f=document.querySelector('[data-group-fader]'), r=f.getBoundingClientRect(); return {x:r.x+r.width/2,y:r.y+r.height/2,vertical:getComputedStyle(f).writingMode==='vertical-lr'}; })()`);
+    if (point.vertical !== (width>height)) throw new Error('Group orientation incorrect');
+    const before = await evaluate('window.controlWrites.length');
+    await touch('touchStart',point.x,point.y);
+    await touch('touchMove',point.x-(width>height?40:0),point.y-(width<height?40:0));
+    await touch('touchEnd');
+    if (await evaluate('window.controlWrites.length') !== before) throw new Error('Group swipe submitted a command');
+    await evaluate("document.querySelector('.channel-strips').scrollTo(0,0)");
+    await sleep(100);
+    await touch('touchStart',point.x,point.y);
+    await sleep(260);
+    await touch('touchMove',point.x+(width<height?5:0),point.y-(width>height?5:0));
+    await command(ws,'Emulation.setDeviceMetricsOverride',{width:height,height:width,deviceScaleFactor:1,mobile:true});
+    await sleep(150);
+    await touch('touchEnd');
+    if (!await evaluate(`window.controlWrites.length===${before} && document.querySelector('[data-group-fader]').value==='0'`)) throw new Error('Rotation committed group movement');
+  }
+  await command(ws,'Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
+  await sleep(150);
+  await evaluate("document.querySelector('.channel-strips').scrollTo(0,0);document.querySelector('.group-strip').scrollIntoView({block:'center'})");
+  const groupPoint = await evaluate(`(() => {const r=document.querySelector('[data-group-fader]').getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2};})()`);
+  const groupWrites = await evaluate('window.controlWrites.length');
+  await touch('touchStart',groupPoint.x,groupPoint.y);
+  await sleep(260);
+  await touch('touchMove',groupPoint.x+3,groupPoint.y);
+  const groupDelta = await evaluate("Number(document.querySelector('[data-group-fader]').value)");
+  if (!Number.isInteger(groupDelta) || groupDelta<=0 || await evaluate('window.controlWrites.length')!==groupWrites) throw new Error('Group delta was not staged in whole dB');
+  await touch('touchEnd');
+  await expectBrowser(`window.controlWrites.length===${groupWrites+1} && document.querySelector('[data-channel="0"]').innerText.includes('${(-350+groupDelta*100)/100} dB')`, 'Touch release failed to apply group movement exactly once');
+  await rcp('get MIXER:Current/InCh/ToMix/Level 1 0',`OK get MIXER:Current/InCh/ToMix/Level 1 0 ${-725+groupDelta*100}`);
+  await rcp('set MIXER:Current/InCh/ToMix/Level 0 0 -350','OK');
+  await rcp('set MIXER:Current/InCh/ToMix/Level 1 0 -725','OK');
+  await expectBrowser("document.querySelector('[data-channel=\"1\"]').innerText.includes('-7.25 dB')", 'Group touch reset missing');
+  await evaluate(`(() => {const f=document.querySelector('[data-group-fader]');f.value='2';f.dispatchEvent(new Event('input',{bubbles:true}));f.dispatchEvent(new Event('change',{bubbles:true}));})()`);
+  await expectBrowser("document.querySelector('[data-channel=\"0\"]').innerText.includes('-1.5 dB') && document.querySelector('[data-channel=\"1\"]').innerText.includes('-5.25 dB')", 'Group movement lost balance or fractional offsets');
+  await rcp('get MIXER:Current/InCh/ToMix/Level 0 0','OK get MIXER:Current/InCh/ToMix/Level 0 0 -150');
+  await rcp('get MIXER:Current/InCh/ToMix/Level 1 0','OK get MIXER:Current/InCh/ToMix/Level 1 0 -525');
+  await evaluate(`(() => {window.groupFetch=window.fetch;window.fetch=function(input,init){const url=typeof input==='string'?input:input.url;if(url.includes('/api/performer/group'))return Promise.resolve(new Response('That mix is not assigned to you.',{status:403}));return window.groupFetch.apply(this,arguments);}; const f=document.querySelector('[data-group-fader]');f.value='1';f.dispatchEvent(new Event('change',{bubbles:true}));})()`);
+  await expectBrowser("document.querySelector('.group-strip [role=alert]').textContent.includes('not assigned')", 'Group refusal message missing');
+  await evaluate('window.fetch=window.groupFetch');
+  await rcp('get MIXER:Current/InCh/ToMix/Level 0 0','OK get MIXER:Current/InCh/ToMix/Level 0 0 -150');
+  await rcp('set MIXER:Current/InCh/ToMix/Level 0 0 -400','OK');
   await evaluate("fetch('/signout',{method:'POST'}).then(()=>fetch('/signin',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:'name=Singer&passcode=5678'}))");
   await command(ws,'Page.navigate',{url:`http://127.0.0.1:${port}/`});
   await expectBrowser("document.querySelectorAll('.mix-picker button').length===2", 'New session picker missing');
   await evaluate("document.querySelector('.mix-picker button').click()");
-  await expectBrowser("document.querySelectorAll('.channel-strip').length===79 && document.querySelector('.channel-strip').dataset.channel==='1' && document.querySelector('.hidden-channels')", 'Saved layout did not return on new sign-in');
+  await expectBrowser("document.querySelectorAll('.channel-strip:not(.group-strip)').length===79 && document.querySelector('.channel-strip:not(.group-strip)').dataset.channel==='1' && document.querySelector('.hidden-channels')", 'Saved layout did not return on new sign-in');
   await clickText('Edit channel layout');
   await expectBrowser("document.querySelector('.layout-group input')?.value==='Drums'", 'Saved group did not return');
   // A refused save keeps the draft open and leaves persisted data untouched.
@@ -328,7 +378,7 @@ try {
   await expectBrowser("document.querySelector('.layout-channel')?.dataset.layoutChannel==='1'", 'Editor order missing');
   await evaluate("document.querySelector('.layout-channel button:nth-of-type(2)').click()");
   await clickText('Cancel layout changes');
-  await expectBrowser("!document.querySelector('.layout-editor') && document.querySelector('.channel-strip').dataset.channel==='1'", 'Cancel changed displayed order');
+  await expectBrowser("!document.querySelector('.layout-editor') && document.querySelector('.channel-strip:not(.group-strip)').dataset.channel==='1'", 'Cancel changed displayed order');
   await rcp('get MIXER:Current/InCh/ToMix/Level 0 0', 'OK get MIXER:Current/InCh/ToMix/Level 0 0 -400');
   await rcp('get MIXER:Current/InCh/ToMix/On 0 0', 'OK get MIXER:Current/InCh/ToMix/On 0 0 0');
   // Personal solo restores exact wire levels and keeps engineer changes.

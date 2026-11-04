@@ -66,6 +66,12 @@ pub struct ConsoleBridge {
 
 enum BridgeCommand {
     Change(PhoneChange),
+    Group {
+        mix: u8,
+        channels: Vec<u8>,
+        delta: i16,
+        reply: oneshot::Sender<Result<(), &'static str>>,
+    },
     Solo {
         mix: u8,
         owner: String,
@@ -145,6 +151,25 @@ impl ConsoleBridge {
                 mix,
                 owner,
                 channels,
+                reply,
+            })
+            .await
+            .map_err(|_| "Console disconnected — reconnecting.")?;
+        result
+            .await
+            .map_err(|_| "Console disconnected — reconnecting.")?
+    }
+
+    pub async fn group(&self, mix: u8, channels: Vec<u8>, delta: i16) -> Result<(), &'static str> {
+        if !self.is_connected() {
+            return Err("Console disconnected — reconnecting.");
+        }
+        let (reply, result) = oneshot::channel();
+        self.writes
+            .send(BridgeCommand::Group {
+                mix,
+                channels,
+                delta,
                 reply,
             })
             .await
@@ -270,6 +295,29 @@ async fn serve_connection(
                 Some(BridgeCommand::Change(change)) => {
                     if *connected.borrow() { pending.insert(change_key(&change), change); }
                 }
+                Some(BridgeCommand::Group { mix, channels, delta, reply }) => {
+                    if !*connected.borrow() {
+                        let _ = reply.send(Err("Console disconnected — reconnecting."));
+                        continue;
+                    }
+                    if !pending.is_empty() || in_flight.values().any(|queue| !queue.is_empty()) || solos.pending(mix) {
+                        let _ = reply.send(Err("Mix levels are still updating. Try again in a moment."));
+                        continue;
+                    }
+                    let values = state.read().await.values.clone();
+                    match group_levels(mix, &channels, delta, &values) {
+                        Err(error) => { let _ = reply.send(Err(error)); }
+                        Ok(changes) => {
+                            for (input, value) in changes {
+                                let key = format!("{LEVEL} {input} {mix}");
+                                in_flight.entry(key).or_default().push_back(value.to_string());
+                                let command = format!("set {LEVEL} {input} {mix} {value}\n");
+                                if write.write_all(command.as_bytes()).await.is_err() { return false; }
+                            }
+                            let _ = reply.send(Ok(()));
+                        }
+                    }
+                }
                 Some(BridgeCommand::Solo { mix, owner, channels, reply }) => {
                     if !*connected.borrow() {
                         let _ = reply.send(Err("Console disconnected — reconnecting."));
@@ -303,6 +351,45 @@ async fn serve_connection(
             }
         }
     }
+}
+
+/// Apply a whole-dB delta to console readback, preserving fractional offsets.
+/// Off is negative infinity, so adding a delta leaves it Off. Saturation at
+/// either endpoint is the only case where the members' balance can change.
+fn group_levels(
+    mix: u8,
+    channels: &[u8],
+    delta: i16,
+    values: &HashMap<String, String>,
+) -> Result<Vec<(u8, i16)>, &'static str> {
+    if mix >= 24
+        || channels.is_empty()
+        || channels.iter().any(|input| *input >= 80)
+        || channels.iter().collect::<BTreeSet<_>>().len() != channels.len()
+    {
+        return Err("That group or mix is not available.");
+    }
+    if !(-149..=149).contains(&delta) {
+        return Err("Group movement must be a whole dB from -149 to 149.");
+    }
+    let mut changes = Vec::new();
+    for &input in channels {
+        let old = values
+            .get(&format!("{LEVEL} {input} {mix}"))
+            .and_then(|value| value.parse::<i16>().ok())
+            .filter(|value| *value == crate::solo::OFF || (-13800..=1000).contains(value))
+            .ok_or("Group levels are unavailable. Wait for the console to reconnect.")?;
+        let shifted = i32::from(old) + i32::from(delta) * 100;
+        let value = if old == crate::solo::OFF || shifted < -13800 {
+            crate::solo::OFF
+        } else {
+            shifted.min(1000) as i16
+        };
+        if value != old {
+            changes.push((input, value));
+        }
+    }
+    Ok(changes)
 }
 
 async fn publish_solos(
@@ -582,6 +669,76 @@ mod tests {
             }
         }
         assert_eq!(reply.trim(), format!("OK get {LEVEL} 0 0 -300"));
+    }
+
+    #[test]
+    fn group_deltas_preserve_offsets_and_saturate_only_at_endpoints() {
+        let values = [-350, -725, 950, -13750, crate::solo::OFF]
+            .into_iter()
+            .enumerate()
+            .map(|(input, value)| (format!("{LEVEL} {input} 0"), value.to_string()))
+            .collect();
+        assert_eq!(
+            group_levels(0, &[0, 1, 2, 3, 4], 2, &values).unwrap(),
+            vec![(0, -150), (1, -525), (2, 1000), (3, -13550)]
+        );
+        assert_eq!(
+            group_levels(0, &[0, 1, 2, 3, 4], -1, &values).unwrap(),
+            vec![(0, -450), (1, -825), (2, 850), (3, crate::solo::OFF)]
+        );
+        assert!(group_levels(0, &[0, 1], 0, &values).unwrap().is_empty());
+        for (mix, channels, delta) in [
+            (24, vec![0], 1),
+            (0, vec![], 1),
+            (0, vec![0, 0], 1),
+            (0, vec![80], 1),
+            (0, vec![0, 5], 1),
+            (0, vec![0], 150),
+        ] {
+            assert!(group_levels(mix, &channels, delta, &values).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn group_moves_readback_and_leave_other_channels_and_mixes_alone() {
+        let fake = Arc::new(FakeConsole::new());
+        let address = fake.clone().listen("127.0.0.1:0").await.unwrap();
+        let bridge = ConsoleBridge::start(address.to_string());
+        ready(&bridge).await;
+        let mut engineer = TcpStream::connect(address).await.unwrap();
+        engineer.write_all(format!("set {LEVEL} 0 0 -350\nset {LEVEL} 1 0 -725\nset {LEVEL} 2 0 -950\nset {LEVEL} 0 1 -1234\n").as_bytes()).await.unwrap();
+        wait_level(&bridge, 0, 1, "-1234").await;
+        bridge.group(0, vec![0, 1], 2).await.unwrap();
+        wait_level(&bridge, 0, 0, "-150").await;
+        wait_level(&bridge, 1, 0, "-525").await;
+        wait_level(&bridge, 2, 0, "-950").await;
+        wait_level(&bridge, 0, 1, "-1234").await;
+        engineer
+            .write_all(format!("set {LEVEL} 1 0 -225\n").as_bytes())
+            .await
+            .unwrap();
+        wait_level(&bridge, 1, 0, "-225").await;
+        bridge.group(0, vec![0, 1], -1).await.unwrap();
+        wait_level(&bridge, 0, 0, "-250").await;
+        wait_level(&bridge, 1, 0, "-325").await;
+        // During solo, Off members stay Off. Audible member group moves are
+        // observed by solo bookkeeping and retained when solo is cleared.
+        engineer
+            .write_all(format!("set {LEVEL} 79 0 -900\n").as_bytes())
+            .await
+            .unwrap();
+        wait_level(&bridge, 79, 0, "-900").await;
+        bridge.solo(0, "Singer".into(), [0].into()).await.unwrap();
+        wait_level(&bridge, 79, 0, "-32768").await;
+        bridge.group(0, vec![0, 1], 1).await.unwrap();
+        wait_level(&bridge, 0, 0, "-150").await;
+        bridge
+            .solo(0, "Singer".into(), BTreeSet::new())
+            .await
+            .unwrap();
+        wait_level(&bridge, 0, 0, "-150").await;
+        wait_level(&bridge, 1, 0, "-325").await;
+        assert!(ConsoleBridge::offline().group(0, vec![0], 1).await.is_err());
     }
 
     async fn wait_level(bridge: &ConsoleBridge, input: u8, mix: u8, value: &str) {
