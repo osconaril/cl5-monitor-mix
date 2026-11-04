@@ -1,5 +1,7 @@
 //! Offline LAN sign-in server and the shared CL5 console bridge.
 mod console;
+mod layout;
+mod solo;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -209,11 +211,6 @@ struct Passcode {
     passcode: String,
 }
 #[derive(Deserialize)]
-struct Mixes {
-    #[serde(default)]
-    mixes: Vec<String>,
-}
-#[derive(Deserialize)]
 struct ConsoleChange {
     path: String,
     input: u8,
@@ -267,12 +264,15 @@ fn routes(app: App) -> Router {
         .route("/api/admin/users/{name}/passcode", post(reset_passcode))
         .route("/api/admin/users/{name}/mixes", post(assign_mixes))
         .route("/api/performer/mixes", get(performer_mixes))
+        .route("/api/performer/layout", get(layout::get).put(layout::save))
         .route(
             "/api/admin/users/{name}",
             post(delete_user).delete(delete_user),
         )
         .route("/api/bootstrap", get(bootstrap))
         .route("/api/console", get(console_socket).post(console_change))
+        .route("/api/performer/solo", post(performer_solo))
+        .route("/api/performer/group", post(layout::move_group))
         .with_state(app)
         .fallback_service(ServeDir::new(web_dist()))
 }
@@ -512,6 +512,8 @@ impl App {
         }
         c.execute("DELETE FROM user_mixes WHERE user_name=?1", [name])
             .map_err(|_| "Could not delete saved settings.".to_string())?;
+        c.execute("DELETE FROM performer_layouts WHERE user_name=?1", [name])
+            .map_err(|_| "Could not delete saved layout.".to_string())?;
         c.execute("DELETE FROM sessions WHERE user_name=?1", [name])
             .map_err(|_| "Could not sign out that user.".to_string())?;
         if c.execute("DELETE FROM users WHERE name=?1", [name])
@@ -586,6 +588,11 @@ fn migrate(c: &mut Connection) -> rusqlite::Result<()> {
         c,
         "0002_admin_portal",
         include_str!("../migrations/0002_admin_portal.sql"),
+    )?;
+    apply_migration(
+        c,
+        "0003_performer_layouts",
+        include_str!("../migrations/0003_performer_layouts.sql"),
     )?;
     Ok(())
 }
@@ -713,6 +720,37 @@ async fn send_socket<T: Serialize>(socket: &mut WebSocket, message: &T) -> Resul
         .send(Message::Text(json.into()))
         .await
         .map_err(|_| ())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SoloRequest {
+    mix: u8,
+    channels: std::collections::BTreeSet<u8>,
+}
+
+async fn performer_solo(
+    State(a): State<App>,
+    headers: HeaderMap,
+    Json(request): Json<SoloRequest>,
+) -> Response {
+    let Some(user) = session(&a, &headers) else {
+        return (StatusCode::UNAUTHORIZED, "Sign in first.").into_response();
+    };
+    if !may_change_mix(&a, &user, request.mix) {
+        return (StatusCode::FORBIDDEN, "That mix is not assigned to you.").into_response();
+    }
+    let result = if user.role == "admin" && request.channels.is_empty() {
+        a.bridge.clear_solo(request.mix).await
+    } else {
+        a.bridge
+            .solo(request.mix, user.name, request.channels)
+            .await
+    };
+    match result {
+        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Err(message) => (StatusCode::BAD_REQUEST, message).into_response(),
+    }
 }
 
 async fn console_change(
@@ -875,13 +913,19 @@ async fn assign_mixes(
     State(a): State<App>,
     h: HeaderMap,
     Path(name): Path<String>,
-    Form(f): Form<Mixes>,
+    Form(fields): Form<Vec<(String, String)>>,
 ) -> Response {
     let actor = match admin(&a, &h) {
         Ok(actor) => actor,
         Err(status) => return status.into_response(),
     };
-    match a.assign_mixes(&actor.name, &name, &f.mixes) {
+    // HTML checkboxes repeat the same key. Deserialize the form as pairs:
+    // serde_urlencoded does not decode repeated keys into a struct Vec field.
+    let mixes: Vec<_> = fields
+        .into_iter()
+        .filter_map(|(key, value)| (key == "mixes").then_some(value))
+        .collect();
+    match a.assign_mixes(&actor.name, &name, &mixes) {
         Ok(()) => Redirect::to("/").into_response(),
         Err(message) => (StatusCode::BAD_REQUEST, message).into_response(),
     }
@@ -974,7 +1018,7 @@ mod tests {
     use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest};
     use tower::ServiceExt;
 
-    async fn response_text(response: Response) -> String {
+    pub(super) async fn response_text(response: Response) -> String {
         String::from_utf8(
             to_bytes(response.into_body(), usize::MAX)
                 .await
@@ -984,7 +1028,7 @@ mod tests {
         .unwrap()
     }
 
-    async fn call(app: &App, request: Request<Body>) -> Response {
+    pub(super) async fn call(app: &App, request: Request<Body>) -> Response {
         routes(app.clone()).oneshot(request).await.unwrap()
     }
 
@@ -1086,7 +1130,7 @@ mod tests {
             loop {
                 if next_websocket_text(&mut socket)
                     .await
-                    .contains("\"value\":\"-2\"")
+                    .contains("\"value\":\"-200\"")
                 {
                     break;
                 }
@@ -1169,6 +1213,89 @@ mod tests {
             "Mix 24 is protocol index 23"
         );
         assert!(may_change_mix(&app, &admin, 23));
+    }
+
+    #[tokio::test]
+    async fn solo_requests_require_current_assignment_and_session() {
+        let app = App::memory().unwrap();
+        app.add_user("Singer", "1234", "performer").unwrap();
+        app.assign_mixes("Admin", "Singer", &["1".into()]).unwrap();
+        let login_response = login(&app, app.user("Singer", "1234").unwrap().unwrap());
+        let cookie = login_response.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        async fn solo_request(app: &App, cookie: &str, body: &str) -> Response {
+            call(
+                app,
+                Request::post("/api/performer/solo")
+                    .header(header::COOKIE, cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_owned()))
+                    .unwrap(),
+            )
+            .await
+        }
+        let body = r#"{"mix":0,"channels":[0]}"#;
+        assert_eq!(
+            solo_request(&app, "", body).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let response = solo_request(&app, &cookie, body).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(response_text(response)
+            .await
+            .contains("Console disconnected"));
+        let response = solo_request(&app, &cookie, r#"{"mix":1,"channels":[0]}"#).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response_text(response).await,
+            "That mix is not assigned to you."
+        );
+        assert_eq!(
+            solo_request(&app, &cookie, r#"{"mix":0,"channels":[0],"owner":"Admin"}"#)
+                .await
+                .status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        app.assign_mixes("Admin", "Singer", &[]).unwrap();
+        assert_eq!(
+            solo_request(&app, &cookie, body).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        assert!(app.bridge.state().await.solos.is_empty());
+    }
+
+    #[tokio::test]
+    async fn assignment_checkboxes_accept_multiple_one_and_no_mixes_over_http() {
+        let app = App::memory().unwrap();
+        app.add_user("Admin", "1234", "admin").unwrap();
+        app.add_user("Singer", "5678", "performer").unwrap();
+        let response = login(&app, app.user("Admin", "1234").unwrap().unwrap());
+        let cookie = response.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        for (body, expected) in [
+            ("mixes=1&mixes=24", vec!["Mix 1", "Mix 24"]),
+            ("mixes=2", vec!["Mix 2"]),
+            ("", vec![]),
+        ] {
+            let response = call(
+                &app,
+                Request::post("/api/admin/users/Singer/mixes")
+                    .header(header::COOKIE, &cookie)
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::SEE_OTHER);
+            assert_eq!(app.user_mixes("Singer").unwrap(), expected);
+        }
     }
 
     #[tokio::test]

@@ -3,7 +3,10 @@
 use gloo_net::http::Request;
 use gloo_timers::callback::{Interval, Timeout};
 use serde::Deserialize;
-use std::{cell::RefCell, rc::Rc};
+use std::{collections::HashMap, rc::Rc};
+
+mod layout;
+mod performer;
 use wasm_bindgen::{closure::Closure, JsCast};
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{MessageEvent, WebSocket};
@@ -78,14 +81,36 @@ enum BridgeMessage {
 struct BridgeState {
     scene_number: Option<u16>,
     scene_name: Option<String>,
+    #[serde(default)]
+    values: HashMap<String, String>,
+    #[serde(default)]
+    solos: HashMap<String, SoloStatus>,
+    #[serde(default)]
+    solo_notice: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+struct SoloStatus {
+    owner: String,
+    channels: std::collections::BTreeSet<u8>,
 }
 
 #[derive(Debug, Deserialize)]
 enum BridgeEvent {
+    SoloChanged {
+        solos: HashMap<String, SoloStatus>,
+        notice: Option<String>,
+    },
     Connected,
     Disconnected,
-    Value { key: String, value: String },
-    SceneRecalled { number: u16, name: Option<String> },
+    Value {
+        key: String,
+        value: String,
+    },
+    SceneRecalled {
+        number: u16,
+        name: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -171,34 +196,10 @@ pub fn app() -> Html {
             if user.role == "admin" {
                 html! { <AdminPortal user={user.clone()} /> }
             } else {
-                html! { <><PerformerAssignments user={user.clone()} /><LiveConsole /></> }
+                html! { <LiveConsole><performer::Performer user={user.clone()} /></LiveConsole> }
             }
         }
     }
-}
-
-#[derive(Properties, PartialEq)]
-struct PerformerAssignmentsProps {
-    user: User,
-}
-
-#[function_component(PerformerAssignments)]
-fn performer_assignments(props: &PerformerAssignmentsProps) -> Html {
-    let mixes = use_state(|| None::<PerformerMixes>);
-    {
-        let mixes = mixes.clone();
-        use_effect_with((), move |_| {
-            refresh_performer_mixes(mixes.clone());
-            let interval = Interval::new(1_000, move || refresh_performer_mixes(mixes.clone()));
-            move || drop(interval)
-        });
-    }
-    let assignment = match &*mixes {
-        Some(value) if value.mixes.is_empty() => "No mixes assigned yet.".into(),
-        Some(value) => format!("Assigned mix numbers: {}", value.mixes.join(", ")),
-        None => "Loading your mix assignments…".into(),
-    };
-    html! { <><h1>{format!("Welcome, {}", props.user.name)}</h1><p>{assignment}</p><p>{"Assignments update automatically."}</p><form method="post" action="/signout"><button>{"Sign out"}</button></form></> }
 }
 
 #[derive(Properties, PartialEq)]
@@ -230,7 +231,7 @@ fn admin_portal(props: &AdminPortalProps) -> Html {
     };
     html! {
         <>
-            <LiveConsole />
+            <LiveConsole><SoloRecovery /></LiveConsole>
             <h1>{"Users"}</h1>
             <p>{format!("Signed in as {}. Console {} at {} · {} phone{} connected.", props.user.name, if overview.console.connected { "connected" } else { "disconnected" }, overview.console.address, overview.console.phones_connected, if overview.console.phones_connected == 1 { "" } else { "s" })}</p>
             <section class="panel"><h2>{"Add user"}</h2><form method="post" action="/api/admin/users"><label>{"Name"}<input name="name" required=true /></label><label>{"Role"}<select name="role"><option value="performer">{"Performer"}</option><option value="admin">{"Admin"}</option></select></label><label>{"4-digit passcode"}<input name="passcode" value="Generate" pattern="([0-9]{4}|Generate)" required=true /></label><button>{"Add user"}</button></form></section>
@@ -239,6 +240,47 @@ fn admin_portal(props: &AdminPortalProps) -> Html {
             <form method="post" action="/signout"><button>{"Sign out"}</button></form>
         </>
     }
+}
+
+/// Admin recovery remains available after a solo owner is removed or unassigned.
+#[function_component(SoloRecovery)]
+fn solo_recovery() -> Html {
+    let live = use_context::<LiveState>().expect("admin has console context");
+    let message = use_state(String::new);
+    let pending = use_state(|| false);
+    let mut solos: Vec<_> = live.console.solos.iter().collect();
+    solos.sort_by_key(|(mix, _)| mix.parse::<u8>().unwrap_or_default());
+    html! { <section aria-label="Solo recovery">
+        if !message.is_empty() { <p role="alert">{&*message}</p> }
+        {for solos.into_iter().map(|(mix, status)| {
+            let mix = mix.parse::<u8>().unwrap_or_default();
+            let message = message.clone();
+            let pending = pending.clone();
+            let disabled = !live.connected || *pending;
+            let onclick = Callback::from(move |_| {
+                let message = message.clone();
+                let pending = pending.clone();
+                pending.set(true);
+                spawn_local(async move {
+                    let result = Request::post("/api/performer/solo")
+                        .json(&serde_json::json!({"mix": mix, "channels": []}));
+                    let text = match result {
+                        Ok(request) => match request.send().await {
+                            Ok(response) if response.ok() => String::new(),
+                            Ok(response) => response.text().await.unwrap_or_else(|_| "Solo recovery was refused.".into()),
+                            Err(_) => "Could not reach the server. Try again.".into(),
+                        },
+                        Err(_) => "Could not prepare solo recovery.".into(),
+                    };
+                    message.set(text);
+                    pending.set(false);
+                });
+            });
+            html! { <p>{format!("Mix {}: solo active (by {}) ", mix + 1, status.owner)}
+                <button {onclick} {disabled}>{format!("Clear solo on Mix {}", mix + 1)}</button>
+            </p> }
+        })}
+    </section> }
 }
 
 #[derive(Properties, PartialEq)]
@@ -289,101 +331,158 @@ fn document_title(window: &web_sys::Window, title: &str) {
     }
 }
 
-/// Keeps every already-open screen subscribed to the server-owned bridge.
-/// Mix controls are deliberately left to CL5-6; this card supplies the shared
-/// connection, state notifications, and operator-visible safety notices.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct LiveState {
+    connected: bool,
+    console: BridgeState,
+}
+
+impl Reducible for LiveState {
+    type Action = Vec<BridgeMessage>;
+
+    fn reduce(self: Rc<Self>, action: Self::Action) -> Rc<Self> {
+        let mut next = (*self).clone();
+        for message in action {
+            match message {
+                BridgeMessage::Snapshot {
+                    kind,
+                    connected,
+                    state,
+                } if kind == "snapshot" => {
+                    next.connected = connected;
+                    next.console = state;
+                }
+                BridgeMessage::Event(BridgeEvent::SoloChanged { solos, notice }) => {
+                    next.console.solos = solos;
+                    next.console.solo_notice = notice;
+                }
+                BridgeMessage::Event(BridgeEvent::Connected) => next.connected = true,
+                BridgeMessage::Event(BridgeEvent::Disconnected) => next.connected = false,
+                BridgeMessage::Event(BridgeEvent::Value { key, value }) => {
+                    next.console.values.insert(key, value);
+                }
+                BridgeMessage::Event(BridgeEvent::SceneRecalled { number, name }) => {
+                    next.console.scene_number = Some(number);
+                    next.console.scene_name = name;
+                }
+                _ => {}
+            }
+        }
+        Rc::new(next)
+    }
+}
+
+#[derive(Properties, PartialEq)]
+struct LiveConsoleProps {
+    #[prop_or_default]
+    children: Children,
+}
+
+/// One socket supplies the scene bar and all performer controls. Reducer actions
+/// apply to the latest state, including bursts of notifications between renders.
 #[function_component(LiveConsole)]
-fn live_console() -> Html {
+fn live_console(props: &LiveConsoleProps) -> Html {
+    let live = use_reducer(LiveState::default);
     let notice = use_state(|| "Connecting to console…".to_owned());
-    let connected = use_state(|| false);
-    let scene = use_state(BridgeState::default);
-    let scene_notice_timeout = Rc::new(RefCell::new(None::<Timeout>));
+    let retry = use_state(|| 0u32);
     {
+        let live = live.clone();
         let notice = notice.clone();
-        let connected = connected.clone();
-        let scene = scene.clone();
-        let scene_notice_timeout = scene_notice_timeout.clone();
-        use_effect_with((), move |_| -> Box<dyn FnOnce()> {
+        let retry = retry.clone();
+        use_effect_with(*retry, move |_| -> Box<dyn FnOnce()> {
             let Some(window) = web_sys::window() else {
                 return Box::new(|| ());
             };
-            let location = window.location();
-            let protocol = match location.protocol().ok().as_deref() {
-                Some("https:") => "wss:",
-                _ => "ws:",
+            let protocol = if window.location().protocol().ok().as_deref() == Some("https:") {
+                "wss:"
+            } else {
+                "ws:"
             };
-            let Ok(host) = location.host() else {
+            let Ok(host) = window.location().host() else {
                 return Box::new(|| ());
             };
             let Ok(socket) = WebSocket::new(&format!("{protocol}//{host}/api/console")) else {
-                notice.set("Console disconnected — reconnecting".into());
+                notice.set(
+                    "The show-machine connection could not be opened. Reload to try again.".into(),
+                );
                 return Box::new(|| ());
             };
+            let timers = Rc::new(std::cell::RefCell::new(None::<Timeout>));
+            let message_timers = timers.clone();
+            let pending = Rc::new(std::cell::RefCell::new(Vec::new()));
+            let batch_pending = pending.clone();
+            let batch_live = live.clone();
+            let batch = Interval::new(50, move || {
+                if !batch_pending.borrow().is_empty() {
+                    batch_live.dispatch(std::mem::take(&mut *batch_pending.borrow_mut()));
+                }
+            });
+            let close_pending = pending.clone();
             let message_notice = notice.clone();
-            let message_connected = connected.clone();
-            let message_scene = scene.clone();
-            let message_scene_notice_timeout = scene_notice_timeout.clone();
             let callback = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
                 let Some(text) = event.data().as_string() else {
                     return;
                 };
-                match serde_json::from_str::<BridgeMessage>(&text) {
-                    Ok(BridgeMessage::Snapshot {
-                        kind,
-                        connected,
-                        state,
-                    }) if kind == "snapshot" && connected => {
-                        message_connected.set(true);
-                        message_scene.set(state);
-                        message_scene_notice_timeout.borrow_mut().take();
-                        message_notice.set(connection_notice(true).into());
-                    }
-                    Ok(BridgeMessage::Snapshot { state, .. }) => {
-                        message_connected.set(false);
-                        message_scene.set(state);
-                        message_scene_notice_timeout.borrow_mut().take();
-                        message_notice.set(connection_notice(false).into());
-                    }
-                    Ok(BridgeMessage::Event(BridgeEvent::Disconnected)) => {
-                        message_connected.set(false);
-                        message_scene_notice_timeout.borrow_mut().take();
-                        message_notice.set(connection_notice(false).into());
-                    }
-                    Ok(BridgeMessage::Event(BridgeEvent::Connected)) => {
-                        message_connected.set(true);
-                        message_scene_notice_timeout.borrow_mut().take();
-                        message_notice.set(connection_notice(true).into());
-                    }
-                    Ok(BridgeMessage::Event(BridgeEvent::SceneRecalled { number, name })) => {
-                        message_scene.set(BridgeState {
-                            scene_number: Some(number),
-                            scene_name: name.clone(),
-                        });
-                        let name = name.unwrap_or_else(|| "Unnamed".into());
-                        message_notice.set(format!("Scene {number} {name} recalled — mix updated"));
-                        let timeout_notice = message_notice.clone();
-                        let timeout_connected = message_connected.clone();
-                        *message_scene_notice_timeout.borrow_mut() =
+                let Ok(message) = serde_json::from_str::<BridgeMessage>(&text) else {
+                    return;
+                };
+                match &message {
+                    BridgeMessage::Event(BridgeEvent::SceneRecalled { number, name }) => {
+                        message_notice.set(format!(
+                            "Scene {number} {} recalled — mix updated",
+                            name.as_deref().unwrap_or("")
+                        ));
+                        let notice = message_notice.clone();
+                        *message_timers.borrow_mut() =
                             Some(Timeout::new(SCENE_RECALL_NOTICE_MS, move || {
-                                timeout_notice.set(connection_notice(*timeout_connected).into())
+                                notice.set(String::new())
                             }));
                     }
-                    Ok(BridgeMessage::Event(BridgeEvent::Value { key, value })) => {
-                        let _ = (key, value); // CL5-6 renders the shared live values as controls.
+                    BridgeMessage::Snapshot { connected, .. } => {
+                        message_timers.borrow_mut().take();
+                        message_notice.set(connection_notice(*connected).into());
+                    }
+                    BridgeMessage::Event(BridgeEvent::Disconnected | BridgeEvent::Connected) => {
+                        message_timers.borrow_mut().take();
+                        message_notice.set(
+                            connection_notice(matches!(
+                                message,
+                                BridgeMessage::Event(BridgeEvent::Connected)
+                            ))
+                            .into(),
+                        );
                     }
                     _ => {}
                 }
+                pending.borrow_mut().push(message);
             });
             socket.set_onmessage(Some(callback.as_ref().unchecked_ref()));
+            let close_timers = timers.clone();
+            let close = Closure::<dyn FnMut(web_sys::Event)>::new(move |_| {
+                close_pending.borrow_mut().clear();
+                live.dispatch(vec![BridgeMessage::Event(BridgeEvent::Disconnected)]);
+                notice.set("Connection to the show machine lost — reconnecting.".into());
+                let retry = retry.clone();
+                let next = *retry + 1;
+                *close_timers.borrow_mut() = Some(Timeout::new(1_000, move || retry.set(next)));
+            });
+            socket.set_onclose(Some(close.as_ref().unchecked_ref()));
             Box::new(move || {
                 socket.set_onmessage(None);
-                scene_notice_timeout.borrow_mut().take();
+                socket.set_onclose(None);
+                timers.borrow_mut().take();
                 let _ = socket.close();
-                drop(callback);
+                drop((callback, close, batch));
             })
         });
     }
-    html! { <><SceneBar connected={*connected} scene={(*scene).clone()} /><p role="status">{(*notice).clone()}</p></> }
+    html! {
+        <ContextProvider<LiveState> context={(*live).clone()}>
+            <SceneBar connected={live.connected} scene={live.console.clone()} />
+            <p role="status">{(*notice).clone()}</p>
+            {props.children.clone()}
+        </ContextProvider<LiveState>>
+    }
 }
 
 #[derive(Properties, PartialEq)]
@@ -444,6 +543,63 @@ fn error_notice(search: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{connection_notice, error_notice, SCENE_RECALL_NOTICE_MS};
+
+    #[test]
+    fn solo_events_and_snapshots_decode_numeric_mix_keys() {
+        let event =
+            r#"{"SoloChanged":{"solos":{"0":{"owner":"Singer","channels":[0]}},"notice":null}}"#;
+        let parsed = serde_json::from_str::<super::BridgeMessage>(event).unwrap();
+        assert!(matches!(
+            parsed,
+            super::BridgeMessage::Event(super::BridgeEvent::SoloChanged { .. })
+        ));
+        let snapshot = r#"{"kind":"snapshot","connected":true,"state":{"scene_number":1,"scene_name":"Show","values":{},"solos":{"0":{"owner":"Singer","channels":[0,2]}},"solo_notice":null}}"#;
+        let parsed = serde_json::from_str::<super::BridgeMessage>(snapshot).unwrap();
+        if let super::BridgeMessage::Snapshot { state, .. } = parsed {
+            assert_eq!(state.solos["0"].owner, "Singer");
+            assert_eq!(state.solos["0"].channels, [0, 2].into());
+        } else {
+            panic!("expected solo snapshot");
+        }
+    }
+
+    #[test]
+    fn live_updates_preserve_other_values_and_scene_until_replaced_by_snapshot() {
+        use super::{BridgeEvent, BridgeMessage, BridgeState, LiveState};
+        use std::rc::Rc;
+        use yew::Reducible;
+        let mut state = Rc::new(LiveState::default());
+        state = state.reduce(
+            [("level", "-350"), ("mute", "1"), ("level", "-351")]
+                .into_iter()
+                .map(|(key, value)| {
+                    BridgeMessage::Event(BridgeEvent::Value {
+                        key: key.into(),
+                        value: value.into(),
+                    })
+                })
+                .collect(),
+        );
+        state = state.reduce(vec![BridgeMessage::Event(BridgeEvent::SceneRecalled {
+            number: 12,
+            name: Some("Opening".into()),
+        })]);
+        assert_eq!(state.console.values["level"], "-351");
+        assert_eq!(state.console.values["mute"], "1");
+        assert_eq!(state.console.scene_number, Some(12));
+        state = state.reduce(vec![BridgeMessage::Event(BridgeEvent::Connected)]);
+        assert!(state.connected);
+        state = state.reduce(vec![BridgeMessage::Event(BridgeEvent::Disconnected)]);
+        assert!(!state.connected);
+        state = state.reduce(vec![BridgeMessage::Snapshot {
+            kind: "snapshot".into(),
+            connected: true,
+            state: BridgeState::default(),
+        }]);
+        assert!(state.connected);
+        assert!(state.console.values.is_empty());
+        assert_eq!(state.console.scene_number, None);
+    }
 
     #[test]
     fn lockout_notice_uses_the_server_reported_time_left() {
