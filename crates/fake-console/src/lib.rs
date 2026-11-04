@@ -21,6 +21,7 @@ pub struct FakeConsole {
     connection_limit: Arc<RwLock<usize>>,
     active_connections: Arc<Mutex<usize>>,
     total_connections: Arc<Mutex<usize>>,
+    drop_after_sets: Arc<Mutex<Option<usize>>>,
 }
 
 #[derive(Debug)]
@@ -77,6 +78,7 @@ impl Default for FakeConsole {
             connection_limit: Arc::new(RwLock::new(usize::MAX)),
             active_connections: Arc::new(Mutex::new(0)),
             total_connections: Arc::new(Mutex::new(0)),
+            drop_after_sets: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -113,6 +115,27 @@ impl FakeConsole {
     /// Drops all clients by broadcasting a control message. The fake has no real-console side effects.
     pub fn drop_connections(&self) {
         let _ = self.notifications.send("__FAKE_DROP__".into());
+    }
+
+    /// Drops every client after this many subsequent `set` commands. This
+    /// lets bridge tests force a disconnect in the middle of a multi-command
+    /// restore without relying on scheduler timing.
+    pub async fn drop_after_set_commands(&self, count: usize) {
+        *self.drop_after_sets.lock().await = Some(count);
+    }
+
+    /// Test-only desk-side edit while the bridge is disconnected. It deliberately
+    /// sends no notification: the reconnect snapshot is the bridge's first
+    /// opportunity to learn about this change.
+    pub async fn set_level_during_outage(&self, input: u8, mix: u8, value: i16) {
+        self.state.lock().await.values.insert(
+            send_key(
+                "MIXER:Current/InCh/ToMix/Level",
+                input as usize,
+                mix as usize,
+            ),
+            value.to_string(),
+        );
     }
 
     /// Test-only stand-in for an engineer recalling a scene on the desk.
@@ -201,6 +224,24 @@ impl FakeConsole {
                 self.state.lock().await.values.insert(key, value.clone());
                 let wire = format!("NOTIFY set {path} {channel} {mix} {value}");
                 let _ = self.notifications.send(wire);
+                let drop_now = {
+                    let mut remaining = self.drop_after_sets.lock().await;
+                    match remaining.as_mut() {
+                        Some(count) => {
+                            *count = count.saturating_sub(1);
+                            if *count == 0 {
+                                *remaining = None;
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        None => false,
+                    }
+                };
+                if drop_now {
+                    let _ = self.notifications.send("__FAKE_DROP__".into());
+                }
                 "OK".into()
             }
             [command, path] if command == "sscurrent_ex" && path == "MIXER:Lib/Scene" => {
