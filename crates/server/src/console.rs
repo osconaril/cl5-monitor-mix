@@ -20,6 +20,7 @@ pub const PAN: &str = "MIXER:Current/InCh/ToMix/Pan";
 const INPUT_NAME: &str = "MIXER:Current/InCh/Label/Name";
 const INPUT_COLOR: &str = "MIXER:Current/InCh/Label/Color";
 const MIX_NAME: &str = "MIXER:Current/Mix/Label/Name";
+const MIX_ROLE: &str = "MIXER:Current/Mix/Role";
 const MIX_BUS_TYPE: &str = "MIXER:Current/Mix/BusType";
 const SCENE: &str = "MIXER:Lib/Scene";
 
@@ -185,6 +186,9 @@ impl ConsoleBridge {
         if !self.is_connected() {
             return Err("Console disconnected — reconnecting.");
         }
+        if change.path == PAN && !stereo_mix(&self.state.read().await.values, change.mix) {
+            return Err("Pan is available only on a stereo-linked mix.");
+        }
         self.writes
             .send(BridgeCommand::Change(change))
             .await
@@ -344,6 +348,7 @@ async fn serve_connection(
             },
             _ = flush.tick(), if outstanding == 0 && !pending.is_empty() => {
                 for (_, change) in std::mem::take(&mut pending) {
+                    if change.path == PAN && !stereo_mix(&state.read().await.values, change.mix) { continue; }
                     let Ok(command) = change.rcp() else { continue };
                     in_flight.entry(change_key(&change)).or_default().push_back(command.rsplit(' ').next().expect("command value").to_owned());
                     if write.write_all(command.as_bytes()).await.is_err() || write.write_all(b"\n").await.is_err() { return false; }
@@ -351,6 +356,12 @@ async fn serve_connection(
             }
         }
     }
+}
+
+fn stereo_mix(values: &HashMap<String, String>, mix: u8) -> bool {
+    values
+        .get(&format!("{MIX_ROLE} {mix} 0"))
+        .is_some_and(|role| matches!(role.trim_matches('"'), "StereoL" | "StereoR"))
 }
 
 /// Apply a whole-dB delta to console readback, preserving fractional offsets.
@@ -435,7 +446,7 @@ fn snapshot_commands() -> Vec<String> {
         }
     }
     for mix in 0..24 {
-        for path in [MIX_NAME, MIX_BUS_TYPE] {
+        for path in [MIX_NAME, MIX_BUS_TYPE, MIX_ROLE] {
             commands.push(format!("get {path} {mix} 0"));
         }
     }
@@ -541,7 +552,13 @@ impl PhoneChange {
                 }
             }
             ON if matches!(self.value.as_str(), "0" | "1") => Ok(()),
-            PAN if self.value.parse::<i16>().is_ok() => Ok(()),
+            PAN if self
+                .value
+                .parse::<i16>()
+                .is_ok_and(|v| (-63..=63).contains(&v) && self.value == v.to_string()) =>
+            {
+                Ok(())
+            }
             _ => Err("That value is not valid for this control."),
         }
     }
@@ -669,6 +686,74 @@ mod tests {
             }
         }
         assert_eq!(reply.trim(), format!("OK get {LEVEL} 0 0 -300"));
+    }
+
+    #[tokio::test]
+    async fn pan_requires_stereo_readback_and_keeps_other_sends_unchanged() {
+        let fake = Arc::new(FakeConsole::new());
+        let address = fake.clone().listen("127.0.0.1:0").await.unwrap();
+        let bridge = ConsoleBridge::start(address.to_string());
+        ready(&bridge).await;
+        let mut change = PhoneChange {
+            path: PAN.into(),
+            input: 0,
+            mix: 0,
+            value: "20".into(),
+        };
+        assert_eq!(
+            bridge.change(change.clone()).await,
+            Err("Pan is available only on a stereo-linked mix.")
+        );
+        for value in ["-64", "64", "1.5", "+1", "01"] {
+            change.value = value.into();
+            assert!(change.validate().is_err());
+        }
+        let mut engineer = TcpStream::connect(address).await.unwrap();
+        engineer
+            .write_all(format!("set {MIX_ROLE} 0 0 \"StereoL\"\n").as_bytes())
+            .await
+            .unwrap();
+        wait_value(&bridge, &format!("{MIX_ROLE} 0 0"), "\"StereoL\"").await;
+        for value in ["-63", "0", "63"] {
+            change.value = value.into();
+            bridge.change(change.clone()).await.unwrap();
+            wait_value(&bridge, &format!("{PAN} 0 0"), value).await;
+        }
+        assert_eq!(bridge.state().await.values[&format!("{PAN} 0 1")], "0");
+        assert_eq!(bridge.state().await.values[&format!("{PAN} 1 0")], "0");
+        engineer
+            .write_all(format!("set {PAN} 0 0 -17\nset {MIX_ROLE} 0 0 \"Mono\"\n").as_bytes())
+            .await
+            .unwrap();
+        wait_value(&bridge, &format!("{MIX_ROLE} 0 0"), "\"Mono\"").await;
+        wait_value(&bridge, &format!("{PAN} 0 0"), "-17").await;
+        assert!(bridge.change(change).await.is_err());
+        let mut values = HashMap::new();
+        for role in ["0", "1", "\"Mono\"", "\"Unknown\""] {
+            values.insert(format!("{MIX_ROLE} 0 0"), role.into());
+            assert!(!stereo_mix(&values, 0));
+        }
+        values.insert(format!("{MIX_ROLE} 0 0"), "\"StereoR\"".into());
+        assert!(stereo_mix(&values, 0));
+    }
+
+    async fn wait_value(bridge: &ConsoleBridge, key: &str, value: &str) {
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if bridge
+                    .state()
+                    .await
+                    .values
+                    .get(key)
+                    .is_some_and(|v| v == value)
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("console readback");
     }
 
     #[test]

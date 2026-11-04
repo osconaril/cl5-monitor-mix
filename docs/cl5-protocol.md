@@ -17,16 +17,16 @@ examples and must be checked against the physical CL5 during bridge work.
 | --- | --- | --- | --- | --- |
 | Send level | `get MIXER:Current/InCh/ToMix/Level <input-0-based> <mix-0-based>` | `set MIXER:Current/InCh/ToMix/Level <input> <mix> <value>` | `-13800..1000`; `-32768` is -infinity | [RCP notes: level](https://github.com/BrenekH/yamaha-rcp-docs/blob/master/commands/current_inch_tomix_level.md); generic dB range in [RCP notes](https://github.com/BrenekH/yamaha-rcp-docs#data-types) |
 | Send on/off | `get MIXER:Current/InCh/ToMix/On <input> <mix>` | `set MIXER:Current/InCh/ToMix/On <input> <mix> <0-or-1>` | `0` false, `1` true | [RCP notes: on](https://github.com/BrenekH/yamaha-rcp-docs/blob/master/commands/current_inch_tomix_on.md) |
-| Send pan | `get MIXER:Current/InCh/ToMix/Pan <input> <mix>` | `set MIXER:Current/InCh/ToMix/Pan <input> <mix> <value>` | **unconfirmed — check on the real console** (including allowed range and stereo-mix applicability) | [RCP notes: pan](https://github.com/BrenekH/yamaha-rcp-docs/blob/master/commands/current_inch_tomix_pan.md) |
+| Send pan | `get MIXER:Current/InCh/ToMix/Pan <input> <mix>` | `set MIXER:Current/InCh/ToMix/Pan <input> <mix> <value>` | integer -63..63; stereo role required (physical-console check pending) | [RCP notes: pan](https://github.com/BrenekH/yamaha-rcp-docs/blob/master/commands/current_inch_tomix_pan.md) |
 | Input name | `get MIXER:Current/InCh/Label/Name <input> 0` | `set MIXER:Current/InCh/Label/Name <input> 0 "name"` | quoted string | [RCP notes: name](https://github.com/BrenekH/yamaha-rcp-docs/blob/master/commands/current_inch_label_name.md) |
-| Input color | `get MIXER:Current/InCh/Label/Color <input> 0` | `set MIXER:Current/InCh/Label/Color <input> 0 <color>` | **unconfirmed — check color codes on the real console** | [RCP notes: color](https://github.com/BrenekH/yamaha-rcp-docs/blob/master/commands/current_inch_label_color.md) |
+| Input color | `get MIXER:Current/InCh/Label/Color <input> 0` | `set MIXER:Current/InCh/Label/Color <input> 0 <color>` | named quoted string (e.g. `"Blue"`); see color readback below | [RCP notes: color](https://github.com/BrenekH/yamaha-rcp-docs/blob/master/commands/current_inch_label_color.md) |
 | Mix name | `get MIXER:Current/Mix/Label/Name <mix> 0` | `set MIXER:Current/Mix/Label/Name <mix> 0 "name"` | quoted string | [RCP notes: mix name](https://github.com/BrenekH/yamaha-rcp-docs/blob/master/commands/current_mix_label_name.md) |
-| Stereo-linked mix | `get MIXER:Current/Mix/BusType <mix> 0` | n/a | **unconfirmed — check exact values on the real console** | [RCP notes: bus type](https://github.com/BrenekH/yamaha-rcp-docs/blob/master/commands/current_mix_bustype.md) |
+| Stereo-linked mix | `get MIXER:Current/Mix/Role <mix> 0` | n/a | named role: StereoL/StereoR enable pan; Mono/unknown do not | [CL/QL parameter capture](https://github.com/bitfocus/companion-module-yamaha-rcp/blob/master/schemas/CLQL%20Parameters-1.txt) |
 
 For deterministic tests, the fake initializes names as the quoted empty string
-and `BusType` as `0` (unlinked). Those defaults are fake-console conventions,
-not claims about the exact CL5 encoding; confirm the physical console's bus-type
-values before the bridge interprets them.
+and retains its legacy `BusType` default of `0`. This is a fake-console
+convention, not a stereo flag or a claim about CL5 encoding. The bridge uses
+Role for stereo detection, never BusType.
 
 CL5 capacity used by the fake: 72 mono inputs, 8 stereo inputs, and 24 mixes.
 The count is **unconfirmed — check on the real console**; it is deliberately
@@ -54,3 +54,28 @@ model recalls for tests.
 
 The app must only observe scene changes; it never recalls or stores a scene on
 a real console.
+
+## Channel color readback
+
+The [CL/QL parameter capture](https://github.com/bitfocus/companion-module-yamaha-rcp/blob/master/schemas/CLQL%20Parameters-1.txt)
+declares input label color as a string. The same module's
+[color choices](https://github.com/bitfocus/companion-module-yamaha-rcp/blob/master/rcpNames.json)
+list Blue, Orange, Yellow, Purple, Cyan, Magenta, Red, Green and Off.
+The fake accepts these quoted names and defaults to Blue. The performer screen
+maps only these names to a swatch; Off and unavailable/unrecognized values have
+a transparent swatch with an accessible label. Swatch RGB values are display
+choices, not a claim about the console display's calibration. Color readback
+never writes a console command. Physical-console verification remains CL5-8.
+
+## Stereo roles and pan
+
+The CL/QL parameter capture above separates `Mix/Role` (string, default Mono)
+from `Mix/BusType` (string, default VARI), and records send pan as -63..63.
+The bridge reads Role and only accepts phone pan with explicit StereoL or
+StereoR readback; missing/unknown roles fail closed. It rechecks before flushing
+queued pan writes. The UI hides pan for other roles and retains console pan
+readback as its displayed value. Pan remains left/right in either orientation.
+The fake exposes a test-only role setter for engineer simulation; the browser's
+allow-list never permits role writes or linking buses. The fake's legacy
+BusType default is not used to infer stereo. StereoR routing/pair behavior and
+the role readback on physical hardware still require CL5-8 before the first show.

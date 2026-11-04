@@ -148,6 +148,16 @@ try {
   await evaluate("document.querySelector('.mix-picker button').click()");
   const strip = "document.querySelector('.channel-strip')";
   await expectBrowser(`document.querySelectorAll('.channel-strip').length === 80 && ${strip}?.innerText.includes('-3.5 dB') && ${strip}?.innerText.includes('Lead Vocal')`, 'Console fractional level/name was not rendered');
+  await expectBrowser(`${strip}.querySelector('.channel-color').getAttribute('aria-label')==='Channel color: Blue'`, 'Initial console color missing');
+  await rcp('set MIXER:Current/InCh/Label/Color 0 0 "Red"', 'OK');
+  await expectBrowser(`${strip}.querySelector('.channel-color').getAttribute('aria-label')==='Channel color: Red' && getComputedStyle(${strip}.querySelector('.channel-color')).backgroundColor==='rgb(244, 67, 54)'`, 'Live console color missing');
+  await rcp('set MIXER:Current/InCh/Label/Color 0 0 "Off"', 'OK');
+  await expectBrowser(`${strip}.querySelector('.channel-color').getAttribute('aria-label')==='Channel color: Off' && getComputedStyle(${strip}.querySelector('.channel-color')).backgroundColor==='rgba(0, 0, 0, 0)'`, 'Off color was not cleared');
+  if (!await evaluate("document.querySelectorAll('.pan-control').length===0")) throw new Error('Mono mix offered pan');
+  await rcp('set MIXER:Current/Mix/Role 0 0 "StereoL"', 'OK');
+  await expectBrowser("document.querySelectorAll('.pan-control').length===80", 'Stereo role did not show pan');
+  await rcp('set MIXER:Current/InCh/ToMix/Pan 0 0 -17', 'OK');
+  await expectBrowser(`${strip}.querySelector('.pan-control').innerText.includes('L 17')`, 'Engineer pan missing');
   // A resize or readback cannot send a rounded level back to the console.
   for (const [width,height] of [[390,844],[844,390]]) {
     await command(ws, 'Emulation.setDeviceMetricsOverride', {width,height,deviceScaleFactor:1,mobile:true});
@@ -251,7 +261,7 @@ try {
     await expectBrowser("document.querySelector('.channel-strip:not(.group-strip)').dataset.channel==='1' && !document.querySelector('.reorder-handle').disabled", 'Touch drag did not reorder actual strips');
     if (!await evaluate("fetch('/api/performer/layout').then(r=>r.json()).then(l=>l.order[0]===1 && l.order[1]===0)"))
       throw new Error('Touch drag order was not persisted');
-    await dragStrip(1,0,true);
+    await dragStrip(0,1);
     await expectBrowser("document.querySelector('.channel-strip').dataset.channel==='0' && !document.querySelector('.reorder-handle').disabled", 'Touch drag did not restore strip order');
   }
   // A refused reorder must not present a new order as saved.
@@ -273,6 +283,33 @@ try {
     throw new Error('Reorder changed sound or a refused reorder changed the displayed order');
   // Presentation settings must survive a fresh session without changing sound.
   const clickText = text => evaluate(`(() => { const b=[...document.querySelectorAll('button')].find(b=>b.textContent===${JSON.stringify(text)}); if(!b) throw new Error('Missing button'); b.click(); })()`);
+  // Pan is horizontal in either orientation and uses the same deliberate hold.
+  for (const [width,height] of [[390,844],[844,390]]) {
+    await command(ws,'Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:true});
+    await sleep(150);
+    await evaluate("document.querySelector('.channel-strips').scrollTo(0,0);document.querySelector('.pan-control').scrollIntoView({block:'center'})");
+    const point=await evaluate(`(() => {const f=document.querySelector('.pan-control input'),r=f.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2,horizontal:getComputedStyle(f).writingMode==='horizontal-tb'};})()`);
+    if (!point.horizontal) throw new Error('Pan must read left/right in both orientations');
+    const before=await evaluate('window.controlWrites.length');
+    await touch('touchStart',point.x,point.y);
+    await touch('touchMove',point.x-20,point.y-20);
+    await touch('touchEnd');
+    if (await evaluate('window.controlWrites.length')!==before) throw new Error('Pan swipe sent a control');
+    await evaluate("document.querySelector('.channel-strips').scrollTo(0,0);document.querySelector('.pan-control').scrollIntoView({block:'center'})");
+    const held=await evaluate(`(() => {const r=document.querySelector('.pan-control input').getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2};})()`);
+    await touch('touchStart',held.x,held.y);
+    await sleep(260);
+    await touch('touchMove',held.x+12,held.y);
+    await expectBrowser(`window.controlWrites.length===${before+1}`, 'Held pan did not submit at '+width+' '+JSON.stringify(held)+' before='+before);
+    await command(ws,'Emulation.setDeviceMetricsOverride',{width:height,height:width,deviceScaleFactor:1,mobile:true});
+    await touch('touchEnd');
+    await sleep(150);
+    if (await evaluate('window.controlWrites.length')!==before+1) throw new Error('Rotation submitted pan');
+  }
+  await rcp('set MIXER:Current/Mix/Role 0 0 "Mono"', 'OK');
+  await expectBrowser("document.querySelectorAll('.pan-control').length===0", 'Unlink did not hide pan');
+  const monoRefusal=await evaluate("fetch('/api/console',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({path:'MIXER:Current/InCh/ToMix/Pan',input:0,mix:0,value:'12'})}).then(async r=>!r.ok && (await r.text()).includes('stereo-linked'))");
+  if (!monoRefusal) throw new Error('Server accepted pan on mono mix');
   await clickText('Edit channel layout');
   await expectBrowser("document.querySelectorAll('.layout-channel').length===80", 'Layout editor did not load');
   for (const [width,height] of [[390,844],[844,390]]) {
@@ -345,6 +382,41 @@ try {
   await evaluate(`(() => {window.groupFetch=window.fetch;window.fetch=function(input,init){const url=typeof input==='string'?input:input.url;if(url.includes('/api/performer/group'))return Promise.resolve(new Response('That mix is not assigned to you.',{status:403}));return window.groupFetch.apply(this,arguments);}; const f=document.querySelector('[data-group-fader]');f.value='1';f.dispatchEvent(new Event('change',{bubbles:true}));})()`);
   await expectBrowser("document.querySelector('.group-strip [role=alert]').textContent.includes('not assigned')", 'Group refusal message missing');
   await evaluate('window.fetch=window.groupFetch');
+  // Hold only the assignment refresh so actual controls can hit server-side
+  // revocation before the UI learns of it. No refusal response is fabricated.
+  await evaluate(`(async()=>{const assignments=await fetch('/api/performer/mixes').then(r=>r.json());window.assignmentFetch=window.fetch;window.fetch=function(input,init){const url=typeof input==='string'?input:input.url;if(url.includes('/api/performer/mixes'))return Promise.resolve(new Response(JSON.stringify(assignments),{headers:{'content-type':'application/json'}}));return window.assignmentFetch.apply(this,arguments);};})()`);
+  const adminLogin=await fetch(`http://127.0.0.1:${port}/signin`,{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:'name=Browser&passcode=1234',redirect:'manual'});
+  const adminCookie=adminLogin.headers.get('set-cookie')?.split(';')[0];
+  if (!adminCookie) throw new Error('Admin test session missing');
+  async function assignSinger(body) {
+    const response=await fetch(`http://127.0.0.1:${port}/api/admin/users/Singer/mixes`,{method:'POST',headers:{cookie:adminCookie,'content-type':'application/x-www-form-urlencoded'},body,redirect:'manual'});
+    if (response.status!==303) throw new Error('Assignment update failed: '+response.status);
+  }
+  await rcp('set MIXER:Current/Mix/Role 0 0 "StereoL"', 'OK');
+  await expectBrowser("document.querySelectorAll('.pan-control').length===79", 'Stereo pan missing before revocation');
+  await evaluate(`(()=>{window.refusalResults=[];const original=window.fetch;window.fetch=async function(input,init){const response=await original.apply(this,arguments);const url=typeof input==='string'?input:input.url;if(init?.method==='POST' || input?.method==='POST')window.refusalResults.push({url,status:response.status,body:await response.clone().text()});return response;};})()`);
+  await assignSinger('mixes=2');
+  for (const action of [
+    `document.querySelector('[data-channel="0"] [data-action="mute"]').click()`,
+    `document.querySelector('[data-channel="0"] [data-action="solo"]').click()`,
+    `(()=>{const f=document.querySelector('[data-channel="0"] .send-control input');f.value='-3';f.dispatchEvent(new Event('input',{bubbles:true}));})()`,
+    `(()=>{const f=document.querySelector('[data-group-fader]');f.value='1';f.dispatchEvent(new Event('change',{bubbles:true}));})()`,
+    `(()=>{const f=document.querySelector('[data-channel="0"] .pan-control input');f.value='12';f.dispatchEvent(new Event('input',{bubbles:true}));})()`
+  ]) {
+    const count=await evaluate('window.refusalResults.length');
+    await evaluate(action);
+    await expectBrowser(`window.refusalResults.length===${count+1} && window.refusalResults.at(-1).status===403 && window.refusalResults.at(-1).body.includes('not assigned')`, 'Revoked action did not receive actual server refusal');
+    await expectBrowser("document.querySelector('.performer').innerText.includes('not assigned')", 'Actual assignment refusal was not shown');
+    await sleep(100);
+  }
+  await rcp('get MIXER:Current/InCh/ToMix/Level 0 0', 'OK get MIXER:Current/InCh/ToMix/Level 0 0 -150');
+  await rcp('get MIXER:Current/InCh/ToMix/On 0 0', 'OK get MIXER:Current/InCh/ToMix/On 0 0 0');
+  await evaluate('window.fetch=window.assignmentFetch');
+  await expectBrowser("!document.querySelector('.channel-strip') && document.body.innerText.includes('no longer assigned')", 'Revocation silently switched the performer to another mix');
+  await assignSinger('mixes=1&mixes=2');
+  await expectBrowser("document.querySelectorAll('.channel-strip').length===80", 'Restored assignment did not return controls');
+  await rcp('set MIXER:Current/Mix/Role 0 0 "Mono"', 'OK');
+
   await rcp('get MIXER:Current/InCh/ToMix/Level 0 0','OK get MIXER:Current/InCh/ToMix/Level 0 0 -150');
   await rcp('set MIXER:Current/InCh/ToMix/Level 0 0 -400','OK');
   await evaluate("fetch('/signout',{method:'POST'}).then(()=>fetch('/signin',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:'name=Singer&passcode=5678'}))");
@@ -393,6 +465,7 @@ try {
   await evaluate(`${soloButton(0)}.click()`);
   await expectBrowser("!document.body.innerText.includes('Solo active (by ') && document.querySelector('[data-channel=\"2\"]').innerText.includes('-3.5 dB')", 'Solo did not restore fractional level');
   await rcp('get MIXER:Current/InCh/ToMix/Level 3 0', 'OK get MIXER:Current/InCh/ToMix/Level 3 0 -725');
+  await sleep(300); // Let restoration readbacks drain before starting another solo.
   await evaluate(`${soloButton(1)}.click()`);
   await expectBrowser("document.body.innerText.includes('Solo active (by ')", 'Second solo did not start');
   await rcp('ssrecall_ex MIXER:Lib/Scene 2', 'OK');
@@ -401,6 +474,11 @@ try {
   await rcp('get MIXER:Current/InCh/ToMix/Level 0 0', 'OK get MIXER:Current/InCh/ToMix/Level 0 0 -1200');
   await evaluate("[...document.querySelectorAll('button')].find(b=>b.textContent==='Choose another mix').click()");
   await expectBrowser("document.querySelectorAll('.mix-picker button').length === 2 && document.title === 'Show · Monitor Mix'", 'Picker lost current scene');
+  await rcp('ssrecall_ex MIXER:Lib/Scene 3', 'OK');
+  await expectBrowser("document.title === 'Scene 3 · Monitor Mix' && document.querySelector('.scene-bar').innerText.includes('Scene 3')", 'Unnamed scene missing on picker');
+  await evaluate("document.querySelector('.mix-picker button').click()");
+  await expectBrowser("document.querySelectorAll('.channel-strip').length===80 && document.title==='Scene 3 · Monitor Mix' && document.querySelector('.scene-bar').innerText.includes('Scene 3')", 'Unnamed scene missing on mix screen');
+  await evaluate("[...document.querySelectorAll('button')].find(b=>b.textContent==='Choose another mix').click()");
   await stop(fake); fake = null;
   await expectBrowser("document.querySelector('.scene-bar').innerText.includes('Console disconnected — scene unknown')", 'Disconnected console left stale scene name');
   await evaluate("document.querySelector('.mix-picker button').click()");

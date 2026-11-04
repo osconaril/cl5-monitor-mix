@@ -59,6 +59,13 @@ impl Default for FakeConsole {
                 values: show_values,
             },
         );
+        scenes.insert(
+            3,
+            Scene {
+                name: String::new(),
+                values: HashMap::new(),
+            },
+        );
         Self {
             state: Arc::new(Mutex::new(State {
                 values: HashMap::new(),
@@ -297,7 +304,7 @@ fn control_key(path: &str, first: &str, second: &str) -> Result<String, ()> {
     );
     let mix_path = matches!(
         path,
-        "MIXER:Current/Mix/Label/Name" | "MIXER:Current/Mix/BusType"
+        "MIXER:Current/Mix/Label/Name" | "MIXER:Current/Mix/BusType" | "MIXER:Current/Mix/Role"
     );
 
     if (input_path && first < MONO_INPUTS + STEREO_INPUTS && second < MIXES)
@@ -316,11 +323,24 @@ fn set_value_is_valid(path: &str, value: &str) -> bool {
             .parse::<i32>()
             .is_ok_and(|level| level == -32768 || (-13800..=1000).contains(&level)),
         "MIXER:Current/InCh/ToMix/On" => matches!(value, "0" | "1"),
-        // The precise pan and color code domains remain deliberately
-        // unconfirmed in the protocol notes. They are still numeric controls.
-        "MIXER:Current/InCh/ToMix/Pan" | "MIXER:Current/InCh/Label/Color" => {
-            value.parse::<i32>().is_ok()
+        "MIXER:Current/InCh/ToMix/Pan" => {
+            value.parse::<i32>().is_ok_and(|v| (-63..=63).contains(&v))
         }
+        // Test-only engineer configuration; the phone never writes mix roles.
+        "MIXER:Current/Mix/Role" => matches!(value, "\"Mono\"" | "\"StereoL\"" | "\"StereoR\""),
+        // CL/QL labels carry named strings, not numeric color codes.
+        "MIXER:Current/InCh/Label/Color" => matches!(
+            value,
+            "\"Blue\""
+                | "\"Orange\""
+                | "\"Yellow\""
+                | "\"Purple\""
+                | "\"Cyan\""
+                | "\"Magenta\""
+                | "\"Red\""
+                | "\"Green\""
+                | "\"Off\""
+        ),
         "MIXER:Current/InCh/Label/Name" | "MIXER:Current/Mix/Label/Name" => {
             value.starts_with('"') && value.ends_with('"') && value.len() >= 2
         }
@@ -334,10 +354,11 @@ fn default_value(path: &str) -> &'static str {
         // them. Returning an empty quoted label keeps a new fake console in
         // the same value domain as a physical console.
         "MIXER:Current/InCh/Label/Name" | "MIXER:Current/Mix/Label/Name" => "\"\"",
-        // The fake models BusType as a boolean-like 0/1 field; a new mix is
-        // unlinked. The physical CL5's precise encoding remains documented as
-        // unconfirmed, but the fake must not return a send-level sentinel here.
+        // Legacy fake default only. BusType is not a stereo boolean; the
+        // bridge uses Role and never infers stereo from this value.
         "MIXER:Current/Mix/BusType" => "0",
+        "MIXER:Current/Mix/Role" => "\"Mono\"",
+        "MIXER:Current/InCh/Label/Color" => "\"Blue\"",
         path if path.ends_with("/On") || path.ends_with("/Pan") => "0",
         _ => "-32768",
     }

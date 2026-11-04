@@ -93,7 +93,7 @@
     gesture = {
       fader, area, id: event.pointerId, x: event.clientX, y: event.clientY,
       startX: event.clientX, startY: event.clientY,
-      armed: event.pointerType !== 'touch', scrolling: false, vertical: sideways,
+      armed: event.pointerType !== 'touch', scrolling: false, vertical: getComputedStyle(fader).writingMode === 'vertical-lr',
     };
     fader.setPointerCapture(event.pointerId);
     gesture.timer = setTimeout(() => {
@@ -120,7 +120,7 @@
         clearTimeout(g.timer);
       }
       if (g.scrolling) {
-        if (g.vertical) g.area.scrollLeft += g.x - event.clientX;
+        if (sideways) g.area.scrollLeft += g.x - event.clientX;
         else g.area.scrollTop += g.y - event.clientY;
       }
     } else if (event.clientX !== g.x || event.clientY !== g.y) {

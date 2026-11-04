@@ -8,8 +8,25 @@ use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
 
 const LEVEL: &str = "MIXER:Current/InCh/ToMix/Level";
+const PAN: &str = "MIXER:Current/InCh/ToMix/Pan";
 const ON: &str = "MIXER:Current/InCh/ToMix/On";
 const OFF: i16 = -32768;
+
+// Only known console names become CSS colors. Never interpolate wire text into style.
+fn channel_color(wire: Option<&str>) -> (&'static str, &'static str) {
+    match wire.map(|v| v.trim_matches('"')) {
+        Some("Blue") => ("#4285f4", "Blue"),
+        Some("Orange") => ("#ff9800", "Orange"),
+        Some("Yellow") => ("#ffeb3b", "Yellow"),
+        Some("Purple") => ("#9c6ade", "Purple"),
+        Some("Cyan") => ("#00d4df", "Cyan"),
+        Some("Magenta") => ("#ed55d8", "Magenta"),
+        Some("Red") => ("#f44336", "Red"),
+        Some("Green") => ("#4caf50", "Green"),
+        Some("Off") => ("transparent", "Off"),
+        _ => ("transparent", "Unknown"),
+    }
+}
 
 fn mix_index(label: &str) -> Option<u8> {
     label
@@ -240,15 +257,23 @@ pub(super) fn performer(props: &PerformerProps) -> Html {
         });
     }
     let assignments = mixes.as_ref().map(|m| m.mixes.clone()).unwrap_or_default();
+    {
+        let selected = selected.clone();
+        use_effect_with(assignments.clone(), move |assignments| {
+            if selected.is_none() && assignments.len() == 1 {
+                selected.set(assignments.first().cloned());
+            }
+            || ()
+        });
+    }
     // A revoked assignment immediately removes its controls. Never silently
     // retarget an old strip to a different mix.
-    let active = if assignments.len() == 1 {
+    let active = if let Some(name) = selected.as_ref() {
+        assignments.contains(name).then(|| name.clone())
+    } else if assignments.len() == 1 {
         assignments.first().cloned()
     } else {
-        selected
-            .as_ref()
-            .filter(|name| assignments.contains(name))
-            .cloned()
+        None
     };
     let change = {
         let message = message.clone();
@@ -329,6 +354,9 @@ pub(super) fn performer(props: &PerformerProps) -> Html {
         <section class="performer">
             <h1>{format!("{}’s in-ear mix", props.user.name)}</h1>
             <p role="alert">{(*message).clone()}</p>
+            if selected.as_ref().is_some_and(|name| !assignments.contains(name)) {
+                <p role="alert">{"That mix is no longer assigned to you. Choose an assigned mix or ask the engineer."}</p>
+            }
             if let Some(mix) = active.as_deref().and_then(mix_index) {
                 <div class="mix-heading"><h2>{active.clone().unwrap_or_default()}</h2>
                 if assignments.len() > 1 { <button onclick={back}>{"Choose another mix"}</button> }</div>
@@ -353,9 +381,12 @@ pub(super) fn performer(props: &PerformerProps) -> Html {
                 {for shown_layout.order.iter().copied().filter(|input| !shown_layout.hidden.contains(input)).map(|input| {
                     let value = |path| live.console.values.get(&format!("{path} {input} {mix}"));
                     let level = value(LEVEL).and_then(|v| v.parse::<i16>().ok()).filter(|v| *v == OFF || (-13800..=1000).contains(v));
+                    let stereo = live.console.values.get(&format!("MIXER:Current/Mix/Role {mix} 0")).is_some_and(|r| matches!(r.trim_matches('"'), "StereoL" | "StereoR"));
+                    let pan = value(PAN).and_then(|v| v.parse::<i16>().ok()).filter(|v| (-63..=63).contains(v));
                     let on = value(ON).and_then(|v| match v.as_str() { "1" => Some(true), "0" => Some(false), _ => None });
                     let name = channel_names[input as usize].clone();
-                    html! { <ChannelStrip key={format!("{mix}-{input}")} {mix} {input} {name} {level} {on} connected={live.connected} reorder_allowed={layout.is_some() && !*reordering} change={change.clone()} solo={solo.clone()}
+                    let color = live.console.values.get(&format!("MIXER:Current/InCh/Label/Color {input} 0")).cloned();
+                    html! { <ChannelStrip key={format!("{mix}-{input}")} {mix} {input} {name} {color} {level} {on} {stereo} {pan} connected={live.connected} reorder_allowed={layout.is_some() && !*reordering} change={change.clone()} solo={solo.clone()}
                         soloed={live.console.solos.get(&mix.to_string()).is_some_and(|s| s.channels.contains(&input))}
                         solo_allowed={live.console.solos.get(&mix.to_string()).is_none_or(|s| s.owner == props.user.name)} /> }
                 })}
@@ -385,8 +416,11 @@ struct ChannelStripProps {
     mix: u8,
     input: u8,
     name: String,
+    color: Option<String>,
     level: Option<i16>,
     on: Option<bool>,
+    stereo: bool,
+    pan: Option<i16>,
     connected: bool,
     reorder_allowed: bool,
     change: Callback<(u8, u8, &'static str, String)>,
@@ -427,6 +461,16 @@ fn channel_strip(props: &ChannelStripProps) -> Html {
             }
         })
     };
+    let pan_input = {
+        let change = props.change.clone();
+        let (mix, input) = (props.mix, props.input);
+        Callback::from(move |event: InputEvent| {
+            let target: web_sys::HtmlInputElement = event.target_unchecked_into();
+            let value = target.value_as_number().round().clamp(-63.0, 63.0) as i16;
+            target.set_value(&value.to_string());
+            change.emit((mix, input, PAN, value.to_string()));
+        })
+    };
     let mute = {
         let change = props.change.clone();
         let (mix, input, on) = (props.mix, props.input, props.on);
@@ -441,6 +485,7 @@ fn channel_strip(props: &ChannelStripProps) -> Html {
         let (mix, input) = (props.mix, props.input);
         Callback::from(move |_| callback.emit((mix, input)))
     };
+    let (color, color_name) = channel_color(props.color.as_deref());
     let position = props
         .level
         .map(|v| {
@@ -453,13 +498,22 @@ fn channel_strip(props: &ChannelStripProps) -> Html {
         .unwrap_or(-139.0);
     html! {
         <article class="channel-strip" data-channel={props.input.to_string()}>
-            <div class="strip-heading"><h3>{&props.name}</h3>
+            <div class="strip-heading">
+            <span class="channel-color" role="img" aria-label={format!("Channel color: {color_name}")} title={format!("Channel color: {color_name}")} style={format!("background-color: {color}")}></span>
+            <h3>{&props.name}</h3>
             <button class="reorder-handle" aria-label={format!("Drag {} to reorder", props.name)} disabled={!props.reorder_allowed}>{"↕"}</button></div>
             <label class="send-control">
                 <span>{props.level.map(level_text).unwrap_or_else(|| "Level unavailable".into())}</span>
                 <input type="range" aria-label={format!("{} send level", props.name)} aria-valuetext={props.level.map(level_text)}
                     min="-139" max="10" step="any" value={position.to_string()} {oninput} disabled={!props.connected || props.level.is_none()} />
             </label>
+            if props.stereo {
+                <label class="send-control pan-control">
+                    <span>{props.pan.map(|v| if v == 0 { "Pan: center".into() } else { format!("Pan: {} {}", if v < 0 { "L" } else { "R" }, v.abs()) }).unwrap_or_else(|| "Pan unavailable".into())}</span>
+                    <input type="range" aria-label={format!("{} pan", props.name)} min="-63" max="63" step="1"
+                        value={props.pan.unwrap_or(0).to_string()} oninput={pan_input} disabled={!props.connected || props.pan.is_none()} />
+                </label>
+            }
             <button data-action="mute" onclick={mute} disabled={!props.connected || props.on.is_none()} aria-pressed={props.on.map(|on| (!on).to_string())}>
                 {if props.on == Some(false) { "Muted — unmute" } else { "Mute" }}
             </button>
@@ -585,6 +639,24 @@ fn group_strip(props: &GroupStripProps) -> Html {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn color_readback_uses_only_known_names() {
+        for name in [
+            "Blue", "Orange", "Yellow", "Purple", "Cyan", "Magenta", "Red", "Green", "Off",
+        ] {
+            assert_eq!(channel_color(Some(&format!("\"{name}\""))).1, name);
+        }
+        for value in [
+            None,
+            Some("0"),
+            Some("-32768"),
+            Some("url(https://example.com)"),
+            Some("Unknown"),
+        ] {
+            assert_eq!(channel_color(value), ("transparent", "Unknown"));
+        }
+    }
 
     #[test]
     fn fractional_console_values_are_displayed_without_rounding() {
