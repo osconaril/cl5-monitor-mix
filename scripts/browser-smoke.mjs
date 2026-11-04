@@ -124,7 +124,7 @@ try {
   async function rcp(line, expected) {
     let buffer = '';
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { engineer.off('data', listener); reject(new Error('RCP timeout: '+line)); }, 5000);
+      const timer = setTimeout(() => { engineer.off('data', listener); reject(new Error('RCP timeout: '+line+'; received: '+buffer)); }, 5000);
       const listener = chunk => {
         buffer += chunk.toString();
         if (buffer.split('\n').some(line => line.trim() === expected)) {
@@ -340,9 +340,11 @@ try {
   // Arrange replaces the legacy layout page. It saves each drag/hide directly,
   // keeps groups in the layout data without rendering group controls, and never
   // changes console values merely because a strip is hidden.
-  await expectBrowser("document.querySelector('.reorder-handle') && document.body.innerText.includes('Hidden. You still hear these in your mix.')", 'Arrange mode did not replace the legacy layout editor');
-  await evaluate("document.querySelector('[data-channel=\"2\"] [data-action=\"hide\"]').click()");
-  await expectBrowser("!document.querySelector('[data-channel=\"2\"]') && document.querySelector('.hidden-channels')", 'Hide did not move a strip to the hidden tray');
+  await expectBrowser("document.querySelector('.reorder-handle') && !document.body.innerText.includes('Edit channel layout')", 'Arrange mode did not replace the legacy layout editor');
+  await expectBrowser("[...document.querySelectorAll('[data-channel=\"2\"] button')].some(button => button.textContent === 'Hide')", 'Arrange channel controls did not load');
+  await rcp('set MIXER:Current/InCh/ToMix/Level 2 0 -350', 'OK');
+  await evaluate("[...document.querySelectorAll('[data-channel=\"2\"] button')].find(button => button.textContent === 'Hide').click()");
+  await expectBrowser("!document.querySelector('[data-channel=\"2\"]') && document.querySelector('.hidden-channels') && document.body.innerText.includes('Hidden. You still hear these in your mix.')", 'Hide did not move a strip to the hidden tray');
   await rcp('get MIXER:Current/InCh/ToMix/Level 2 0', 'OK get MIXER:Current/InCh/ToMix/Level 2 0 -350');
   if (!await evaluate("fetch('/api/performer/layout').then(r=>r.json()).then(l=>l.hidden.includes(2))"))
     throw new Error('Hide was not persisted');
@@ -389,7 +391,7 @@ try {
   await expectBrowser("document.querySelectorAll('.channel-strip').length===80", 'Restored assignment did not return controls');
   await rcp('set MIXER:Current/Mix/Role 0 0 "Mono"', 'OK');
 
-  await rcp('get MIXER:Current/InCh/ToMix/Level 0 0','OK get MIXER:Current/InCh/ToMix/Level 0 0 -150');
+  await rcp('get MIXER:Current/InCh/ToMix/Level 0 0','OK get MIXER:Current/InCh/ToMix/Level 0 0 -400');
   await rcp('set MIXER:Current/InCh/ToMix/Level 0 0 -400','OK');
   await evaluate("fetch('/signout',{method:'POST'}).then(()=>fetch('/signin',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:'name=Singer&passcode=5678'}))");
   await command(ws,'Page.navigate',{url:`http://127.0.0.1:${port}/`});
