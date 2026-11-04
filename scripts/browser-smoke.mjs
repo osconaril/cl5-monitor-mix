@@ -160,11 +160,25 @@ try {
   await rcp('set MIXER:Current/InCh/ToMix/Pan 0 0 -17', 'OK');
   await expectBrowser("document.querySelector('.channel-panel').innerText.includes('Left or right in your ears')", 'Stereo channel panel missing');
   await evaluate("[...document.querySelectorAll('.channel-panel button')].find(button => button.textContent === 'Done').click()");
-  // A resize or readback cannot send a rounded level back to the console.
-  for (const [width,height] of [[390,844],[844,390]]) {
+  // The performer shell owns the viewport: the document never scrolls, while
+  // its channel rail does. At each promised viewport, every control on a
+  // visible strip must be reachable rather than clipped below the page edge.
+  for (const [width,height] of [[390,844],[844,390],[1280,720],[1440,900]]) {
     await command(ws, 'Emulation.setDeviceMetricsOverride', {width,height,deviceScaleFactor:1,mobile:true});
-    if (!await evaluate("Math.max(document.documentElement.scrollWidth, document.body.scrollWidth) <= innerWidth && [...document.querySelectorAll('button')].every(b=>b.getBoundingClientRect().height>=44) && !document.body.innerText.toLowerCase().includes('wedge')"))
-      throw new Error('Performer page overflow, small controls or incorrect wording');
+    if (!await evaluate(`(() => {
+      const visible = [...document.querySelectorAll('.channel-strip')].filter(strip => {
+        const r = strip.getBoundingClientRect();
+        return r.right > 0 && r.left < innerWidth && r.bottom > 0 && r.top < innerHeight;
+      });
+      const controlsFit = visible.every(strip => [...strip.querySelectorAll('.channel-name, input, button')]
+        .every(control => { const r = control.getBoundingClientRect(); return r.left >= 0 && r.right <= innerWidth && r.top >= 0 && r.bottom <= innerHeight; }));
+      return Math.max(document.documentElement.scrollWidth, document.body.scrollWidth) <= innerWidth
+        && document.scrollingElement.scrollHeight <= innerHeight
+        && [...document.querySelectorAll('button')].every(b=>b.getBoundingClientRect().height>=44)
+        && controlsFit
+        && !document.body.innerText.toLowerCase().includes('wedge');
+    })()`))
+      throw new Error('Performer page overflow, clipped visible controls, small controls or incorrect wording');
     await rcp('get MIXER:Current/InCh/ToMix/Level 0 0', 'OK get MIXER:Current/InCh/ToMix/Level 0 0 -350');
   }
   // Real touch input: a swipe begun on a fader scrolls without changing sound;
