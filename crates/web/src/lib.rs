@@ -177,21 +177,7 @@ pub fn app() -> Html {
                 </form>
             </>
         },
-        Screen::SignIn(users) => html! {
-            <>
-                <h1>{"Monitor Mix"}</h1>
-                {notice.map(|text| html! { <p role="alert">{text}</p> }).unwrap_or_default()}
-                <form method="post" action="/signin">
-                    <label>{"Name"}<input name="name" list="existing-user-names" required=true /></label>
-                    <datalist id="existing-user-names">
-                        {for users.iter().map(|name| html! { <option value={name.clone()} /> })}
-                    </datalist>
-                    <p>{"Choose a saved name from the list or type your name."}</p>
-                    <label>{"4-digit passcode"}<input name="passcode" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" required=true /></label>
-                    <button>{"Sign in"}</button>
-                </form>
-            </>
-        },
+        Screen::SignIn(users) => html! { <SignIn users={users.clone()} notice={notice} /> },
         Screen::SignedIn(user) => {
             if user.role == "admin" {
                 html! { <AdminPortal user={user.clone()} /> }
@@ -200,6 +186,110 @@ pub fn app() -> Html {
             }
         }
     }
+}
+
+#[derive(Properties, PartialEq)]
+struct SignInProps {
+    users: Vec<String>,
+    notice: Option<String>,
+}
+
+/// A performer never needs to type a name: selecting it reveals a deliberately
+/// small four-digit keypad, which submits as soon as the fourth digit is tapped.
+#[function_component(SignIn)]
+fn sign_in(props: &SignInProps) -> Html {
+    let selected = use_state(|| None::<String>);
+    let digits = use_state(String::new);
+    let form = use_node_ref();
+    let locked = props
+        .notice
+        .as_deref()
+        .is_some_and(|notice| notice.starts_with("This name is locked."));
+    let choose = {
+        let selected = selected.clone();
+        let digits = digits.clone();
+        Callback::from(move |name: String| {
+            selected.set(Some(name));
+            digits.set(String::new());
+        })
+    };
+    let digit = {
+        let digits = digits.clone();
+        let form = form.clone();
+        Callback::from(move |value: String| {
+            let mut next = (*digits).clone();
+            if next.len() == 4
+                || value.len() != 1
+                || !value.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return;
+            }
+            next.push_str(&value);
+            let submit = next.len() == 4;
+            digits.set(next);
+            if submit {
+                if let Some(form) = form.cast::<web_sys::HtmlFormElement>() {
+                    let _ = form.submit();
+                }
+            }
+        })
+    };
+    let erase = {
+        let digits = digits.clone();
+        Callback::from(move |_| {
+            let mut next = (*digits).clone();
+            next.pop();
+            digits.set(next);
+        })
+    };
+    let zero = {
+        let digit = digit.clone();
+        Callback::from(move |_| digit.emit("0".into()))
+    };
+    let change_name = {
+        let selected = selected.clone();
+        Callback::from(move |_| selected.set(None))
+    };
+    html! {
+        <section class="sign-in" aria-label="Sign in">
+            <h1>{"Monitor Mix"}</h1>
+            {props.notice.as_ref().map(|text| html! { <p role="alert">{text}</p> }).unwrap_or_default()}
+            if let Some(name) = selected.as_ref() {
+                <form method="post" action="/signin" ref={form}>
+                    <input type="hidden" name="name" value={name.clone()} />
+                    <input type="hidden" name="passcode" value={(*digits).clone()} />
+                </form>
+                <h2>{format!("Hi, {}", first_name(name))}</h2>
+                <p aria-live="polite">{format!("Code: {}", "●".repeat(digits.len()))}</p>
+                <div class="keypad" aria-label="4-digit passcode keypad">
+                    {for (1..=9).map(|number| {
+                        let digit = digit.clone();
+                        let value = number.to_string();
+                        let onclick = Callback::from(move |_| digit.emit(value.clone()));
+                        html! { <button type="button" {onclick} disabled={locked}>{number}</button> }
+                    })}
+                    <button type="button" onclick={erase} disabled={locked || digits.is_empty()}>{"Delete"}</button>
+                    <button type="button" onclick={zero} disabled={locked}>{"0"}</button>
+                </div>
+                <button type="button" class="change-name" onclick={change_name}>{"Choose a different name"}</button>
+            } else {
+                <p>{"Tap your name, then enter your 4-digit code."}</p>
+                <div class="name-picker" aria-label="Choose your name">
+                    {for props.users.iter().map(|name| {
+                        let choose = choose.clone();
+                        let name_for_click = name.clone();
+                        let onclick = Callback::from(move |_| choose.emit(name_for_click.clone()));
+                        html! { <button type="button" {onclick}>{name}</button> }
+                    })}
+                </div>
+                <p>{"Don't see your name? Ask the sound engineer to add you."}</p>
+            }
+        </section>
+    }
+}
+
+fn first_name(name: &str) -> &str {
+    name.split_whitespace().next().unwrap_or(name)
 }
 
 #[derive(Properties, PartialEq)]
