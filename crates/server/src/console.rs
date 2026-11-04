@@ -320,7 +320,7 @@ async fn serve_connection(
                         let _ = connected.send(true);
                         let _ = events.send(BridgeEvent::Connected);
                     }
-                    if outstanding == 0 && !*connected.borrow() {
+                    if outstanding == 0 && !*connected.borrow() && !solos.restoring() {
                         if !solos.statuses().is_empty() {
                             let state_snapshot = state.read().await.clone();
                             let (restore, scene_changed) = solos.restore_after_reconnect(
