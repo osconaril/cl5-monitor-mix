@@ -3,6 +3,7 @@ use super::layout::{Layout, LayoutEditor};
 use super::{refresh_performer_mixes, LiveState, PerformerMixes, User};
 use gloo_net::http::Request;
 use gloo_timers::callback::Interval;
+use wasm_bindgen::{closure::Closure, JsCast};
 use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
 
@@ -71,6 +72,8 @@ pub(super) fn performer(props: &PerformerProps) -> Html {
     let message = use_state(String::new);
     let layout = use_state(|| None::<Layout>);
     let editing = use_state(|| false);
+    let reordering = use_state(|| false);
+    let reorder_pending = use_mut_ref(|| false);
     let layout_error = use_state(String::new);
     let load_generation = use_state(|| 0u32);
     {
@@ -121,6 +124,93 @@ pub(super) fn performer(props: &PerformerProps) -> Html {
         })
         .collect();
     let shown_layout = layout.as_ref().cloned().unwrap_or_default();
+    {
+        let layout = layout.clone();
+        let error = layout_error.clone();
+        let reordering = reordering.clone();
+        let pending = reorder_pending.clone();
+        use_effect_with(
+            (layout.is_some(), shown_layout.clone()),
+            move |(_, saved)| {
+                let saved = saved.clone();
+                let handler = Closure::<dyn FnMut(web_sys::CustomEvent)>::new(
+                    move |event: web_sys::CustomEvent| {
+                        if *pending.borrow() || layout.is_none() {
+                            return;
+                        }
+                        let Some(detail) = event.detail().as_string() else {
+                            return;
+                        };
+                        let Ok((source, target, after)) =
+                            serde_json::from_str::<(u8, u8, bool)>(&detail)
+                        else {
+                            return;
+                        };
+                        let mut next = saved.clone();
+                        next.move_before(source, target);
+                        if after {
+                            next.move_before(target, source);
+                        }
+                        if next == saved {
+                            return;
+                        }
+                        *pending.borrow_mut() = true;
+                        reordering.set(true);
+                        let (layout, error, reordering, pending) = (
+                            layout.clone(),
+                            error.clone(),
+                            reordering.clone(),
+                            pending.clone(),
+                        );
+                        spawn_local(async move {
+                            let result = async {
+                                let request =
+                                    Request::put("/api/performer/layout").json(&next).map_err(
+                                        |_| "Could not prepare your channel order.".to_owned(),
+                                    )?;
+                                let response = request.send().await.map_err(|_| {
+                                    "Could not save your channel order. Check your connection."
+                                        .to_owned()
+                                })?;
+                                if !response.ok() {
+                                    return Err(response.text().await.unwrap_or_else(|_| {
+                                        "Channel reorder was refused.".into()
+                                    }));
+                                }
+                                response.json::<Layout>().await.map_err(|_| {
+                                    "Could not read the saved channel order.".to_owned()
+                                })
+                            }
+                            .await;
+                            match result {
+                                Ok(saved) => {
+                                    layout.set(Some(saved));
+                                    error.set(String::new());
+                                }
+                                Err(message) => error.set(message),
+                            }
+                            *pending.borrow_mut() = false;
+                            reordering.set(false);
+                        });
+                    },
+                );
+                let window = web_sys::window().expect("browser window");
+                window
+                    .add_event_listener_with_callback(
+                        "cl5-reorder",
+                        handler.as_ref().unchecked_ref(),
+                    )
+                    .expect("reorder listener");
+                move || {
+                    let _ = window.remove_event_listener_with_callback(
+                        "cl5-reorder",
+                        handler.as_ref().unchecked_ref(),
+                    );
+                    drop(handler);
+                }
+            },
+        );
+    }
     let edit_layout = {
         let editing = editing.clone();
         Callback::from(move |_| editing.set(true))
@@ -248,18 +338,20 @@ pub(super) fn performer(props: &PerformerProps) -> Html {
                 }
                 if let Some(notice) = &live.console.solo_notice { <p role="status">{notice}</p> }
                 <p role="alert">{(*layout_error).clone()}</p>
-                if !layout_error.is_empty() { <button onclick={retry_layout}>{"Retry loading layout"}</button> }
+                if !layout_error.is_empty() { <button onclick={retry_layout} disabled={*reordering}>{"Retry loading layout"}</button> }
                 if *editing {
                     <LayoutEditor layout={shown_layout.clone()} names={channel_names.clone()} saved={saved_layout} cancel={cancel_layout} />
                 } else {
-                <button onclick={edit_layout} disabled={layout.is_none()}>{"Edit channel layout"}</button>
-                <div class="channel-strips">
+                <button onclick={edit_layout} disabled={layout.is_none() || *reordering}>{"Edit channel layout"}</button>
+                if *reordering { <p role="status">{"Saving channel order…"}</p> }
+                <p class="fader-hint">{"Touch and hold a fader to adjust. Swipe to scroll."}</p>
+                <div class="channel-strips" tabindex="0" aria-label="Mix channels">
                 {for shown_layout.order.iter().copied().filter(|input| !shown_layout.hidden.contains(input)).map(|input| {
                     let value = |path| live.console.values.get(&format!("{path} {input} {mix}"));
                     let level = value(LEVEL).and_then(|v| v.parse::<i16>().ok()).filter(|v| *v == OFF || (-13800..=1000).contains(v));
                     let on = value(ON).and_then(|v| match v.as_str() { "1" => Some(true), "0" => Some(false), _ => None });
                     let name = channel_names[input as usize].clone();
-                    html! { <ChannelStrip key={format!("{mix}-{input}")} {mix} {input} {name} {level} {on} connected={live.connected} change={change.clone()} solo={solo.clone()}
+                    html! { <ChannelStrip key={format!("{mix}-{input}")} {mix} {input} {name} {level} {on} connected={live.connected} reorder_allowed={layout.is_some() && !*reordering} change={change.clone()} solo={solo.clone()}
                         soloed={live.console.solos.get(&mix.to_string()).is_some_and(|s| s.channels.contains(&input))}
                         solo_allowed={live.console.solos.get(&mix.to_string()).is_none_or(|s| s.owner == props.user.name)} /> }
                 })}
@@ -292,6 +384,7 @@ struct ChannelStripProps {
     level: Option<i16>,
     on: Option<bool>,
     connected: bool,
+    reorder_allowed: bool,
     change: Callback<(u8, u8, &'static str, String)>,
     solo: Callback<(u8, u8)>,
     soloed: bool,
@@ -356,16 +449,17 @@ fn channel_strip(props: &ChannelStripProps) -> Html {
         .unwrap_or(-139.0);
     html! {
         <article class="channel-strip" data-channel={props.input.to_string()}>
-            <h3>{&props.name}</h3>
+            <div class="strip-heading"><h3>{&props.name}</h3>
+            <button class="reorder-handle" aria-label={format!("Drag {} to reorder", props.name)} disabled={!props.reorder_allowed}>{"↕"}</button></div>
             <label class="send-control">
                 <span>{props.level.map(level_text).unwrap_or_else(|| "Level unavailable".into())}</span>
                 <input type="range" aria-label={format!("{} send level", props.name)} aria-valuetext={props.level.map(level_text)}
                     min="-139" max="10" step="any" value={position.to_string()} {oninput} disabled={!props.connected || props.level.is_none()} />
             </label>
-            <button onclick={mute} disabled={!props.connected || props.on.is_none()} aria-pressed={props.on.map(|on| (!on).to_string())}>
+            <button data-action="mute" onclick={mute} disabled={!props.connected || props.on.is_none()} aria-pressed={props.on.map(|on| (!on).to_string())}>
                 {if props.on == Some(false) { "Muted — unmute" } else { "Mute" }}
             </button>
-            <button onclick={solo} disabled={!props.connected || !props.solo_allowed || props.level.is_none()} aria-pressed={props.soloed.to_string()}>
+            <button data-action="solo" onclick={solo} disabled={!props.connected || !props.solo_allowed || props.level.is_none()} aria-pressed={props.soloed.to_string()}>
                 {if props.soloed { "Un-solo" } else { "Solo" }}
             </button>
         </article>

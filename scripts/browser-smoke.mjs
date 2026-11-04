@@ -155,6 +155,73 @@ try {
       throw new Error('Performer page overflow, small controls or incorrect wording');
     await rcp('get MIXER:Current/InCh/ToMix/Level 0 0', 'OK get MIXER:Current/InCh/ToMix/Level 0 0 -350');
   }
+  // Real touch input: a swipe begun on a fader scrolls without changing sound;
+  // holding first arms it. Orientation cancels a held gesture and retains the
+  // first visible strip. Count every browser control request during these steps.
+  await command(ws, 'Emulation.setTouchEmulationEnabled', {enabled:true, maxTouchPoints:1});
+  await evaluate(`(() => {
+    window.controlWrites = [];
+    const original = window.fetch;
+    window.fetch = function(input, init) {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url.includes('/api/console') || url.includes('/api/performer/solo'))
+        window.controlWrites.push(url);
+      return original.apply(this, arguments);
+    };
+  })()`);
+  const touch = (type, x, y) => command(ws, 'Input.dispatchTouchEvent', {
+    type, touchPoints: type === 'touchEnd' ? [] : [{x,y}]
+  });
+  for (const [width,height] of Array(3).fill([[390,844],[844,390]]).flat()) {
+    await command(ws,'Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:true});
+    await sleep(150);
+    await evaluate("document.querySelector('.channel-strips').scrollIntoView({block:'center'})");
+    const geometry = await evaluate(`(() => {
+      const a=document.querySelector('.channel-strips'), strips=a.children;
+      const first=strips[0].getBoundingClientRect(), second=strips[1].getBoundingClientRect();
+      const f=strips[0].querySelector('input').getBoundingClientRect();
+      return {rows:second.top>first.top, columns:second.left>first.left,
+        vertical:getComputedStyle(strips[0].querySelector('input')).writingMode==='vertical-lr',
+        x:f.x+f.width/2, y:f.y+f.height/2,
+        scene:document.querySelector('.scene-bar').getBoundingClientRect().height};
+    })()`);
+    if (width<height ? !geometry.rows || geometry.vertical : !geometry.columns || !geometry.vertical || geometry.scene>40)
+      throw new Error('Wrong fader orientation or scene bar: '+JSON.stringify(geometry));
+    await touch('touchStart',geometry.x,geometry.y);
+    await touch('touchMove',geometry.x-(width>height?60:0),geometry.y-(width<height?60:0));
+    await touch('touchEnd');
+    if (!await evaluate(`document.querySelector('.channel-strips').${width>height?'scrollLeft':'scrollTop'}>0 && window.controlWrites.length===0`))
+      throw new Error('A swipe on a fader failed to scroll or changed sound at '+width+' '+JSON.stringify(geometry)+' '+await evaluate("JSON.stringify({scroll:document.querySelector('.channel-strips').scrollTop,left:document.querySelector('.channel-strips').scrollLeft,writes:window.controlWrites,scripts:[...document.scripts].map(s=>s.src)})"));
+    await evaluate(`(() => {
+      const a=document.querySelector('.channel-strips'), c=a.querySelector('[data-channel="40"]');
+      const b=a.getBoundingClientRect(), r=c.getBoundingClientRect();
+      a.scrollLeft += ${width>height?'r.left-b.left':'0'};
+      a.scrollTop += ${width<height?'r.top-b.top':'0'};
+    })()`);
+    await evaluate("new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))");
+    await command(ws,'Emulation.setDeviceMetricsOverride',{width:height,height:width,deviceScaleFactor:1,mobile:true});
+    await sleep(150);
+    if (!await evaluate(`(() => {const a=document.querySelector('.channel-strips'), b=a.getBoundingClientRect(), r=a.querySelector('[data-channel="40"]').getBoundingClientRect(); return ${width<height?'Math.abs(r.left-b.left)<2':'Math.abs(r.top-b.top)<2'} && window.controlWrites.length===0;})()`))
+      throw new Error('Rotation moved the visible channel or submitted a control request at '+width+' '+await evaluate("JSON.stringify({writes:window.controlWrites,area:document.querySelector('.channel-strips').getBoundingClientRect().toJSON(),strip:document.querySelector('[data-channel=\"40\"]').getBoundingClientRect().toJSON(),scroll:document.querySelector('.channel-strips').scrollTop,left:document.querySelector('.channel-strips').scrollLeft})"));
+    await evaluate("document.querySelector('.channel-strips').scrollTo(0,0)");
+    await sleep(100);
+  }
+  await command(ws,'Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
+  await sleep(150);
+  await evaluate("document.querySelector('.channel-strips').scrollIntoView({block:'center'})");
+  const faderPoint = await evaluate(`(() => {const r=${strip}.querySelector('input').getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2};})()`);
+  await touch('touchStart',faderPoint.x,faderPoint.y);
+  await sleep(260);
+  await touch('touchMove',faderPoint.x+10,faderPoint.y);
+  await expectBrowser("window.controlWrites.length===1", 'A deliberate hold and move did not adjust the fader');
+  await command(ws,'Emulation.setDeviceMetricsOverride',{width:844,height:390,deviceScaleFactor:1,mobile:true});
+  await sleep(150);
+  await touch('touchMove',faderPoint.x+20,faderPoint.y);
+  await touch('touchEnd');
+  if (!await evaluate("window.controlWrites.length===1 && !document.querySelector('[data-adjusting]')"))
+    throw new Error('Rotation did not cancel the active fader gesture');
+  await rcp('set MIXER:Current/InCh/ToMix/Level 0 0 -350', 'OK');
+  await expectBrowser(`${strip}.innerText.includes('-3.5 dB')`, 'Touch test reset did not reach browser');
   await evaluate(`(() => {const f = ${strip}.querySelector('input'); f.value='-3.49'; f.dispatchEvent(new Event('input',{bubbles:true}));})()`);
   await expectBrowser(`${strip}.innerText.includes('-3 dB')`, 'Upward fractional move did not snap to -3 dB');
   await rcp('get MIXER:Current/InCh/ToMix/Level 0 0', 'OK get MIXER:Current/InCh/ToMix/Level 0 0 -300');
@@ -162,9 +229,48 @@ try {
   await expectBrowser(`${strip}.innerText.includes('-3.5 dB')`, 'Engineer changes did not reach open screen');
   await evaluate(`(() => {const f = ${strip}.querySelector('input'); f.value='-3.51'; f.dispatchEvent(new Event('input',{bubbles:true}));})()`);
   await expectBrowser(`${strip}.innerText.includes('-4 dB')`, 'Downward fractional move did not snap to -4 dB');
-  await evaluate(`${strip}.querySelector('button').click()`);
-  await expectBrowser(`${strip}.querySelector('button').getAttribute('aria-pressed') === 'true'`, 'Mute readback did not reach the browser');
+  await evaluate(`${strip}.querySelector('[data-action="mute"]').click()`);
+  await expectBrowser(`${strip}.querySelector('[data-action="mute"]').getAttribute('aria-pressed') === 'true'`, 'Mute readback did not reach the browser');
   await rcp('get MIXER:Current/InCh/ToMix/On 0 0', 'OK get MIXER:Current/InCh/ToMix/On 0 0 0');
+  async function dragStrip(source, target, after=false) {
+    const points = await evaluate(`(() => {
+      const s=document.querySelector('[data-channel="${source}"] .reorder-handle').getBoundingClientRect();
+      const t=document.querySelector('[data-channel="${target}"]').getBoundingClientRect();
+      return {sx:s.x+s.width/2,sy:s.y+s.height/2,tx:t.x+t.width*(${after}?0.75:0.25),ty:matchMedia("(orientation: landscape)").matches?t.y+22:t.y+t.height*(${after}?0.75:0.1)};
+    })()`);
+    await touch('touchStart',points.sx,points.sy);
+    await touch('touchMove',points.tx,points.ty);
+    await touch('touchEnd');
+  }
+  const writesBeforeReorder = await evaluate("window.controlWrites.length");
+  for (const [width,height] of [[390,844],[844,390]]) {
+    await command(ws,'Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:true});
+    await sleep(150);
+    await evaluate("document.querySelector('.channel-strips').scrollTo(0,0); document.querySelector('.channel-strips').scrollIntoView({block:'center'})");
+    await dragStrip(1,0);
+    await expectBrowser("document.querySelector('.channel-strip').dataset.channel==='1' && !document.querySelector('.reorder-handle').disabled", 'Touch drag did not reorder actual strips');
+    if (!await evaluate("fetch('/api/performer/layout').then(r=>r.json()).then(l=>l.order[0]===1 && l.order[1]===0)"))
+      throw new Error('Touch drag order was not persisted');
+    await dragStrip(1,0,true);
+    await expectBrowser("document.querySelector('.channel-strip').dataset.channel==='0' && !document.querySelector('.reorder-handle').disabled", 'Touch drag did not restore strip order');
+  }
+  // A refused reorder must not present a new order as saved.
+  await evaluate(`(() => {
+    const original=window.fetch;
+    let refuse=true;
+    window.fetch=function(input,init) {
+      const url=typeof input==='string'?input:input.url;
+      if (refuse && url.includes('/api/performer/layout') && (init?.method??input.method)==='PUT') {
+        refuse=false;
+        return Promise.resolve(new Response('Channel reorder was refused.',{status:403}));
+      }
+      return original.apply(this,arguments);
+    };
+  })()`);
+  await dragStrip(1,0);
+  await expectBrowser("document.body.innerText.includes('Channel reorder was refused.') && !document.querySelector('.reorder-handle').disabled", 'Refused reorder did not show an error');
+  if (!await evaluate(`document.querySelector('.channel-strip').dataset.channel==='0' && window.controlWrites.length===${writesBeforeReorder}`))
+    throw new Error('Reorder changed sound or a refused reorder changed the displayed order');
   // Presentation settings must survive a fresh session without changing sound.
   const clickText = text => evaluate(`(() => { const b=[...document.querySelectorAll('button')].find(b=>b.textContent===${JSON.stringify(text)}); if(!b) throw new Error('Missing button'); b.click(); })()`);
   await clickText('Edit channel layout');
@@ -228,7 +334,7 @@ try {
   // Personal solo restores exact wire levels and keeps engineer changes.
   await rcp('set MIXER:Current/InCh/ToMix/Level 2 0 -350', 'OK');
   await expectBrowser("document.querySelector('[data-channel=\"2\"]').innerText.includes('-3.5 dB')", 'Solo baseline did not reach the browser');
-  const soloButton = input => `document.querySelector('[data-channel="${input}"]').querySelector('button:last-child')`;
+  const soloButton = input => `document.querySelector('[data-channel="${input}"]').querySelector('[data-action="solo"]')`;
   await evaluate(`${soloButton(0)}.click()`);
   await expectBrowser("document.body.innerText.includes('Solo active (by ') && document.querySelector('[data-channel=\"2\"]').innerText.includes('Off')", 'Solo did not turn the other send off');
   await rcp('get MIXER:Current/InCh/ToMix/Level 2 0', 'OK get MIXER:Current/InCh/ToMix/Level 2 0 -32768');
@@ -248,9 +354,9 @@ try {
   await stop(fake); fake = null;
   await expectBrowser("document.querySelector('.scene-bar').innerText.includes('Console disconnected — scene unknown')", 'Disconnected console left stale scene name');
   await evaluate("document.querySelector('.mix-picker button').click()");
-  await expectBrowser("[...document.querySelectorAll('.channel-strip input, .channel-strip button')].every(e=>e.disabled)", 'Disconnected controls remained enabled');
+  await expectBrowser("[...document.querySelectorAll('.channel-strip input, .channel-strip button:not(.reorder-handle)')].every(e=>e.disabled)", 'Disconnected controls remained enabled');
   ws.close();
-  console.log('Browser smoke passed at 390x844 and 844x390, including performer picker, live faders/mute, saved layouts/groups and scenes.');
+  console.log('Browser smoke passed at 390x844 and 844x390, including touch-safe faders, rotation, strip drag reorder, performer picker, live controls, saved layouts/groups and scenes.');
 } finally {
   engineer?.destroy();
   await Promise.all([stop(server), stop(browser), stop(fake)]);

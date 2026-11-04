@@ -29,7 +29,7 @@ impl Default for Layout {
 }
 
 impl Layout {
-    fn move_before(&mut self, source: u8, target: u8) {
+    pub(super) fn move_before(&mut self, source: u8, target: u8) {
         if source == target || !self.order.contains(&source) || !self.order.contains(&target) {
             return;
         }
