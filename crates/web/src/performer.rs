@@ -370,7 +370,7 @@ pub(super) fn performer(props: &PerformerProps) -> Html {
                 if *editing {
                     <LayoutEditor layout={shown_layout.clone()} names={channel_names.clone()} saved={saved_layout} cancel={cancel_layout} />
                 } else {
-                <button onclick={edit_layout} disabled={layout.is_none() || *reordering}>{"Edit channel layout"}</button>
+                <button onclick={edit_layout} disabled={layout.is_none() || *reordering}>{"Arrange"}</button>
                 if *reordering { <p role="status">{"Saving channel order…"}</p> }
                 <p class="fader-hint">{"Touch and hold a fader to adjust. Swipe to scroll."}</p>
                 <div class="channel-strips" tabindex="0" aria-label="Mix channels">
@@ -394,7 +394,7 @@ pub(super) fn performer(props: &PerformerProps) -> Html {
                 if !shown_layout.hidden.is_empty() {
                     <section class="hidden-channels"><h2>{"Hidden"}</h2>
                     <p>{shown_layout.hidden.iter().map(|input| channel_names[*input as usize].clone()).collect::<Vec<_>>().join(", ")}</p>
-                    <p>{"Use Edit channel layout to show these channels again."}</p></section>
+                    <p>{"Open Arrange to show these channels again."}</p></section>
                 }
                 }
             } else {
@@ -518,7 +518,7 @@ fn channel_strip(props: &ChannelStripProps) -> Html {
                 {if props.on == Some(false) { "Muted — unmute" } else { "Mute" }}
             </button>
             <button data-action="solo" onclick={solo} disabled={!props.connected || !props.solo_allowed || props.level.is_none()} aria-pressed={props.soloed.to_string()}>
-                {if props.soloed { "Un-solo" } else { "Solo" }}
+                {"Solo"}
             </button>
         </article>
     }
