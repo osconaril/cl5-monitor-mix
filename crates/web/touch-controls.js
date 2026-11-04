@@ -63,7 +63,17 @@
     const delta = position < start + 30 ? -12 : position > end - 30 ? 12 : 0;
     if (landscape()) r.area.scrollLeft += delta;
     else r.area.scrollTop += delta;
-    const target = document.elementFromPoint(r.x, r.y)?.closest('.channel-strip');
+    // Pointer capture can make elementFromPoint return the captured handle in
+    // some browsers.  Find the strip from the pointer coordinates as a
+    // fallback, so a real captured touch and the browser smoke harness both
+    // select the strip under the drop position.
+    let target = document.elementFromPoint(r.x, r.y)?.closest('.channel-strip');
+    if (target?.parentElement !== r.area) {
+      target = [...r.area.children].find(child => {
+        const box = child.getBoundingClientRect();
+        return r.x >= box.left && r.x <= box.right && r.y >= box.top && r.y <= box.bottom;
+      });
+    }
     r.target = target?.parentElement === r.area && !target.classList.contains('group-strip') ? target : null;
     r.target?.setAttribute('data-drop-target', '');
   }
