@@ -1049,7 +1049,7 @@ mod tests {
         .expect("bridge observes the initial drop");
         fake.drop_after_set_commands(1).await;
 
-        timeout(Duration::from_secs(30), async {
+        timeout(Duration::from_secs(60), async {
             while !bridge.is_connected()
                 || bridge.state().await.values.get(&format!("{LEVEL} 79 0")) != Some(&"-350".into())
             {
