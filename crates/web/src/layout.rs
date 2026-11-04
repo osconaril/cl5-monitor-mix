@@ -44,6 +44,7 @@ impl Layout {
 }
 
 #[derive(Properties, PartialEq)]
+#[allow(dead_code)]
 pub(super) struct EditorProps {
     pub layout: Layout,
     pub names: Vec<String>,

@@ -1,5 +1,5 @@
 //! Performer controls use console readback as the displayed source of truth.
-use super::layout::{Layout, LayoutEditor};
+use super::layout::Layout;
 use super::{refresh_performer_mixes, LiveState, PerformerMixes, User};
 use gloo_net::http::Request;
 use gloo_timers::callback::Interval;
@@ -236,12 +236,54 @@ pub(super) fn performer(props: &PerformerProps) -> Html {
         let editing = editing.clone();
         Callback::from(move |_| editing.set(false))
     };
-    let saved_layout = {
+    let toggle_hidden = {
         let layout = layout.clone();
-        let editing = editing.clone();
-        Callback::from(move |saved| {
-            layout.set(Some(saved));
-            editing.set(false);
+        let error = layout_error.clone();
+        let reordering = reordering.clone();
+        let current = shown_layout.clone();
+        Callback::from(move |input: u8| {
+            if *reordering {
+                return;
+            }
+            let mut next = current.clone();
+            if next.hidden.contains(&input) {
+                next.hidden.retain(|channel| *channel != input);
+            } else {
+                next.hidden.push(input);
+            }
+            reordering.set(true);
+            let (layout, error, reordering) = (layout.clone(), error.clone(), reordering.clone());
+            spawn_local(async move {
+                let result = async {
+                    let response = Request::put("/api/performer/layout")
+                        .json(&next)
+                        .map_err(|_| "Could not prepare your layout.".to_owned())?
+                        .send()
+                        .await
+                        .map_err(|_| {
+                            "Could not save your layout. Check your connection.".to_owned()
+                        })?;
+                    if !response.ok() {
+                        return Err(response
+                            .text()
+                            .await
+                            .unwrap_or_else(|_| "Your layout was refused.".into()));
+                    }
+                    response
+                        .json::<Layout>()
+                        .await
+                        .map_err(|_| "Could not read back your saved layout.".to_owned())
+                }
+                .await;
+                match result {
+                    Ok(saved) => {
+                        layout.set(Some(saved));
+                        error.set(String::new());
+                    }
+                    Err(message) => error.set(message),
+                }
+                reordering.set(false);
+            });
         })
     };
     let retry_layout = {
@@ -346,6 +388,31 @@ pub(super) fn performer(props: &PerformerProps) -> Html {
             });
         })
     };
+    let clear_solo = {
+        let message = message.clone();
+        Callback::from(move |mix: u8| {
+            let message = message.clone();
+            spawn_local(async move {
+                let request = Request::post("/api/performer/solo")
+                    .json(&serde_json::json!({"mix": mix, "channels": []}));
+                match request {
+                    Ok(request) => match request.send().await {
+                        Ok(response) if response.ok() => message.set(String::new()),
+                        Ok(response) => message.set(
+                            response
+                                .text()
+                                .await
+                                .unwrap_or_else(|_| "Solo was refused.".into()),
+                        ),
+                        Err(_) => message.set(
+                            "The show machine could not be reached. Check your connection.".into(),
+                        ),
+                    },
+                    Err(_) => message.set("Could not prepare solo. Try again.".into()),
+                }
+            });
+        })
+    };
     let back = {
         let selected = selected.clone();
         Callback::from(move |_| selected.set(None))
@@ -360,24 +427,30 @@ pub(super) fn performer(props: &PerformerProps) -> Html {
             if let Some(mix) = active.as_deref().and_then(mix_index) {
                 <div class="mix-heading"><h2>{active.clone().unwrap_or_default()}</h2>
                 if assignments.len() > 1 { <button onclick={back}>{"Choose another mix"}</button> }</div>
-                if !live.connected { <p role="alert">{"Console disconnected — controls are unavailable until it reconnects."}</p> }
+                if !live.connected { <p role="alert">{"Lost the sound desk. Trying again…"}</p> }
                 if let Some(status) = live.console.solos.get(&mix.to_string()) {
-                    <p role="status">{format!("Solo active (by {})", status.owner)}</p>
+                    <section class="solo-banner" role="status">
+                    if status.owner == props.user.name {
+                        <strong>{format!("Solo: {}", status.channels.iter().map(|input| channel_names[*input as usize].clone()).collect::<Vec<_>>().join(", "))}</strong>
+                        <button onclick={{ let clear_solo = clear_solo.clone(); Callback::from(move |_| clear_solo.emit(mix)) }}>{"Clear solo"}</button>
+                    } else {
+                        <strong>{format!("{} has Solo on for {}. Ask {} or the sound engineer to turn it off.", status.owner, status.channels.iter().map(|input| channel_names[*input as usize].clone()).collect::<Vec<_>>().join(", "), status.owner)}</strong>
+                    }
+                    </section>
                 }
                 if let Some(notice) = &live.console.solo_notice { <p role="status">{notice}</p> }
                 <p role="alert">{(*layout_error).clone()}</p>
                 if !layout_error.is_empty() { <button onclick={retry_layout} disabled={*reordering}>{"Retry loading layout"}</button> }
+                <div class="arrange-controls">
                 if *editing {
-                    <LayoutEditor layout={shown_layout.clone()} names={channel_names.clone()} saved={saved_layout} cancel={cancel_layout} />
+                    <p>{"Drag a channel by its dotted handle to move it. Hide tucks one away. Changes save as you go."}</p>
+                    <button onclick={cancel_layout} disabled={*reordering}>{"Done"}</button>
                 } else {
-                <button onclick={edit_layout} disabled={layout.is_none() || *reordering}>{"Arrange"}</button>
+                    <button onclick={edit_layout} disabled={layout.is_none() || *reordering}>{"Arrange"}</button>
+                }
+                </div>
                 if *reordering { <p role="status">{"Saving channel order…"}</p> }
-                <p class="fader-hint">{"Touch and hold a fader to adjust. Swipe to scroll."}</p>
                 <div class="channel-strips" tabindex="0" aria-label="Mix channels">
-                {for shown_layout.groups.iter().map(|group| html! {
-                    <GroupStrip key={format!("{mix}-{}", group.id)} mix={mix} group={group.clone()} connected={live.connected}
-                        levels={group.channels.iter().map(|input| live.console.values.get(&format!("{LEVEL} {input} {mix}")).and_then(|v| v.parse::<i16>().ok())).collect::<Vec<_>>()} />
-                })}
                 {for shown_layout.order.iter().copied().filter(|input| !shown_layout.hidden.contains(input)).map(|input| {
                     let value = |path| live.console.values.get(&format!("{path} {input} {mix}"));
                     let level = value(LEVEL).and_then(|v| v.parse::<i16>().ok()).filter(|v| *v == OFF || (-13800..=1000).contains(v));
@@ -386,16 +459,18 @@ pub(super) fn performer(props: &PerformerProps) -> Html {
                     let on = value(ON).and_then(|v| match v.as_str() { "1" => Some(true), "0" => Some(false), _ => None });
                     let name = channel_names[input as usize].clone();
                     let color = live.console.values.get(&format!("MIXER:Current/InCh/Label/Color {input} 0")).cloned();
-                    html! { <ChannelStrip key={format!("{mix}-{input}")} {mix} {input} {name} {color} {level} {on} {stereo} {pan} connected={live.connected} reorder_allowed={layout.is_some() && !*reordering} change={change.clone()} solo={solo.clone()}
+                    let solo_status = live.console.solos.get(&mix.to_string());
+                    let mine = solo_status.is_some_and(|status| status.owner == props.user.name);
+                    let paused = solo_status.is_some_and(|status| !status.channels.contains(&input));
+                    html! { <ChannelStrip key={format!("{mix}-{input}")} {mix} {input} {name} {color} {level} {on} {stereo} {pan} connected={live.connected} reorder_allowed={*editing && !*reordering} arranging={*editing} paused={paused} toggle_hidden={toggle_hidden.clone()} change={change.clone()} solo={solo.clone()}
                         soloed={live.console.solos.get(&mix.to_string()).is_some_and(|s| s.channels.contains(&input))}
-                        solo_allowed={live.console.solos.get(&mix.to_string()).is_none_or(|s| s.owner == props.user.name)} /> }
+                        solo_allowed={solo_status.is_none() || mine} /> }
                 })}
                 </div>
                 if !shown_layout.hidden.is_empty() {
-                    <section class="hidden-channels"><h2>{"Hidden"}</h2>
-                    <p>{shown_layout.hidden.iter().map(|input| channel_names[*input as usize].clone()).collect::<Vec<_>>().join(", ")}</p>
-                    <p>{"Open Arrange to show these channels again."}</p></section>
-                }
+                    <section class="hidden-channels"><h2>{"Hidden. You still hear these in your mix."}</h2>
+                    if *editing { {for shown_layout.hidden.iter().copied().map(|input| { let toggle_hidden = toggle_hidden.clone(); html! { <button onclick={Callback::from(move |_| toggle_hidden.emit(input))}>{format!("Show {}", channel_names[input as usize])}</button> } })} }
+                    else { <p>{format!("{} hidden channels, still playing in your ears.", shown_layout.hidden.len())}</p> }</section>
                 }
             } else {
                 <p>{if mixes.is_none() { "Loading your mix assignments…" } else if assignments.is_empty() { "No mixes assigned yet. Ask the engineer to assign your mix." } else { "Choose your mix." }}</p>
@@ -423,6 +498,9 @@ struct ChannelStripProps {
     pan: Option<i16>,
     connected: bool,
     reorder_allowed: bool,
+    arranging: bool,
+    paused: bool,
+    toggle_hidden: Callback<u8>,
     change: Callback<(u8, u8, &'static str, String)>,
     solo: Callback<(u8, u8)>,
     soloed: bool,
@@ -485,6 +563,11 @@ fn channel_strip(props: &ChannelStripProps) -> Html {
         let (mix, input) = (props.mix, props.input);
         Callback::from(move |_| callback.emit((mix, input)))
     };
+    let hide = {
+        let toggle_hidden = props.toggle_hidden.clone();
+        let input = props.input;
+        Callback::from(move |_| toggle_hidden.emit(input))
+    };
     let (color, color_name) = channel_color(props.color.as_deref());
     let position = props
         .level
@@ -501,30 +584,37 @@ fn channel_strip(props: &ChannelStripProps) -> Html {
             <div class="strip-heading">
             <span class="channel-color" role="img" aria-label={format!("Channel color: {color_name}")} title={format!("Channel color: {color_name}")} style={format!("background-color: {color}")}></span>
             <h3>{&props.name}</h3>
-            <button class="reorder-handle" aria-label={format!("Drag {} to reorder", props.name)} disabled={!props.reorder_allowed}>{"↕"}</button></div>
+            if props.arranging {
+                <button class="reorder-handle" aria-label={format!("Drag {} to reorder", props.name)} disabled={!props.reorder_allowed}>{"⠿"}</button>
+                <button onclick={hide}>{"Hide"}</button>
+            }
+            </div>
+            if !props.arranging {
             <label class="send-control">
                 <span>{props.level.map(level_text).unwrap_or_else(|| "Level unavailable".into())}</span>
                 <input type="range" aria-label={format!("{} send level", props.name)} aria-valuetext={props.level.map(level_text)}
-                    min="-139" max="10" step="any" value={position.to_string()} {oninput} disabled={!props.connected || props.level.is_none()} />
+                    min="-139" max="10" step="any" value={position.to_string()} {oninput} disabled={!props.connected || props.level.is_none() || props.paused} />
             </label>
             if props.stereo {
                 <label class="send-control pan-control">
                     <span>{props.pan.map(|v| if v == 0 { "Pan: center".into() } else { format!("Pan: {} {}", if v < 0 { "L" } else { "R" }, v.abs()) }).unwrap_or_else(|| "Pan unavailable".into())}</span>
                     <input type="range" aria-label={format!("{} pan", props.name)} min="-63" max="63" step="1"
-                        value={props.pan.unwrap_or(0).to_string()} oninput={pan_input} disabled={!props.connected || props.pan.is_none()} />
+                        value={props.pan.unwrap_or(0).to_string()} oninput={pan_input} disabled={!props.connected || props.pan.is_none() || props.paused} />
                 </label>
             }
-            <button data-action="mute" onclick={mute} disabled={!props.connected || props.on.is_none()} aria-pressed={props.on.map(|on| (!on).to_string())}>
+            <button data-action="mute" onclick={mute} disabled={!props.connected || props.on.is_none() || props.paused} aria-pressed={props.on.map(|on| (!on).to_string())}>
                 {if props.on == Some(false) { "Muted — unmute" } else { "Mute" }}
             </button>
             <button data-action="solo" onclick={solo} disabled={!props.connected || !props.solo_allowed || props.level.is_none()} aria-pressed={props.soloed.to_string()}>
-                {"Solo"}
+                {if props.paused { "+ Add" } else { "Solo" }}
             </button>
+            }
         </article>
     }
 }
 
 #[derive(Properties, PartialEq)]
+#[allow(dead_code)]
 struct GroupStripProps {
     mix: u8,
     group: super::layout::Group,

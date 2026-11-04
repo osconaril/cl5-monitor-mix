@@ -602,9 +602,9 @@ fn scene_bar(props: &SceneBarProps) -> Html {
             )
         }
         _ => (
-            "Console".into(),
-            "Console disconnected — scene unknown".into(),
-            "Console disconnected — scene unknown".into(),
+            String::new(),
+            "Lost the sound desk. Trying again…".into(),
+            "Sound desk disconnected · Monitor Mix".into(),
         ),
     };
     if let Some(window) = web_sys::window() {
