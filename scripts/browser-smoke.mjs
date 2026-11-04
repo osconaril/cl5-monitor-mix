@@ -225,8 +225,24 @@ try {
   await expectBrowser("!document.querySelector('.layout-editor') && document.querySelector('.channel-strip').dataset.channel==='1'", 'Cancel changed displayed order');
   await rcp('get MIXER:Current/InCh/ToMix/Level 0 0', 'OK get MIXER:Current/InCh/ToMix/Level 0 0 -400');
   await rcp('get MIXER:Current/InCh/ToMix/On 0 0', 'OK get MIXER:Current/InCh/ToMix/On 0 0 0');
+  // Personal solo restores exact wire levels and keeps engineer changes.
+  await rcp('set MIXER:Current/InCh/ToMix/Level 2 0 -350', 'OK');
+  await expectBrowser("document.querySelector('[data-channel=\"2\"]').innerText.includes('-3.5 dB')", 'Solo baseline did not reach the browser');
+  const soloButton = input => `document.querySelector('[data-channel="${input}"]').querySelector('button:last-child')`;
+  await evaluate(`${soloButton(0)}.click()`);
+  await expectBrowser("document.body.innerText.includes('Solo active (by ') && document.querySelector('[data-channel=\"2\"]').innerText.includes('Off')", 'Solo did not turn the other send off');
+  await rcp('get MIXER:Current/InCh/ToMix/Level 2 0', 'OK get MIXER:Current/InCh/ToMix/Level 2 0 -32768');
+  await rcp('set MIXER:Current/InCh/ToMix/Level 3 0 -725', 'OK');
+  await expectBrowser("document.querySelector('[data-channel=\"3\"]').innerText.includes('-7.25 dB')", 'Engineer change during solo missing');
+  await evaluate(`${soloButton(0)}.click()`);
+  await expectBrowser("!document.body.innerText.includes('Solo active (by ') && document.querySelector('[data-channel=\"2\"]').innerText.includes('-3.5 dB')", 'Solo did not restore fractional level');
+  await rcp('get MIXER:Current/InCh/ToMix/Level 3 0', 'OK get MIXER:Current/InCh/ToMix/Level 3 0 -725');
+  await evaluate(`${soloButton(1)}.click()`);
+  await expectBrowser("document.body.innerText.includes('Solo active (by ')", 'Second solo did not start');
   await rcp('ssrecall_ex MIXER:Lib/Scene 2', 'OK');
   await expectBrowser("document.title === 'Show · Monitor Mix' && document.querySelector('.scene-bar').innerText.includes('Show')", 'Scene recall did not update mix page/title');
+  await expectBrowser("document.body.innerText.includes('Scene changed — solo cleared') && !document.body.innerText.includes('Solo active (by ')", 'Scene recall did not clear solo and explain why');
+  await rcp('get MIXER:Current/InCh/ToMix/Level 0 0', 'OK get MIXER:Current/InCh/ToMix/Level 0 0 -1200');
   await evaluate("[...document.querySelectorAll('button')].find(b=>b.textContent==='Choose another mix').click()");
   await expectBrowser("document.querySelectorAll('.mix-picker button').length === 2 && document.title === 'Show · Monitor Mix'", 'Picker lost current scene');
   await stop(fake); fake = null;

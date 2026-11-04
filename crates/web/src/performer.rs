@@ -192,6 +192,45 @@ pub(super) fn performer(props: &PerformerProps) -> Html {
             },
         )
     };
+    let solo = {
+        let message = message.clone();
+        let live = live.clone();
+        Callback::from(move |(mix, input): (u8, u8)| {
+            let mut channels = live
+                .console
+                .solos
+                .get(&mix.to_string())
+                .map(|s| s.channels.clone())
+                .unwrap_or_default();
+            if !channels.remove(&input) {
+                channels.insert(input);
+            }
+            let message = message.clone();
+            spawn_local(async move {
+                let request = Request::post("/api/performer/solo")
+                    .json(&serde_json::json!({"mix": mix, "channels": channels}));
+                let response = match request {
+                    Ok(request) => request.send().await,
+                    Err(_) => {
+                        message.set("Could not prepare solo. Try again.".into());
+                        return;
+                    }
+                };
+                match response {
+                    Ok(response) if response.ok() => message.set(String::new()),
+                    Ok(response) => message.set(
+                        response
+                            .text()
+                            .await
+                            .unwrap_or_else(|_| "Solo was refused.".into()),
+                    ),
+                    Err(_) => message.set(
+                        "The show machine could not be reached. Check your connection.".into(),
+                    ),
+                }
+            });
+        })
+    };
     let back = {
         let selected = selected.clone();
         Callback::from(move |_| selected.set(None))
@@ -204,6 +243,10 @@ pub(super) fn performer(props: &PerformerProps) -> Html {
                 <div class="mix-heading"><h2>{active.clone().unwrap_or_default()}</h2>
                 if assignments.len() > 1 { <button onclick={back}>{"Choose another mix"}</button> }</div>
                 if !live.connected { <p role="alert">{"Console disconnected — controls are unavailable until it reconnects."}</p> }
+                if let Some(status) = live.console.solos.get(&mix.to_string()) {
+                    <p role="status">{format!("Solo active (by {})", status.owner)}</p>
+                }
+                if let Some(notice) = &live.console.solo_notice { <p role="status">{notice}</p> }
                 <p role="alert">{(*layout_error).clone()}</p>
                 if !layout_error.is_empty() { <button onclick={retry_layout}>{"Retry loading layout"}</button> }
                 if *editing {
@@ -216,7 +259,9 @@ pub(super) fn performer(props: &PerformerProps) -> Html {
                     let level = value(LEVEL).and_then(|v| v.parse::<i16>().ok()).filter(|v| *v == OFF || (-13800..=1000).contains(v));
                     let on = value(ON).and_then(|v| match v.as_str() { "1" => Some(true), "0" => Some(false), _ => None });
                     let name = channel_names[input as usize].clone();
-                    html! { <ChannelStrip key={format!("{mix}-{input}")} {mix} {input} {name} {level} {on} connected={live.connected} change={change.clone()} /> }
+                    html! { <ChannelStrip key={format!("{mix}-{input}")} {mix} {input} {name} {level} {on} connected={live.connected} change={change.clone()} solo={solo.clone()}
+                        soloed={live.console.solos.get(&mix.to_string()).is_some_and(|s| s.channels.contains(&input))}
+                        solo_allowed={live.console.solos.get(&mix.to_string()).is_none_or(|s| s.owner == props.user.name)} /> }
                 })}
                 </div>
                 if !shown_layout.hidden.is_empty() {
@@ -248,6 +293,9 @@ struct ChannelStripProps {
     on: Option<bool>,
     connected: bool,
     change: Callback<(u8, u8, &'static str, String)>,
+    solo: Callback<(u8, u8)>,
+    soloed: bool,
+    solo_allowed: bool,
 }
 
 #[function_component(ChannelStrip)]
@@ -291,6 +339,11 @@ fn channel_strip(props: &ChannelStripProps) -> Html {
             }
         })
     };
+    let solo = {
+        let callback = props.solo.clone();
+        let (mix, input) = (props.mix, props.input);
+        Callback::from(move |_| callback.emit((mix, input)))
+    };
     let position = props
         .level
         .map(|v| {
@@ -311,6 +364,9 @@ fn channel_strip(props: &ChannelStripProps) -> Html {
             </label>
             <button onclick={mute} disabled={!props.connected || props.on.is_none()} aria-pressed={props.on.map(|on| (!on).to_string())}>
                 {if props.on == Some(false) { "Muted — unmute" } else { "Mute" }}
+            </button>
+            <button onclick={solo} disabled={!props.connected || !props.solo_allowed || props.level.is_none()} aria-pressed={props.soloed.to_string()}>
+                {if props.soloed { "Un-solo" } else { "Solo" }}
             </button>
         </article>
     }

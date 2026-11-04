@@ -83,14 +83,34 @@ struct BridgeState {
     scene_name: Option<String>,
     #[serde(default)]
     values: HashMap<String, String>,
+    #[serde(default)]
+    solos: HashMap<String, SoloStatus>,
+    #[serde(default)]
+    solo_notice: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+struct SoloStatus {
+    owner: String,
+    channels: std::collections::BTreeSet<u8>,
 }
 
 #[derive(Debug, Deserialize)]
 enum BridgeEvent {
+    SoloChanged {
+        solos: HashMap<String, SoloStatus>,
+        notice: Option<String>,
+    },
     Connected,
     Disconnected,
-    Value { key: String, value: String },
-    SceneRecalled { number: u16, name: Option<String> },
+    Value {
+        key: String,
+        value: String,
+    },
+    SceneRecalled {
+        number: u16,
+        name: Option<String>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -291,6 +311,10 @@ impl Reducible for LiveState {
                     next.connected = connected;
                     next.console = state;
                 }
+                BridgeMessage::Event(BridgeEvent::SoloChanged { solos, notice }) => {
+                    next.console.solos = solos;
+                    next.console.solo_notice = notice;
+                }
                 BridgeMessage::Event(BridgeEvent::Connected) => next.connected = true,
                 BridgeMessage::Event(BridgeEvent::Disconnected) => next.connected = false,
                 BridgeMessage::Event(BridgeEvent::Value { key, value }) => {
@@ -478,6 +502,25 @@ fn error_notice(search: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{connection_notice, error_notice, SCENE_RECALL_NOTICE_MS};
+
+    #[test]
+    fn solo_events_and_snapshots_decode_numeric_mix_keys() {
+        let event =
+            r#"{"SoloChanged":{"solos":{"0":{"owner":"Singer","channels":[0]}},"notice":null}}"#;
+        let parsed = serde_json::from_str::<super::BridgeMessage>(event).unwrap();
+        assert!(matches!(
+            parsed,
+            super::BridgeMessage::Event(super::BridgeEvent::SoloChanged { .. })
+        ));
+        let snapshot = r#"{"kind":"snapshot","connected":true,"state":{"scene_number":1,"scene_name":"Show","values":{},"solos":{"0":{"owner":"Singer","channels":[0,2]}},"solo_notice":null}}"#;
+        let parsed = serde_json::from_str::<super::BridgeMessage>(snapshot).unwrap();
+        if let super::BridgeMessage::Snapshot { state, .. } = parsed {
+            assert_eq!(state.solos["0"].owner, "Singer");
+            assert_eq!(state.solos["0"].channels, [0, 2].into());
+        } else {
+            panic!("expected solo snapshot");
+        }
+    }
 
     #[test]
     fn live_updates_preserve_other_values_and_scene_until_replaced_by_snapshot() {

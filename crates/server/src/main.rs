@@ -1,6 +1,7 @@
 //! Offline LAN sign-in server and the shared CL5 console bridge.
 mod console;
 mod layout;
+mod solo;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -270,6 +271,7 @@ fn routes(app: App) -> Router {
         )
         .route("/api/bootstrap", get(bootstrap))
         .route("/api/console", get(console_socket).post(console_change))
+        .route("/api/performer/solo", post(performer_solo))
         .with_state(app)
         .fallback_service(ServeDir::new(web_dist()))
 }
@@ -717,6 +719,34 @@ async fn send_socket<T: Serialize>(socket: &mut WebSocket, message: &T) -> Resul
         .send(Message::Text(json.into()))
         .await
         .map_err(|_| ())
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SoloRequest {
+    mix: u8,
+    channels: std::collections::BTreeSet<u8>,
+}
+
+async fn performer_solo(
+    State(a): State<App>,
+    headers: HeaderMap,
+    Json(request): Json<SoloRequest>,
+) -> Response {
+    let Some(user) = session(&a, &headers) else {
+        return (StatusCode::UNAUTHORIZED, "Sign in first.").into_response();
+    };
+    if !may_change_mix(&a, &user, request.mix) {
+        return (StatusCode::FORBIDDEN, "That mix is not assigned to you.").into_response();
+    }
+    match a
+        .bridge
+        .solo(request.mix, user.name, request.channels)
+        .await
+    {
+        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Err(message) => (StatusCode::BAD_REQUEST, message).into_response(),
+    }
 }
 
 async fn console_change(
@@ -1179,6 +1209,57 @@ mod tests {
             "Mix 24 is protocol index 23"
         );
         assert!(may_change_mix(&app, &admin, 23));
+    }
+
+    #[tokio::test]
+    async fn solo_requests_require_current_assignment_and_session() {
+        let app = App::memory().unwrap();
+        app.add_user("Singer", "1234", "performer").unwrap();
+        app.assign_mixes("Admin", "Singer", &["1".into()]).unwrap();
+        let login_response = login(&app, app.user("Singer", "1234").unwrap().unwrap());
+        let cookie = login_response.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        async fn solo_request(app: &App, cookie: &str, body: &str) -> Response {
+            call(
+                app,
+                Request::post("/api/performer/solo")
+                    .header(header::COOKIE, cookie)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_owned()))
+                    .unwrap(),
+            )
+            .await
+        }
+        let body = r#"{"mix":0,"channels":[0]}"#;
+        assert_eq!(
+            solo_request(&app, "", body).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let response = solo_request(&app, &cookie, body).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(response_text(response)
+            .await
+            .contains("Console disconnected"));
+        let response = solo_request(&app, &cookie, r#"{"mix":1,"channels":[0]}"#).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response_text(response).await,
+            "That mix is not assigned to you."
+        );
+        assert_eq!(
+            solo_request(&app, &cookie, r#"{"mix":0,"channels":[0],"owner":"Admin"}"#)
+                .await
+                .status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        app.assign_mixes("Admin", "Singer", &[]).unwrap();
+        assert_eq!(
+            solo_request(&app, &cookie, body).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        assert!(app.bridge.state().await.solos.is_empty());
     }
 
     #[tokio::test]

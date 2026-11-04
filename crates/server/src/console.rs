@@ -3,12 +3,14 @@
 //! Keeping this parser separate from HTTP/WebSocket handling makes it impossible
 //! for a browser request to become an arbitrary RCP command.
 
+use crate::solo::{SoloStatus, Solos};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeSet, VecDeque};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
-    sync::{broadcast, mpsc, watch, RwLock},
+    sync::{broadcast, mpsc, oneshot, watch, RwLock},
     time::{interval, sleep},
 };
 
@@ -29,14 +31,26 @@ pub struct ConsoleState {
     pub values: HashMap<String, String>,
     pub scene_number: Option<u16>,
     pub scene_name: Option<String>,
+    pub solos: HashMap<u8, SoloStatus>,
+    pub solo_notice: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub enum BridgeEvent {
+    SoloChanged {
+        solos: HashMap<u8, SoloStatus>,
+        notice: Option<String>,
+    },
     Connected,
     Disconnected,
-    Value { key: String, value: String },
-    SceneRecalled { number: u16, name: Option<String> },
+    Value {
+        key: String,
+        value: String,
+    },
+    SceneRecalled {
+        number: u16,
+        name: Option<String>,
+    },
 }
 
 /// One server-owned RCP connection. It is deliberately independent from the
@@ -47,7 +61,17 @@ pub struct ConsoleBridge {
     state: Arc<RwLock<ConsoleState>>,
     connected: watch::Receiver<bool>,
     events: broadcast::Sender<BridgeEvent>,
-    writes: mpsc::Sender<PhoneChange>,
+    writes: mpsc::Sender<BridgeCommand>,
+}
+
+enum BridgeCommand {
+    Change(PhoneChange),
+    Solo {
+        mix: u8,
+        owner: String,
+        channels: BTreeSet<u8>,
+        reply: oneshot::Sender<Result<(), &'static str>>,
+    },
 }
 
 impl ConsoleBridge {
@@ -106,6 +130,30 @@ impl ConsoleBridge {
         self.state.read().await.clone()
     }
 
+    pub async fn solo(
+        &self,
+        mix: u8,
+        owner: String,
+        channels: BTreeSet<u8>,
+    ) -> Result<(), &'static str> {
+        if !self.is_connected() {
+            return Err("Console disconnected — reconnecting.");
+        }
+        let (reply, result) = oneshot::channel();
+        self.writes
+            .send(BridgeCommand::Solo {
+                mix,
+                owner,
+                channels,
+                reply,
+            })
+            .await
+            .map_err(|_| "Console disconnected — reconnecting.")?;
+        result
+            .await
+            .map_err(|_| "Console disconnected — reconnecting.")?
+    }
+
     /// Validates before queuing, and never retains a command while offline.
     pub async fn change(&self, change: PhoneChange) -> Result<(), &'static str> {
         change.validate()?;
@@ -113,7 +161,7 @@ impl ConsoleBridge {
             return Err("Console disconnected — reconnecting.");
         }
         self.writes
-            .send(change)
+            .send(BridgeCommand::Change(change))
             .await
             .map_err(|_| "Console disconnected — reconnecting.")
     }
@@ -124,11 +172,22 @@ async fn run_bridge(
     state: Arc<RwLock<ConsoleState>>,
     connected: watch::Sender<bool>,
     events: broadcast::Sender<BridgeEvent>,
-    mut writes: mpsc::Receiver<PhoneChange>,
+    mut writes: mpsc::Receiver<BridgeCommand>,
 ) {
     let mut retry = Duration::from_millis(100);
     loop {
         let _ = connected.send(false);
+        if !state.read().await.solos.is_empty() {
+            publish_solos(
+                &Solos::default(),
+                Some("Console disconnected — solo cleared. Check your mix levels.".into()),
+                &state,
+                &events,
+            )
+            .await;
+        }
+        // Commands accepted by the old connection must never replay after a reconnect.
+        while writes.try_recv().is_ok() {}
         let _ = events.send(BridgeEvent::Disconnected);
         if let Ok(stream) = TcpStream::connect(&address).await {
             retry = Duration::from_millis(100);
@@ -148,7 +207,7 @@ async fn serve_connection(
     state: &Arc<RwLock<ConsoleState>>,
     connected: &watch::Sender<bool>,
     events: &broadcast::Sender<BridgeEvent>,
-    writes: &mut mpsc::Receiver<PhoneChange>,
+    writes: &mut mpsc::Receiver<BridgeCommand>,
 ) -> bool {
     let (read, mut write) = stream.into_split();
     let mut lines = BufReader::new(read).lines();
@@ -160,6 +219,8 @@ async fn serve_connection(
             return false;
         }
     }
+    let mut in_flight: HashMap<String, VecDeque<String>> = HashMap::new();
+    let mut solos = Solos::default();
     let mut outstanding = snapshot.len();
     let mut pending = HashMap::<String, PhoneChange>::new();
     let mut flush = interval(Duration::from_millis(50));
@@ -174,10 +235,27 @@ async fn serve_connection(
                         outstanding += 1;
                     }
                     if is_scene_recall(&line) {
+                        pending.clear();
+                        in_flight.clear();
+                        while writes.try_recv().is_ok() {}
+                        let had_solo = !solos.statuses().is_empty();
+                        solos = Solos::default();
+                        publish_solos(&solos, had_solo.then(|| "Scene changed — solo cleared".into()), state, events).await;
                         let _ = connected.send(false);
                         for command in snapshot_commands() {
                             if write.write_all(command.as_bytes()).await.is_err() || write.write_all(b"\n").await.is_err() { return false; }
                             outstanding += 1;
+                        }
+                    }
+                    if let Some((path, input, mix, value)) = value_reply(line.strip_prefix("NOTIFY ").or_else(|| line.strip_prefix("OK ")).unwrap_or(&line)) {
+                        let key = format!("{path} {input} {mix}");
+                        if let Some(queue) = in_flight.get_mut(&key) {
+                            if queue.front().is_some_and(|sent| sent == value) { queue.pop_front(); }
+                        }
+                        if path == LEVEL {
+                            if let (Ok(input), Ok(mix), Ok(value)) = (input.parse::<u8>(), mix.parse::<u8>(), value.parse::<i16>()) {
+                                if input < 80 && mix < 24 { solos.observe(input, mix, value); }
+                            }
                         }
                     }
                     apply_line(&line, state, events).await;
@@ -189,17 +267,58 @@ async fn serve_connection(
                 _ => return true,
             },
             change = writes.recv() => match change {
-                Some(change) => { pending.insert(change_key(&change), change); }
+                Some(BridgeCommand::Change(change)) => {
+                    if *connected.borrow() { pending.insert(change_key(&change), change); }
+                }
+                Some(BridgeCommand::Solo { mix, owner, channels, reply }) => {
+                    if !*connected.borrow() {
+                        let _ = reply.send(Err("Console disconnected — reconnecting."));
+                        continue;
+                    }
+                    if !pending.is_empty() || in_flight.values().any(|queue| !queue.is_empty()) {
+                        let _ = reply.send(Err("Mix levels are still updating. Try again in a moment."));
+                        continue;
+                    }
+                    let values = state.read().await.values.clone();
+                    match solos.set(mix, &owner, channels, &values) {
+                        Err(error) => { let _ = reply.send(Err(error)); }
+                        Ok(changes) => {
+                            for (input, value) in changes {
+                                let command = format!("set {LEVEL} {input} {mix} {value}\n");
+                                if write.write_all(command.as_bytes()).await.is_err() { return false; }
+                            }
+                            publish_solos(&solos, None, state, events).await;
+                            let _ = reply.send(Ok(()));
+                        }
+                    }
+                }
                 None => return false,
             },
             _ = flush.tick(), if outstanding == 0 && !pending.is_empty() => {
                 for (_, change) in std::mem::take(&mut pending) {
                     let Ok(command) = change.rcp() else { continue };
+                    in_flight.entry(change_key(&change)).or_default().push_back(command.rsplit(' ').next().expect("command value").to_owned());
                     if write.write_all(command.as_bytes()).await.is_err() || write.write_all(b"\n").await.is_err() { return false; }
                 }
             }
         }
     }
+}
+
+async fn publish_solos(
+    solos: &Solos,
+    notice: Option<String>,
+    state: &Arc<RwLock<ConsoleState>>,
+    events: &broadcast::Sender<BridgeEvent>,
+) {
+    let statuses = solos.statuses();
+    let mut state = state.write().await;
+    state.solos = statuses.clone();
+    state.solo_notice = notice.clone();
+    let _ = events.send(BridgeEvent::SoloChanged {
+        solos: statuses,
+        notice,
+    });
 }
 
 fn change_key(change: &PhoneChange) -> String {
@@ -463,6 +582,85 @@ mod tests {
             }
         }
         assert_eq!(reply.trim(), format!("OK get {LEVEL} 0 0 -300"));
+    }
+
+    async fn wait_level(bridge: &ConsoleBridge, input: u8, mix: u8, value: &str) {
+        timeout(Duration::from_secs(5), async {
+            while bridge
+                .state()
+                .await
+                .values
+                .get(&format!("{LEVEL} {input} {mix}"))
+                .map(String::as_str)
+                != Some(value)
+            {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("console level readback");
+    }
+
+    #[tokio::test]
+    async fn personal_solo_round_trips_and_recall_never_restores_old_levels() {
+        let fake = Arc::new(FakeConsole::new());
+        let address = fake.clone().listen("127.0.0.1:0").await.unwrap();
+        let bridge = ConsoleBridge::start(address.to_string());
+        ready(&bridge).await;
+        let mut engineer = TcpStream::connect(address).await.unwrap();
+        engineer.write_all(format!("set {LEVEL} 0 0 -350\nset {LEVEL} 1 0 -725\nset {LEVEL} 2 0 -950\nset {LEVEL} 1 1 -1234\n").as_bytes()).await.unwrap();
+        wait_level(&bridge, 1, 1, "-1234").await;
+        bridge.solo(0, "Singer".into(), [0].into()).await.unwrap();
+        wait_level(&bridge, 2, 0, "-32768").await;
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(bridge.state().await.solos[&0].owner, "Singer");
+        assert!(bridge
+            .solo(0, "Other singer".into(), [2].into())
+            .await
+            .is_err());
+        engineer
+            .write_all(format!("set {LEVEL} 1 0 -625\n").as_bytes())
+            .await
+            .unwrap();
+        wait_level(&bridge, 1, 0, "-625").await;
+        bridge
+            .solo(0, "Singer".into(), BTreeSet::new())
+            .await
+            .unwrap();
+        wait_level(&bridge, 2, 0, "-950").await;
+        wait_level(&bridge, 1, 0, "-625").await;
+        wait_level(&bridge, 0, 0, "-350").await;
+        wait_level(&bridge, 1, 1, "-1234").await;
+        sleep(Duration::from_millis(100)).await;
+        bridge.solo(0, "Singer".into(), [1].into()).await.unwrap();
+        wait_level(&bridge, 0, 0, "-32768").await;
+        fake.recall_scene(2).await.unwrap();
+        timeout(Duration::from_secs(30), async {
+            loop {
+                let state = bridge.state().await;
+                if state.scene_number == Some(2) && bridge.is_connected() && state.solos.is_empty()
+                {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            bridge.state().await.solo_notice.as_deref(),
+            Some("Scene changed — solo cleared")
+        );
+        bridge
+            .solo(0, "Singer".into(), BTreeSet::new())
+            .await
+            .unwrap();
+        wait_level(&bridge, 0, 0, "-1200").await;
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            bridge.state().await.values[&format!("{LEVEL} 0 0")],
+            "-1200"
+        );
     }
 
     async fn ready(bridge: &ConsoleBridge) {
