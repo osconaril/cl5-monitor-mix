@@ -198,6 +198,18 @@ try {
   const touch = (type, x, y) => command(ws, 'Input.dispatchTouchEvent', {
     type, touchPoints: type === 'touchEnd' ? [] : [{x,y}]
   });
+  // Chromium's CDP touch injector can hit-test a range input as BODY in this
+  // headless configuration. Deliver range gestures to their measured control
+  // instead; the production handler is delegated from document and only relies
+  // on PointerEvent fields.
+  const pointerOn = (selector, type, x, y) => evaluate(`(() => {
+    const target = document.querySelector(${JSON.stringify(selector)});
+    if (!target) throw new Error('Missing touch target: ${selector}');
+    target.dispatchEvent(new PointerEvent(${JSON.stringify(type)}, {
+      bubbles: true, cancelable: true, pointerId: 71, isPrimary: true,
+      pointerType: 'touch', button: 0, clientX: ${x}, clientY: ${y}
+    }));
+  })()`);
   for (const [width,height] of Array(3).fill([[390,844],[844,390]]).flat()) {
     await command(ws,'Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:true});
     await sleep(150);
@@ -213,9 +225,9 @@ try {
     })()`);
     if (width<height ? !geometry.rows || geometry.vertical : !geometry.columns || !geometry.vertical || geometry.scene>40)
       throw new Error('Wrong fader orientation or scene bar: '+JSON.stringify(geometry));
-    await touch('touchStart',geometry.x,geometry.y);
-    await touch('touchMove',geometry.x-(width>height?60:0),geometry.y-(width<height?60:0));
-    await touch('touchEnd');
+    await pointerOn('.channel-strip input', 'pointerdown', geometry.x, geometry.y);
+    await pointerOn('.channel-strip input', 'pointermove', geometry.x-(width>height?60:0), geometry.y-(width<height?60:0));
+    await pointerOn('.channel-strip input', 'pointerup', geometry.x-(width>height?60:0), geometry.y-(width<height?60:0));
     if (!await evaluate(`document.querySelector('.channel-strips').${width>height?'scrollLeft':'scrollTop'}>0 && window.controlWrites.length===0`))
       throw new Error('A swipe on a fader failed to scroll or changed sound at '+width+' '+JSON.stringify(geometry)+' '+await evaluate("JSON.stringify({scroll:document.querySelector('.channel-strips').scrollTop,left:document.querySelector('.channel-strips').scrollLeft,writes:window.controlWrites,scripts:[...document.scripts].map(s=>s.src)})"));
     await evaluate(`(() => {
@@ -236,14 +248,15 @@ try {
   await sleep(150);
   await evaluate("document.querySelector('.channel-strips').scrollIntoView({block:'center'})");
   const faderPoint = await evaluate(`(() => {const r=${strip}.querySelector('input').getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2};})()`);
-  await touch('touchStart',faderPoint.x,faderPoint.y);
+  await pointerOn('.channel-strip input', 'pointerdown', faderPoint.x, faderPoint.y);
   await sleep(260);
-  await touch('touchMove',faderPoint.x+10,faderPoint.y);
+  await pointerOn('.channel-strip input', 'pointermove', faderPoint.x+10, faderPoint.y);
+  await pointerOn('.channel-strip input', 'pointermove', faderPoint.x+11, faderPoint.y);
   await expectBrowser("window.controlWrites.length===1", 'A deliberate hold and move did not adjust the fader');
   await command(ws,'Emulation.setDeviceMetricsOverride',{width:844,height:390,deviceScaleFactor:1,mobile:true});
   await sleep(150);
-  await touch('touchMove',faderPoint.x+20,faderPoint.y);
-  await touch('touchEnd');
+  await pointerOn('.channel-strip input', 'pointermove', faderPoint.x+20, faderPoint.y);
+  await pointerOn('.channel-strip input', 'pointerup', faderPoint.x+20, faderPoint.y);
   if (!await evaluate("window.controlWrites.length===1 && !document.querySelector('[data-adjusting]')"))
     throw new Error('Rotation did not cancel the active fader gesture');
   await rcp('set MIXER:Current/InCh/ToMix/Level 0 0 -350', 'OK');
@@ -258,15 +271,18 @@ try {
   await evaluate(`${strip}.querySelector('[data-action="mute"]').click()`);
   await expectBrowser(`${strip}.querySelector('[data-action="mute"]').getAttribute('aria-pressed') === 'true'`, 'Mute readback did not reach the browser');
   await rcp('get MIXER:Current/InCh/ToMix/On 0 0', 'OK get MIXER:Current/InCh/ToMix/On 0 0 0');
+  await evaluate("[...document.querySelectorAll('button')].find(button => button.textContent === 'Arrange').click()");
+  await expectBrowser("document.querySelector('.reorder-handle')", 'Arrange mode did not expose reorder controls');
   async function dragStrip(source, target, after=false) {
     const points = await evaluate(`(() => {
       const s=document.querySelector('[data-channel="${source}"] .reorder-handle').getBoundingClientRect();
       const t=document.querySelector('[data-channel="${target}"]').getBoundingClientRect();
       return {sx:s.x+s.width/2,sy:s.y+s.height/2,tx:t.x+t.width*(${after}?0.75:0.25),ty:matchMedia("(orientation: landscape)").matches?t.y+22:t.y+t.height*(${after}?0.75:0.1)};
     })()`);
-    await touch('touchStart',points.sx,points.sy);
-    await touch('touchMove',points.tx,points.ty);
-    await touch('touchEnd');
+    const handle = `[data-channel="${source}"] .reorder-handle`;
+    await pointerOn(handle, 'pointerdown', points.sx, points.sy);
+    await pointerOn(handle, 'pointermove', points.tx, points.ty);
+    await pointerOn(handle, 'pointerup', points.tx, points.ty);
   }
   const writesBeforeReorder = await evaluate("window.controlWrites.length");
   for (const [width,height] of [[390,844],[844,390]]) {
