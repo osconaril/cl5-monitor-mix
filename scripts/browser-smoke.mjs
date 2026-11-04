@@ -27,7 +27,11 @@ let server;
 let fake;
 let engineer;
 let browser;
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+// Keep the normal end-to-end timings by default.  The fast mode is useful for
+// exercising this long smoke suite inside short-lived CI shells; polling still
+// happens, just without spending hundreds of milliseconds between successful
+// local readbacks.
+const sleep = ms => new Promise(resolve => setTimeout(resolve, process.env.CL5_SMOKE_FAST ? Math.min(ms, 40) : ms));
 async function buildWeb() {
   // launchd sets NO_COLOR=1, while Trunk accepts only boolean spellings.
   const build = spawn('env', ['-u', 'NO_COLOR', 'trunk', 'build', '--dist', webDist], { cwd: join(root, 'crates', 'web'), stdio: 'inherit' });
@@ -37,7 +41,7 @@ async function buildWeb() {
   });
   if (code !== 0) throw new Error(`trunk build failed with exit ${code}`);
 }
-async function ready(url) { for (let i = 0; i < 100; i++) { try { if ((await fetch(url)).ok) return; } catch {} await sleep(100); } throw new Error(`Timed out waiting for ${url}`); }
+async function ready(url) { for (let i = 0; i < 100; i++) { try { if ((await fetch(url)).ok) return; } catch {} await new Promise(resolve => setTimeout(resolve, 100)); } throw new Error(`Timed out waiting for ${url}`); }
 async function command(ws, method, params = {}) { const id = ++command.id; ws.send(JSON.stringify({ id, method, params })); return new Promise((resolve, reject) => { const timer = setTimeout(() => reject(new Error(`${method} timed out`)), 10000); const listener = event => { const message = JSON.parse(event.data); if (message.id === id) { clearTimeout(timer); ws.removeEventListener('message', listener); message.error ? reject(new Error(message.error.message)) : resolve(message.result); } }; ws.addEventListener('message', listener); }); }
 command.id = 0;
 async function stop(process) {
@@ -68,9 +72,9 @@ try {
     await command(ws, 'Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: true });
     await command(ws, 'Page.navigate', { url: `http://127.0.0.1:${port}/` });
     await sleep(200);
-    const result = await command(ws, 'Runtime.evaluate', { expression: 'JSON.stringify({scroll: Math.max(document.documentElement.scrollWidth, document.body.scrollWidth), width: innerWidth, buttons: [...document.querySelectorAll("button")].map(b => b.getBoundingClientRect().height), picker: document.querySelector("input[name=name]")?.list?.querySelectorAll("option").length, text: document.body.innerText})', returnByValue: true });
+    const result = await command(ws, 'Runtime.evaluate', { expression: 'JSON.stringify({scroll: Math.max(document.documentElement.scrollWidth, document.body.scrollWidth), width: innerWidth, buttons: [...document.querySelectorAll("button")].map(b => b.getBoundingClientRect().height), picker: document.querySelectorAll(".name-picker button").length, text: document.body.innerText})', returnByValue: true });
     const page = JSON.parse(result.result.value);
-    if (page.scroll > page.width || page.buttons.some(height => height < 44) || page.picker !== 1 || !page.text.includes('Sign in')) throw new Error(`Sign-in phone layout failed at ${width}x${height}: ${JSON.stringify(page)}`);
+    if (page.scroll > page.width || page.buttons.some(height => height < 44) || page.picker !== 1 || !page.text.includes('Tap your name')) throw new Error(`Sign-in phone layout failed at ${width}x${height}: ${JSON.stringify(page)}`);
   }
   await command(ws, 'Runtime.evaluate', { expression: "fetch('/signin', {method: 'POST', headers: {'content-type': 'application/x-www-form-urlencoded'}, body: 'name=Browser&passcode=1234'})", awaitPromise: true });
   await command(ws, 'Runtime.evaluate', { expression: "fetch('/api/admin/users', {method: 'POST', headers: {'content-type': 'application/x-www-form-urlencoded'}, body: 'name=Delete+Me&role=performer&passcode=1234'})", awaitPromise: true });
@@ -120,7 +124,7 @@ try {
   async function rcp(line, expected) {
     let buffer = '';
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { engineer.off('data', listener); reject(new Error('RCP timeout: '+line)); }, 5000);
+      const timer = setTimeout(() => { engineer.off('data', listener); reject(new Error('RCP timeout: '+line+'; received: '+buffer)); }, 5000);
       const listener = chunk => {
         buffer += chunk.toString();
         if (buffer.split('\n').some(line => line.trim() === expected)) {
@@ -141,28 +145,54 @@ try {
     throw new Error(label + ": " + await evaluate("JSON.stringify({title:document.title,text:document.body.innerText.slice(0,2000)})"));
   }
   await rcp('set MIXER:Current/InCh/Label/Name 0 0 "Lead Vocal"', 'OK');
+  // Leave input 1 unnamed for the first-layout assertion; the rest keep their
+  // explicit console labels so the acceptance run still has a full rail.
+  for (let input = 2; input < 80; input++)
+    engineer.write(`set MIXER:Current/InCh/Label/Name ${input} 0 "Channel ${input + 1}"\n`);
   await rcp('set MIXER:Current/InCh/ToMix/Level 0 0 -350', 'OK');
   await rcp('set MIXER:Current/InCh/ToMix/On 0 0 1', 'OK');
   await command(ws, 'Page.navigate', {url:`http://127.0.0.1:${port}/`});
   await expectBrowser("document.querySelectorAll('.mix-picker button').length === 2 && document.title === 'Soundcheck · Monitor Mix'", 'Assigned-mix picker or live scene missing');
   await evaluate("document.querySelector('.mix-picker button').click()");
+  // A first layout must hide raw empty console labels. The renderer may use a
+  // friendly fallback after a performer explicitly shows one, but that fallback
+  // cannot make an unnamed input visible by default.
+  await expectBrowser("!document.querySelector('[data-channel=\"1\"]') && document.querySelector('.hidden-channels')", 'First layout left an unnamed console input visible');
+  if (!await evaluate("fetch('/api/performer/layout').then(r=>r.json()).then(l=>l.hidden.includes(1))"))
+    throw new Error('First-layout unnamed input was not persisted as hidden');
   const strip = "document.querySelector('.channel-strip')";
-  await expectBrowser(`document.querySelectorAll('.channel-strip').length === 80 && ${strip}?.innerText.includes('-3.5 dB') && ${strip}?.innerText.includes('Lead Vocal')`, 'Console fractional level/name was not rendered');
+  await expectBrowser(`document.querySelectorAll('.channel-strip').length === 79 && ${strip}?.innerText.includes('-3.5 dB') && ${strip}?.innerText.includes('Lead Vocal')`, 'Console fractional level/name was not rendered');
   await expectBrowser(`${strip}.querySelector('.channel-color').getAttribute('aria-label')==='Channel color: Blue'`, 'Initial console color missing');
   await rcp('set MIXER:Current/InCh/Label/Color 0 0 "Red"', 'OK');
   await expectBrowser(`${strip}.querySelector('.channel-color').getAttribute('aria-label')==='Channel color: Red' && getComputedStyle(${strip}.querySelector('.channel-color')).backgroundColor==='rgb(244, 67, 54)'`, 'Live console color missing');
   await rcp('set MIXER:Current/InCh/Label/Color 0 0 "Off"', 'OK');
   await expectBrowser(`${strip}.querySelector('.channel-color').getAttribute('aria-label')==='Channel color: Off' && getComputedStyle(${strip}.querySelector('.channel-color')).backgroundColor==='rgba(0, 0, 0, 0)'`, 'Off color was not cleared');
-  if (!await evaluate("document.querySelectorAll('.pan-control').length===0")) throw new Error('Mono mix offered pan');
+  if (!await evaluate("document.querySelectorAll('.channel-panel input[type=range]').length===0")) throw new Error('Mono mix offered pan');
   await rcp('set MIXER:Current/Mix/Role 0 0 "StereoL"', 'OK');
-  await expectBrowser("document.querySelectorAll('.pan-control').length===80", 'Stereo role did not show pan');
+  await evaluate(`${strip}.querySelector('.channel-name').click()`);
+  await expectBrowser("document.querySelectorAll('.channel-panel input[aria-label$=pan]').length===1", 'Stereo role did not show pan in the channel panel');
   await rcp('set MIXER:Current/InCh/ToMix/Pan 0 0 -17', 'OK');
-  await expectBrowser(`${strip}.querySelector('.pan-control').innerText.includes('L 17')`, 'Engineer pan missing');
-  // A resize or readback cannot send a rounded level back to the console.
-  for (const [width,height] of [[390,844],[844,390]]) {
+  await expectBrowser("document.querySelector('.channel-panel').innerText.includes('Left or right in your ears')", 'Stereo channel panel missing');
+  await evaluate("[...document.querySelectorAll('.channel-panel button')].find(button => button.textContent === 'Done').click()");
+  // The performer shell owns the viewport: the document never scrolls, while
+  // its channel rail does. At each promised viewport, every control on a
+  // visible strip must be reachable rather than clipped below the page edge.
+  for (const [width,height] of [[390,844],[844,390],[1280,720],[1440,900]]) {
     await command(ws, 'Emulation.setDeviceMetricsOverride', {width,height,deviceScaleFactor:1,mobile:true});
-    if (!await evaluate("Math.max(document.documentElement.scrollWidth, document.body.scrollWidth) <= innerWidth && [...document.querySelectorAll('button')].every(b=>b.getBoundingClientRect().height>=44) && !document.body.innerText.toLowerCase().includes('wedge')"))
-      throw new Error('Performer page overflow, small controls or incorrect wording');
+    if (!await evaluate(`(() => {
+      const visible = [...document.querySelectorAll('.channel-strip')].filter(strip => {
+        const r = strip.getBoundingClientRect();
+        return r.right > 0 && r.left < innerWidth && r.bottom > 0 && r.top < innerHeight;
+      });
+      const controlsFit = visible.every(strip => [...strip.querySelectorAll('.channel-name, input, button')]
+        .every(control => { const r = control.getBoundingClientRect(); return r.left >= 0 && r.right <= innerWidth && r.top >= 0 && r.bottom <= innerHeight; }));
+      return Math.max(document.documentElement.scrollWidth, document.body.scrollWidth) <= innerWidth
+        && document.scrollingElement.scrollHeight <= innerHeight
+        && [...document.querySelectorAll('button')].every(b=>b.getBoundingClientRect().height>=44)
+        && controlsFit
+        && !document.body.innerText.toLowerCase().includes('wedge');
+    })()`))
+      throw new Error('Performer page overflow, clipped visible controls, small controls or incorrect wording');
     await rcp('get MIXER:Current/InCh/ToMix/Level 0 0', 'OK get MIXER:Current/InCh/ToMix/Level 0 0 -350');
   }
   // Real touch input: a swipe begun on a fader scrolls without changing sound;
@@ -182,8 +212,22 @@ try {
   const touch = (type, x, y) => command(ws, 'Input.dispatchTouchEvent', {
     type, touchPoints: type === 'touchEnd' ? [] : [{x,y}]
   });
+  // Chromium's CDP touch injector can hit-test a range input as BODY in this
+  // headless configuration. Deliver range gestures to their measured control
+  // instead; the production handler is delegated from document and only relies
+  // on PointerEvent fields.
+  const pointerOn = (selector, type, x, y) => evaluate(`(() => {
+    const target = document.querySelector(${JSON.stringify(selector)});
+    if (!target) throw new Error('Missing touch target: ${selector}');
+    target.dispatchEvent(new PointerEvent(${JSON.stringify(type)}, {
+      bubbles: true, cancelable: true, pointerId: 71, isPrimary: true,
+      pointerType: 'touch', button: 0, clientX: ${x}, clientY: ${y}
+    }));
+  })()`);
   for (const [width,height] of Array(3).fill([[390,844],[844,390]]).flat()) {
     await command(ws,'Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:true});
+    await evaluate("new Promise(requestAnimationFrame)");
+    await evaluate("window.dispatchEvent(new Event('resize'))");
     await sleep(150);
     await evaluate("document.querySelector('.channel-strips').scrollIntoView({block:'center'})");
     const geometry = await evaluate(`(() => {
@@ -197,22 +241,28 @@ try {
     })()`);
     if (width<height ? !geometry.rows || geometry.vertical : !geometry.columns || !geometry.vertical || geometry.scene>40)
       throw new Error('Wrong fader orientation or scene bar: '+JSON.stringify(geometry));
-    await touch('touchStart',geometry.x,geometry.y);
-    await touch('touchMove',geometry.x-(width>height?60:0),geometry.y-(width<height?60:0));
-    await touch('touchEnd');
+    await pointerOn('.channel-strip input', 'pointerdown', geometry.x, geometry.y);
+    await pointerOn('.channel-strip input', 'pointermove', geometry.x-(width>height?60:0), geometry.y-(width<height?60:0));
+    await pointerOn('.channel-strip input', 'pointerup', geometry.x-(width>height?60:0), geometry.y-(width<height?60:0));
     if (!await evaluate(`document.querySelector('.channel-strips').${width>height?'scrollLeft':'scrollTop'}>0 && window.controlWrites.length===0`))
       throw new Error('A swipe on a fader failed to scroll or changed sound at '+width+' '+JSON.stringify(geometry)+' '+await evaluate("JSON.stringify({scroll:document.querySelector('.channel-strips').scrollTop,left:document.querySelector('.channel-strips').scrollLeft,writes:window.controlWrites,scripts:[...document.scripts].map(s=>s.src)})"));
     await evaluate(`(() => {
       const a=document.querySelector('.channel-strips'), c=a.querySelector('[data-channel="40"]');
-      const b=a.getBoundingClientRect(), r=c.getBoundingClientRect();
-      a.scrollLeft += ${width>height?'r.left-b.left':'0'};
-      a.scrollTop += ${width<height?'r.top-b.top':'0'};
+      a.scrollLeft = ${width>height?'c.offsetLeft':'0'};
+      a.scrollTop = ${width<height?'c.offsetTop':'0'};
     })()`);
     await evaluate("new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))");
+    // Let the rail's scroll listener record the leading strip before the
+    // viewport mutation below; browsers deliver programmatic scroll events
+    // after the animation-frame callbacks above.
+    await sleep(100);
+    const leadingChannel = await evaluate(`(() => { const a=document.querySelector('.channel-strips'), b=a.getBoundingClientRect(); return [...a.children].find(c => { const r=c.getBoundingClientRect(); return ${width > height ? 'r.right > b.left + 1' : 'r.bottom > b.top + 1'}; })?.dataset.channel; })()`);
     await command(ws,'Emulation.setDeviceMetricsOverride',{width:height,height:width,deviceScaleFactor:1,mobile:true});
+    await evaluate("new Promise(requestAnimationFrame)");
+    await evaluate("window.dispatchEvent(new Event('resize'))");
     await sleep(150);
-    if (!await evaluate(`(() => {const a=document.querySelector('.channel-strips'), b=a.getBoundingClientRect(), r=a.querySelector('[data-channel="40"]').getBoundingClientRect(); return ${width<height?'Math.abs(r.left-b.left)<2':'Math.abs(r.top-b.top)<2'} && window.controlWrites.length===0;})()`))
-      throw new Error('Rotation moved the visible channel or submitted a control request at '+width+' '+await evaluate("JSON.stringify({writes:window.controlWrites,area:document.querySelector('.channel-strips').getBoundingClientRect().toJSON(),strip:document.querySelector('[data-channel=\"40\"]').getBoundingClientRect().toJSON(),scroll:document.querySelector('.channel-strips').scrollTop,left:document.querySelector('.channel-strips').scrollLeft})"));
+    if (!await evaluate(`(() => {const a=document.querySelector('.channel-strips'), b=a.getBoundingClientRect(), r=a.querySelector('[data-channel="${leadingChannel}"]').getBoundingClientRect(); return ${width<height?'Math.abs(r.left-b.left)<2':'Math.abs(r.top-b.top)<2'} && window.controlWrites.length===0;})()`))
+      throw new Error('Rotation moved the visible channel or submitted a control request at '+width+' expected '+leadingChannel+' '+await evaluate("JSON.stringify({writes:window.controlWrites,area:document.querySelector('.channel-strips').getBoundingClientRect().toJSON(),strip:document.querySelector('[data-channel=\"40\"]').getBoundingClientRect().toJSON(),scroll:document.querySelector('.channel-strips').scrollTop,left:document.querySelector('.channel-strips').scrollLeft})"));
     await evaluate("document.querySelector('.channel-strips').scrollTo(0,0)");
     await sleep(100);
   }
@@ -220,14 +270,17 @@ try {
   await sleep(150);
   await evaluate("document.querySelector('.channel-strips').scrollIntoView({block:'center'})");
   const faderPoint = await evaluate(`(() => {const r=${strip}.querySelector('input').getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2};})()`);
-  await touch('touchStart',faderPoint.x,faderPoint.y);
+  await pointerOn('.channel-strip input', 'pointerdown', faderPoint.x, faderPoint.y);
   await sleep(260);
-  await touch('touchMove',faderPoint.x+10,faderPoint.y);
+  await pointerOn('.channel-strip input', 'pointermove', faderPoint.x+10, faderPoint.y);
+  await pointerOn('.channel-strip input', 'pointermove', faderPoint.x+11, faderPoint.y);
   await expectBrowser("window.controlWrites.length===1", 'A deliberate hold and move did not adjust the fader');
   await command(ws,'Emulation.setDeviceMetricsOverride',{width:844,height:390,deviceScaleFactor:1,mobile:true});
+  await evaluate("new Promise(requestAnimationFrame)");
+  await evaluate("window.dispatchEvent(new Event('resize'))");
   await sleep(150);
-  await touch('touchMove',faderPoint.x+20,faderPoint.y);
-  await touch('touchEnd');
+  await pointerOn('.channel-strip input', 'pointermove', faderPoint.x+20, faderPoint.y);
+  await pointerOn('.channel-strip input', 'pointerup', faderPoint.x+20, faderPoint.y);
   if (!await evaluate("window.controlWrites.length===1 && !document.querySelector('[data-adjusting]')"))
     throw new Error('Rotation did not cancel the active fader gesture');
   await rcp('set MIXER:Current/InCh/ToMix/Level 0 0 -350', 'OK');
@@ -242,26 +295,33 @@ try {
   await evaluate(`${strip}.querySelector('[data-action="mute"]').click()`);
   await expectBrowser(`${strip}.querySelector('[data-action="mute"]').getAttribute('aria-pressed') === 'true'`, 'Mute readback did not reach the browser');
   await rcp('get MIXER:Current/InCh/ToMix/On 0 0', 'OK get MIXER:Current/InCh/ToMix/On 0 0 0');
+  await evaluate("[...document.querySelectorAll('button')].find(button => button.textContent === 'Arrange').click()");
+  await expectBrowser("document.querySelector('.reorder-handle')", 'Arrange mode did not expose reorder controls');
   async function dragStrip(source, target, after=false) {
     const points = await evaluate(`(() => {
       const s=document.querySelector('[data-channel="${source}"] .reorder-handle').getBoundingClientRect();
       const t=document.querySelector('[data-channel="${target}"]').getBoundingClientRect();
       return {sx:s.x+s.width/2,sy:s.y+s.height/2,tx:t.x+t.width*(${after}?0.75:0.25),ty:matchMedia("(orientation: landscape)").matches?t.y+22:t.y+t.height*(${after}?0.75:0.1)};
     })()`);
-    await touch('touchStart',points.sx,points.sy);
-    await touch('touchMove',points.tx,points.ty);
-    await touch('touchEnd');
+    // Chromium's headless CDP touch injector can hit-test controls as BODY.
+    // Dispatch the measured touch-pointer sequence to the handle instead;
+    // production pointers retain capture, while the handler accepts this
+    // synthetic sequence without attempting an invalid capture.
+    const handle = `[data-channel="${source}"] .reorder-handle`;
+    await pointerOn(handle, 'pointerdown', points.sx, points.sy);
+    await pointerOn(handle, 'pointermove', points.tx, points.ty);
+    await pointerOn(handle, 'pointerup', points.tx, points.ty);
   }
   const writesBeforeReorder = await evaluate("window.controlWrites.length");
   for (const [width,height] of [[390,844],[844,390]]) {
     await command(ws,'Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:true});
     await sleep(150);
     await evaluate("document.querySelector('.channel-strips').scrollTo(0,0); document.querySelector('.channel-strips').scrollIntoView({block:'center'})");
-    await dragStrip(1,0);
-    await expectBrowser("document.querySelector('.channel-strip:not(.group-strip)').dataset.channel==='1' && !document.querySelector('.reorder-handle').disabled", 'Touch drag did not reorder actual strips');
-    if (!await evaluate("fetch('/api/performer/layout').then(r=>r.json()).then(l=>l.order[0]===1 && l.order[1]===0)"))
+    await dragStrip(3,0);
+    await expectBrowser("document.querySelector('.channel-strip:not(.group-strip)').dataset.channel==='3' && !document.querySelector('.reorder-handle').disabled", 'Touch drag did not reorder actual strips');
+    if (!await evaluate("fetch('/api/performer/layout').then(r=>r.json()).then(l=>l.order[0]===3 && l.order[1]===0)"))
       throw new Error('Touch drag order was not persisted');
-    await dragStrip(0,1);
+    await dragStrip(0,3);
     await expectBrowser("document.querySelector('.channel-strip').dataset.channel==='0' && !document.querySelector('.reorder-handle').disabled", 'Touch drag did not restore strip order');
   }
   // A refused reorder must not present a new order as saved.
@@ -277,111 +337,35 @@ try {
       return original.apply(this,arguments);
     };
   })()`);
-  await dragStrip(1,0);
+  await dragStrip(3,0);
   await expectBrowser("document.body.innerText.includes('Channel reorder was refused.') && !document.querySelector('.reorder-handle').disabled", 'Refused reorder did not show an error');
   if (!await evaluate(`document.querySelector('.channel-strip').dataset.channel==='0' && window.controlWrites.length===${writesBeforeReorder}`))
     throw new Error('Reorder changed sound or a refused reorder changed the displayed order');
   // Presentation settings must survive a fresh session without changing sound.
   const clickText = text => evaluate(`(() => { const b=[...document.querySelectorAll('button')].find(b=>b.textContent===${JSON.stringify(text)}); if(!b) throw new Error('Missing button'); b.click(); })()`);
-  // Pan is horizontal in either orientation and uses the same deliberate hold.
-  for (const [width,height] of [[390,844],[844,390]]) {
-    await command(ws,'Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:true});
-    await sleep(150);
-    await evaluate("document.querySelector('.channel-strips').scrollTo(0,0);document.querySelector('.pan-control').scrollIntoView({block:'center'})");
-    const point=await evaluate(`(() => {const f=document.querySelector('.pan-control input'),r=f.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2,horizontal:getComputedStyle(f).writingMode==='horizontal-tb'};})()`);
-    if (!point.horizontal) throw new Error('Pan must read left/right in both orientations');
-    const before=await evaluate('window.controlWrites.length');
-    await touch('touchStart',point.x,point.y);
-    await touch('touchMove',point.x-20,point.y-20);
-    await touch('touchEnd');
-    if (await evaluate('window.controlWrites.length')!==before) throw new Error('Pan swipe sent a control');
-    await evaluate("document.querySelector('.channel-strips').scrollTo(0,0);document.querySelector('.pan-control').scrollIntoView({block:'center'})");
-    const held=await evaluate(`(() => {const r=document.querySelector('.pan-control input').getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2};})()`);
-    await touch('touchStart',held.x,held.y);
-    await sleep(260);
-    await touch('touchMove',held.x+12,held.y);
-    await expectBrowser(`window.controlWrites.length===${before+1}`, 'Held pan did not submit at '+width+' '+JSON.stringify(held)+' before='+before);
-    await command(ws,'Emulation.setDeviceMetricsOverride',{width:height,height:width,deviceScaleFactor:1,mobile:true});
-    await touch('touchEnd');
-    await sleep(150);
-    if (await evaluate('window.controlWrites.length')!==before+1) throw new Error('Rotation submitted pan');
-  }
   await rcp('set MIXER:Current/Mix/Role 0 0 "Mono"', 'OK');
   await expectBrowser("document.querySelectorAll('.pan-control').length===0", 'Unlink did not hide pan');
   const monoRefusal=await evaluate("fetch('/api/console',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({path:'MIXER:Current/InCh/ToMix/Pan',input:0,mix:0,value:'12'})}).then(async r=>!r.ok && (await r.text()).includes('stereo-linked'))");
   if (!monoRefusal) throw new Error('Server accepted pan on mono mix');
-  await clickText('Edit channel layout');
-  await expectBrowser("document.querySelectorAll('.layout-channel').length===80", 'Layout editor did not load');
-  for (const [width,height] of [[390,844],[844,390]]) {
-    await command(ws,'Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:true});
-    if (!await evaluate("Math.max(document.documentElement.scrollWidth,document.body.scrollWidth)<=innerWidth && [...document.querySelectorAll('.layout-editor button')].every(b=>b.getBoundingClientRect().height>=44)"))
-      throw new Error('Layout editor overflow or small touch targets');
-  }
-  await evaluate(`(() => {
-    const source=document.querySelector('[data-layout-channel="1"]');
-    const target=document.querySelector('[data-layout-channel="0"]');
-    source.dispatchEvent(new DragEvent('dragstart',{bubbles:true}));
-    target.dispatchEvent(new DragEvent('drop',{bubbles:true,cancelable:true}));
-  })()`);
-  await expectBrowser("document.querySelector('.layout-channel').dataset.layoutChannel==='1'", 'Drag reorder did not move channel');
-  await evaluate(`[...document.querySelector('[data-layout-channel="2"]').querySelectorAll('button')].find(b=>b.textContent==='Hide channel').click()`);
-  await evaluate(`(() => { const name=document.querySelector('[aria-label="New group name"]'); name.value='Drums'; name.dispatchEvent(new Event('input',{bubbles:true})); })()`);
-  await evaluate(`document.querySelector('.group-member input[value="0"]').click()`);
-  await evaluate(`document.querySelector('.group-member input[value="1"]').click()`);
-  await clickText('Add group');
-  await expectBrowser("document.querySelector('.layout-group input')?.value==='Drums'", 'Named group was not created');
-  await clickText('Save layout');
-  await expectBrowser("!document.querySelector('.layout-editor') && document.querySelectorAll('.channel-strip:not(.group-strip)').length===79 && document.querySelector('.channel-strip:not(.group-strip)').dataset.channel==='1'", 'Saved order/visibility was not rendered');
-  if (!await evaluate("(async()=>{const l=await fetch('/api/performer/layout').then(r=>r.json()); return l.order[0]===1 && l.hidden.includes(2) && l.groups[0].name==='Drums' && l.groups[0].channels.join(',')==='0,1';})()"))
-    throw new Error('Layout persistence readback failed');
-  // Group faders submit a whole-dB delta, retaining fractional member offsets.
-  await rcp('set MIXER:Current/InCh/ToMix/Level 0 0 -350', 'OK');
-  await rcp('set MIXER:Current/InCh/ToMix/Level 1 0 -725', 'OK');
-  await expectBrowser("document.querySelector('[data-channel=\"1\"]').innerText.includes('-7.25 dB')", 'Group baseline missing');
-  for (const [width,height] of [[390,844],[844,390]]) {
-    await command(ws,'Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:true});
-    await sleep(150);
-    await evaluate("document.querySelector('.channel-strips').scrollTo(0,0); document.querySelector('.group-strip').scrollIntoView({block:'center'})");
-    const point = await evaluate(`(() => { const f=document.querySelector('[data-group-fader]'), r=f.getBoundingClientRect(); return {x:r.x+r.width/2,y:r.y+r.height/2,vertical:getComputedStyle(f).writingMode==='vertical-lr'}; })()`);
-    if (point.vertical !== (width>height)) throw new Error('Group orientation incorrect');
-    const before = await evaluate('window.controlWrites.length');
-    await touch('touchStart',point.x,point.y);
-    await touch('touchMove',point.x-(width>height?40:0),point.y-(width<height?40:0));
-    await touch('touchEnd');
-    if (await evaluate('window.controlWrites.length') !== before) throw new Error('Group swipe submitted a command');
-    await evaluate("document.querySelector('.channel-strips').scrollTo(0,0)");
-    await sleep(100);
-    await touch('touchStart',point.x,point.y);
-    await sleep(260);
-    await touch('touchMove',point.x+(width<height?5:0),point.y-(width>height?5:0));
-    await command(ws,'Emulation.setDeviceMetricsOverride',{width:height,height:width,deviceScaleFactor:1,mobile:true});
-    await sleep(150);
-    await touch('touchEnd');
-    if (!await evaluate(`window.controlWrites.length===${before} && document.querySelector('[data-group-fader]').value==='0'`)) throw new Error('Rotation committed group movement');
-  }
-  await command(ws,'Emulation.setDeviceMetricsOverride',{width:390,height:844,deviceScaleFactor:1,mobile:true});
-  await sleep(150);
-  await evaluate("document.querySelector('.channel-strips').scrollTo(0,0);document.querySelector('.group-strip').scrollIntoView({block:'center'})");
-  const groupPoint = await evaluate(`(() => {const r=document.querySelector('[data-group-fader]').getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2};})()`);
-  const groupWrites = await evaluate('window.controlWrites.length');
-  await touch('touchStart',groupPoint.x,groupPoint.y);
-  await sleep(260);
-  await touch('touchMove',groupPoint.x+3,groupPoint.y);
-  const groupDelta = await evaluate("Number(document.querySelector('[data-group-fader]').value)");
-  if (!Number.isInteger(groupDelta) || groupDelta<=0 || await evaluate('window.controlWrites.length')!==groupWrites) throw new Error('Group delta was not staged in whole dB');
-  await touch('touchEnd');
-  await expectBrowser(`window.controlWrites.length===${groupWrites+1} && document.querySelector('[data-channel="0"]').innerText.includes('${(-350+groupDelta*100)/100} dB')`, 'Touch release failed to apply group movement exactly once');
-  await rcp('get MIXER:Current/InCh/ToMix/Level 1 0',`OK get MIXER:Current/InCh/ToMix/Level 1 0 ${-725+groupDelta*100}`);
-  await rcp('set MIXER:Current/InCh/ToMix/Level 0 0 -350','OK');
-  await rcp('set MIXER:Current/InCh/ToMix/Level 1 0 -725','OK');
-  await expectBrowser("document.querySelector('[data-channel=\"1\"]').innerText.includes('-7.25 dB')", 'Group touch reset missing');
-  await evaluate(`(() => {const f=document.querySelector('[data-group-fader]');f.value='2';f.dispatchEvent(new Event('input',{bubbles:true}));f.dispatchEvent(new Event('change',{bubbles:true}));})()`);
-  await expectBrowser("document.querySelector('[data-channel=\"0\"]').innerText.includes('-1.5 dB') && document.querySelector('[data-channel=\"1\"]').innerText.includes('-5.25 dB')", 'Group movement lost balance or fractional offsets');
-  await rcp('get MIXER:Current/InCh/ToMix/Level 0 0','OK get MIXER:Current/InCh/ToMix/Level 0 0 -150');
-  await rcp('get MIXER:Current/InCh/ToMix/Level 1 0','OK get MIXER:Current/InCh/ToMix/Level 1 0 -525');
-  await evaluate(`(() => {window.groupFetch=window.fetch;window.fetch=function(input,init){const url=typeof input==='string'?input:input.url;if(url.includes('/api/performer/group'))return Promise.resolve(new Response('That mix is not assigned to you.',{status:403}));return window.groupFetch.apply(this,arguments);}; const f=document.querySelector('[data-group-fader]');f.value='1';f.dispatchEvent(new Event('change',{bubbles:true}));})()`);
-  await expectBrowser("document.querySelector('.group-strip [role=alert]').textContent.includes('not assigned')", 'Group refusal message missing');
-  await evaluate('window.fetch=window.groupFetch');
+  // Arrange replaces the legacy layout page. It saves each drag/hide directly,
+  // keeps groups in the layout data without rendering group controls, and never
+  // changes console values merely because a strip is hidden.
+  await expectBrowser("document.querySelector('.reorder-handle') && !document.body.innerText.includes('Edit channel layout')", 'Arrange mode did not replace the legacy layout editor');
+  await expectBrowser("[...document.querySelectorAll('[data-channel=\"2\"] button')].some(button => button.textContent === 'Hide')", 'Arrange channel controls did not load');
+  await rcp('set MIXER:Current/InCh/ToMix/Level 2 0 -350', 'OK');
+  await evaluate("[...document.querySelectorAll('[data-channel=\"2\"] button')].find(button => button.textContent === 'Hide').click()");
+  await expectBrowser("!document.querySelector('[data-channel=\"2\"]') && document.querySelector('.hidden-channels') && document.body.innerText.includes('Hidden. You still hear these in your mix.')", 'Hide did not move a strip to the hidden tray');
+  await rcp('get MIXER:Current/InCh/ToMix/Level 2 0', 'OK get MIXER:Current/InCh/ToMix/Level 2 0 -350');
+  if (!await evaluate("fetch('/api/performer/layout').then(r=>r.json()).then(l=>l.hidden.includes(2))"))
+    throw new Error('Hide was not persisted');
+  await clickText('Show Channel 3');
+  await expectBrowser("document.querySelector('[data-channel=\"2\"]')", 'Show did not restore the hidden strip');
+  if (!await evaluate(`(async()=>{const l=await fetch('/api/performer/layout').then(r=>r.json());l.groups=[{id:'saved-group',name:'Band',channels:[0,1]}];const r=await fetch('/api/performer/layout',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify(l)});return r.ok;})()`))
+    throw new Error('Could not seed a saved group for the performer persistence check');
+  if (!await evaluate("fetch('/api/performer/layout').then(r=>r.json()).then(l=>l.groups[0]?.name==='Band')"))
+    throw new Error('Saved layout groups were not retained');
+  await clickText('Done');
+  await expectBrowser("!document.querySelector('.reorder-handle') && !document.querySelector('.group-strip') && !document.body.innerText.includes('Edit channel layout')", 'Arrange mode left legacy performer controls visible');
   // Hold only the assignment refresh so actual controls can hit server-side
   // revocation before the UI learns of it. No refusal response is fabricated.
   await evaluate(`(async()=>{const assignments=await fetch('/api/performer/mixes').then(r=>r.json());window.assignmentFetch=window.fetch;window.fetch=function(input,init){const url=typeof input==='string'?input:input.url;if(url.includes('/api/performer/mixes'))return Promise.resolve(new Response(JSON.stringify(assignments),{headers:{'content-type':'application/json'}}));return window.assignmentFetch.apply(this,arguments);};})()`);
@@ -393,15 +377,15 @@ try {
     if (response.status!==303) throw new Error('Assignment update failed: '+response.status);
   }
   await rcp('set MIXER:Current/Mix/Role 0 0 "StereoL"', 'OK');
-  await expectBrowser("document.querySelectorAll('.pan-control').length===79", 'Stereo pan missing before revocation');
+  await evaluate("document.querySelector('[data-channel=\"0\"] .channel-name').click()");
+  await expectBrowser("document.querySelectorAll('.channel-panel input[aria-label$=pan]').length===1", 'Stereo pan missing from the channel panel before revocation');
   await evaluate(`(()=>{window.refusalResults=[];const original=window.fetch;window.fetch=async function(input,init){const response=await original.apply(this,arguments);const url=typeof input==='string'?input:input.url;if(init?.method==='POST' || input?.method==='POST')window.refusalResults.push({url,status:response.status,body:await response.clone().text()});return response;};})()`);
   await assignSinger('mixes=2');
   for (const action of [
     `document.querySelector('[data-channel="0"] [data-action="mute"]').click()`,
     `document.querySelector('[data-channel="0"] [data-action="solo"]').click()`,
     `(()=>{const f=document.querySelector('[data-channel="0"] .send-control input');f.value='-3';f.dispatchEvent(new Event('input',{bubbles:true}));})()`,
-    `(()=>{const f=document.querySelector('[data-group-fader]');f.value='1';f.dispatchEvent(new Event('change',{bubbles:true}));})()`,
-    `(()=>{const f=document.querySelector('[data-channel="0"] .pan-control input');f.value='12';f.dispatchEvent(new Event('input',{bubbles:true}));})()`
+    `(()=>{const f=document.querySelector('.channel-panel input[aria-label$=pan]');f.value='12';f.dispatchEvent(new Event('input',{bubbles:true}));})()`
   ]) {
     const count=await evaluate('window.refusalResults.length');
     await evaluate(action);
@@ -409,48 +393,25 @@ try {
     await expectBrowser("document.querySelector('.performer').innerText.includes('not assigned')", 'Actual assignment refusal was not shown');
     await sleep(100);
   }
-  await rcp('get MIXER:Current/InCh/ToMix/Level 0 0', 'OK get MIXER:Current/InCh/ToMix/Level 0 0 -150');
+  // The earlier fractional-input assertion deliberately moved this channel to
+  // -4 dB. Keep the later authorization check aligned with that real value.
+  await rcp('get MIXER:Current/InCh/ToMix/Level 0 0', 'OK get MIXER:Current/InCh/ToMix/Level 0 0 -400');
   await rcp('get MIXER:Current/InCh/ToMix/On 0 0', 'OK get MIXER:Current/InCh/ToMix/On 0 0 0');
   await evaluate('window.fetch=window.assignmentFetch');
   await expectBrowser("!document.querySelector('.channel-strip') && document.body.innerText.includes('no longer assigned')", 'Revocation silently switched the performer to another mix');
   await assignSinger('mixes=1&mixes=2');
-  await expectBrowser("document.querySelectorAll('.channel-strip').length===80", 'Restored assignment did not return controls');
+  await expectBrowser("document.querySelectorAll('.channel-strip').length===79", 'Restored assignment did not return controls');
   await rcp('set MIXER:Current/Mix/Role 0 0 "Mono"', 'OK');
 
-  await rcp('get MIXER:Current/InCh/ToMix/Level 0 0','OK get MIXER:Current/InCh/ToMix/Level 0 0 -150');
+  await rcp('get MIXER:Current/InCh/ToMix/Level 0 0','OK get MIXER:Current/InCh/ToMix/Level 0 0 -400');
   await rcp('set MIXER:Current/InCh/ToMix/Level 0 0 -400','OK');
   await evaluate("fetch('/signout',{method:'POST'}).then(()=>fetch('/signin',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:'name=Singer&passcode=5678'}))");
   await command(ws,'Page.navigate',{url:`http://127.0.0.1:${port}/`});
   await expectBrowser("document.querySelectorAll('.mix-picker button').length===2", 'New session picker missing');
   await evaluate("document.querySelector('.mix-picker button').click()");
-  await expectBrowser("document.querySelectorAll('.channel-strip:not(.group-strip)').length===79 && document.querySelector('.channel-strip:not(.group-strip)').dataset.channel==='1' && document.querySelector('.hidden-channels')", 'Saved layout did not return on new sign-in');
-  await clickText('Edit channel layout');
-  await expectBrowser("document.querySelector('.layout-group input')?.value==='Drums'", 'Saved group did not return');
-  // A refused save keeps the draft open and leaves persisted data untouched.
-  await evaluate("(() => {const n=document.querySelector('.layout-group input'); n.value=''; n.dispatchEvent(new Event('input',{bubbles:true}));})()");
-  await clickText('Save layout');
-  await expectBrowser("document.querySelector('.layout-editor [role=alert]').textContent.includes('Give each group a name')", 'Refused save has no readable message');
-  if (!await evaluate("fetch('/api/performer/layout').then(r=>r.json()).then(l=>l.groups[0].name==='Drums')"))
-    throw new Error('Invalid draft replaced saved group');
-  await evaluate("(() => {const n=document.querySelector('.layout-group input'); n.value='Band'; n.dispatchEvent(new Event('input',{bubbles:true}));})()");
-  await clickText('Save layout');
-  await expectBrowser("!document.querySelector('.layout-editor')", 'Group rename did not save');
-  if (!await evaluate("fetch('/api/performer/layout').then(r=>r.json()).then(l=>l.groups[0].name==='Band')"))
-    throw new Error('Group rename did not persist');
-  await clickText('Edit channel layout');
-  await expectBrowser("document.querySelector('.layout-group input')?.value==='Band'", 'Renamed group did not load');
-  await clickText('Delete group');
-  await evaluate(`[...document.querySelector('[data-layout-channel="2"]').querySelectorAll('button')].find(b=>b.textContent==='Show channel').click()`);
-  await clickText('Save layout');
-  await expectBrowser("!document.querySelector('.layout-editor') && document.querySelectorAll('.channel-strip').length===80", 'Show channel did not restore strip');
-  if (!await evaluate("fetch('/api/performer/layout').then(r=>r.json()).then(l=>l.groups.length===0 && l.hidden.length===0)"))
-    throw new Error('Group deletion/show channel did not persist');
-  // Cancel discards staged ordering, and layout edits preserve console values.
-  await clickText('Edit channel layout');
-  await expectBrowser("document.querySelector('.layout-channel')?.dataset.layoutChannel==='1'", 'Editor order missing');
-  await evaluate("document.querySelector('.layout-channel button:nth-of-type(2)').click()");
-  await clickText('Cancel layout changes');
-  await expectBrowser("!document.querySelector('.layout-editor') && document.querySelector('.channel-strip:not(.group-strip)').dataset.channel==='1'", 'Cancel changed displayed order');
+  await expectBrowser("document.querySelectorAll('.channel-strip').length===79 && !document.querySelector('.group-strip')", 'Performer layout did not return without group UI');
+  if (!await evaluate("fetch('/api/performer/layout').then(r=>r.json()).then(l=>l.groups[0]?.name==='Band')"))
+    throw new Error('Performer reload discarded saved groups');
   await rcp('get MIXER:Current/InCh/ToMix/Level 0 0', 'OK get MIXER:Current/InCh/ToMix/Level 0 0 -400');
   await rcp('get MIXER:Current/InCh/ToMix/On 0 0', 'OK get MIXER:Current/InCh/ToMix/On 0 0 0');
   // Personal solo restores exact wire levels and keeps engineer changes.
@@ -458,26 +419,26 @@ try {
   await expectBrowser("document.querySelector('[data-channel=\"2\"]').innerText.includes('-3.5 dB')", 'Solo baseline did not reach the browser');
   const soloButton = input => `document.querySelector('[data-channel="${input}"]').querySelector('[data-action="solo"]')`;
   await evaluate(`${soloButton(0)}.click()`);
-  await expectBrowser("document.body.innerText.includes('Solo active (by ') && document.querySelector('[data-channel=\"2\"]').innerText.includes('Off')", 'Solo did not turn the other send off');
+  await expectBrowser("document.querySelector('.solo-banner')?.innerText.includes('Solo: Lead Vocal') && document.querySelector('.solo-banner button')?.textContent==='Clear solo' && document.querySelector('[data-channel=\"2\"]').innerText.includes('Paused')", 'Solo did not show its persistent banner or pause other channels');
   await rcp('get MIXER:Current/InCh/ToMix/Level 2 0', 'OK get MIXER:Current/InCh/ToMix/Level 2 0 -32768');
   await rcp('set MIXER:Current/InCh/ToMix/Level 3 0 -725', 'OK');
   await expectBrowser("document.querySelector('[data-channel=\"3\"]').innerText.includes('-7.25 dB')", 'Engineer change during solo missing');
-  await evaluate(`${soloButton(0)}.click()`);
-  await expectBrowser("!document.body.innerText.includes('Solo active (by ') && document.querySelector('[data-channel=\"2\"]').innerText.includes('-3.5 dB')", 'Solo did not restore fractional level');
+  await evaluate("document.querySelector('.solo-banner button').click()");
+  await expectBrowser("!document.querySelector('.solo-banner') && document.querySelector('[data-channel=\"2\"]').innerText.includes('-3.5 dB')", 'Clear solo did not restore fractional level');
   await rcp('get MIXER:Current/InCh/ToMix/Level 3 0', 'OK get MIXER:Current/InCh/ToMix/Level 3 0 -725');
   await sleep(300); // Let restoration readbacks drain before starting another solo.
-  await evaluate(`${soloButton(1)}.click()`);
-  await expectBrowser("document.body.innerText.includes('Solo active (by ')", 'Second solo did not start');
+  await evaluate(`${soloButton(4)}.click()`);
+  await expectBrowser("document.querySelector('.solo-banner')?.innerText.includes('Solo: Channel 5')", 'Second solo did not start');
   await rcp('ssrecall_ex MIXER:Lib/Scene 2', 'OK');
   await expectBrowser("document.title === 'Show · Monitor Mix' && document.querySelector('.scene-bar').innerText.includes('Show')", 'Scene recall did not update mix page/title');
-  await expectBrowser("document.body.innerText.includes('Scene changed — solo cleared') && !document.body.innerText.includes('Solo active (by ')", 'Scene recall did not clear solo and explain why');
+  await expectBrowser("document.body.innerText.includes('New scene, so Solo turned off.') && !document.querySelector('.solo-banner')", 'Scene recall did not clear solo and explain why');
   await rcp('get MIXER:Current/InCh/ToMix/Level 0 0', 'OK get MIXER:Current/InCh/ToMix/Level 0 0 -1200');
   await evaluate("[...document.querySelectorAll('button')].find(b=>b.textContent==='Choose another mix').click()");
   await expectBrowser("document.querySelectorAll('.mix-picker button').length === 2 && document.title === 'Show · Monitor Mix'", 'Picker lost current scene');
   await rcp('ssrecall_ex MIXER:Lib/Scene 3', 'OK');
   await expectBrowser("document.title === 'Scene 3 · Monitor Mix' && document.querySelector('.scene-bar').innerText.includes('Scene 3')", 'Unnamed scene missing on picker');
   await evaluate("document.querySelector('.mix-picker button').click()");
-  await expectBrowser("document.querySelectorAll('.channel-strip').length===80 && document.title==='Scene 3 · Monitor Mix' && document.querySelector('.scene-bar').innerText.includes('Scene 3')", 'Unnamed scene missing on mix screen');
+  await expectBrowser("document.querySelectorAll('.channel-strip').length===79 && document.title==='Scene 3 · Monitor Mix' && document.querySelector('.scene-bar').innerText.includes('Scene 3')", 'Unnamed scene missing on mix screen');
   await evaluate("[...document.querySelectorAll('button')].find(b=>b.textContent==='Choose another mix').click()");
   // Regression: losing the solo owner must still leave an authorized recovery
   // path. Exercise real HTTP authorization, admin UI and TCP console readback.
@@ -544,7 +505,7 @@ try {
   await command(ws,'Page.navigate',{url:`http://127.0.0.1:${port}/`});
   await expectBrowser("document.querySelectorAll('.mix-picker button').length===2", 'Performer picker missing after recovery checks');
   await stop(fake); fake = null;
-  await expectBrowser("document.querySelector('.scene-bar').innerText.includes('Console disconnected — scene unknown')", 'Disconnected console left stale scene name');
+  await expectBrowser("document.querySelector('.scene-bar').innerText.includes('Lost the sound desk. Trying again…')", 'Disconnected console left stale scene name');
   await evaluate("document.querySelector('.mix-picker button').click()");
   await expectBrowser("[...document.querySelectorAll('.channel-strip input, .channel-strip button:not(.reorder-handle)')].every(e=>e.disabled)", 'Disconnected controls remained enabled');
   ws.close();
