@@ -145,13 +145,23 @@ try {
     throw new Error(label + ": " + await evaluate("JSON.stringify({title:document.title,text:document.body.innerText.slice(0,2000)})"));
   }
   await rcp('set MIXER:Current/InCh/Label/Name 0 0 "Lead Vocal"', 'OK');
+  // Leave input 1 unnamed for the first-layout assertion; the rest keep their
+  // explicit console labels so the acceptance run still has a full rail.
+  for (let input = 2; input < 80; input++)
+    engineer.write(`set MIXER:Current/InCh/Label/Name ${input} 0 "Channel ${input + 1}"\n`);
   await rcp('set MIXER:Current/InCh/ToMix/Level 0 0 -350', 'OK');
   await rcp('set MIXER:Current/InCh/ToMix/On 0 0 1', 'OK');
   await command(ws, 'Page.navigate', {url:`http://127.0.0.1:${port}/`});
   await expectBrowser("document.querySelectorAll('.mix-picker button').length === 2 && document.title === 'Soundcheck · Monitor Mix'", 'Assigned-mix picker or live scene missing');
   await evaluate("document.querySelector('.mix-picker button').click()");
+  // A first layout must hide raw empty console labels. The renderer may use a
+  // friendly fallback after a performer explicitly shows one, but that fallback
+  // cannot make an unnamed input visible by default.
+  await expectBrowser("!document.querySelector('[data-channel=\"1\"]') && document.querySelector('.hidden-channels')", 'First layout left an unnamed console input visible');
+  if (!await evaluate("fetch('/api/performer/layout').then(r=>r.json()).then(l=>l.hidden.includes(1))"))
+    throw new Error('First-layout unnamed input was not persisted as hidden');
   const strip = "document.querySelector('.channel-strip')";
-  await expectBrowser(`document.querySelectorAll('.channel-strip').length === 80 && ${strip}?.innerText.includes('-3.5 dB') && ${strip}?.innerText.includes('Lead Vocal')`, 'Console fractional level/name was not rendered');
+  await expectBrowser(`document.querySelectorAll('.channel-strip').length === 79 && ${strip}?.innerText.includes('-3.5 dB') && ${strip}?.innerText.includes('Lead Vocal')`, 'Console fractional level/name was not rendered');
   await expectBrowser(`${strip}.querySelector('.channel-color').getAttribute('aria-label')==='Channel color: Blue'`, 'Initial console color missing');
   await rcp('set MIXER:Current/InCh/Label/Color 0 0 "Red"', 'OK');
   await expectBrowser(`${strip}.querySelector('.channel-color').getAttribute('aria-label')==='Channel color: Red' && getComputedStyle(${strip}.querySelector('.channel-color')).backgroundColor==='rgb(244, 67, 54)'`, 'Live console color missing');
@@ -307,11 +317,11 @@ try {
     await command(ws,'Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile:true});
     await sleep(150);
     await evaluate("document.querySelector('.channel-strips').scrollTo(0,0); document.querySelector('.channel-strips').scrollIntoView({block:'center'})");
-    await dragStrip(1,0);
-    await expectBrowser("document.querySelector('.channel-strip:not(.group-strip)').dataset.channel==='1' && !document.querySelector('.reorder-handle').disabled", 'Touch drag did not reorder actual strips');
-    if (!await evaluate("fetch('/api/performer/layout').then(r=>r.json()).then(l=>l.order[0]===1 && l.order[1]===0)"))
+    await dragStrip(3,0);
+    await expectBrowser("document.querySelector('.channel-strip:not(.group-strip)').dataset.channel==='3' && !document.querySelector('.reorder-handle').disabled", 'Touch drag did not reorder actual strips');
+    if (!await evaluate("fetch('/api/performer/layout').then(r=>r.json()).then(l=>l.order[0]===3 && l.order[1]===0)"))
       throw new Error('Touch drag order was not persisted');
-    await dragStrip(0,1);
+    await dragStrip(0,3);
     await expectBrowser("document.querySelector('.channel-strip').dataset.channel==='0' && !document.querySelector('.reorder-handle').disabled", 'Touch drag did not restore strip order');
   }
   // A refused reorder must not present a new order as saved.
@@ -327,7 +337,7 @@ try {
       return original.apply(this,arguments);
     };
   })()`);
-  await dragStrip(1,0);
+  await dragStrip(3,0);
   await expectBrowser("document.body.innerText.includes('Channel reorder was refused.') && !document.querySelector('.reorder-handle').disabled", 'Refused reorder did not show an error');
   if (!await evaluate(`document.querySelector('.channel-strip').dataset.channel==='0' && window.controlWrites.length===${writesBeforeReorder}`))
     throw new Error('Reorder changed sound or a refused reorder changed the displayed order');
@@ -390,7 +400,7 @@ try {
   await evaluate('window.fetch=window.assignmentFetch');
   await expectBrowser("!document.querySelector('.channel-strip') && document.body.innerText.includes('no longer assigned')", 'Revocation silently switched the performer to another mix');
   await assignSinger('mixes=1&mixes=2');
-  await expectBrowser("document.querySelectorAll('.channel-strip').length===80", 'Restored assignment did not return controls');
+  await expectBrowser("document.querySelectorAll('.channel-strip').length===79", 'Restored assignment did not return controls');
   await rcp('set MIXER:Current/Mix/Role 0 0 "Mono"', 'OK');
 
   await rcp('get MIXER:Current/InCh/ToMix/Level 0 0','OK get MIXER:Current/InCh/ToMix/Level 0 0 -400');
@@ -399,7 +409,7 @@ try {
   await command(ws,'Page.navigate',{url:`http://127.0.0.1:${port}/`});
   await expectBrowser("document.querySelectorAll('.mix-picker button').length===2", 'New session picker missing');
   await evaluate("document.querySelector('.mix-picker button').click()");
-  await expectBrowser("document.querySelectorAll('.channel-strip').length===80 && !document.querySelector('.group-strip')", 'Performer layout did not return without group UI');
+  await expectBrowser("document.querySelectorAll('.channel-strip').length===79 && !document.querySelector('.group-strip')", 'Performer layout did not return without group UI');
   if (!await evaluate("fetch('/api/performer/layout').then(r=>r.json()).then(l=>l.groups[0]?.name==='Band')"))
     throw new Error('Performer reload discarded saved groups');
   await rcp('get MIXER:Current/InCh/ToMix/Level 0 0', 'OK get MIXER:Current/InCh/ToMix/Level 0 0 -400');
@@ -417,8 +427,8 @@ try {
   await expectBrowser("!document.querySelector('.solo-banner') && document.querySelector('[data-channel=\"2\"]').innerText.includes('-3.5 dB')", 'Clear solo did not restore fractional level');
   await rcp('get MIXER:Current/InCh/ToMix/Level 3 0', 'OK get MIXER:Current/InCh/ToMix/Level 3 0 -725');
   await sleep(300); // Let restoration readbacks drain before starting another solo.
-  await evaluate(`${soloButton(1)}.click()`);
-  await expectBrowser("document.querySelector('.solo-banner')?.innerText.includes('Solo: Channel 2')", 'Second solo did not start');
+  await evaluate(`${soloButton(4)}.click()`);
+  await expectBrowser("document.querySelector('.solo-banner')?.innerText.includes('Solo: Channel 5')", 'Second solo did not start');
   await rcp('ssrecall_ex MIXER:Lib/Scene 2', 'OK');
   await expectBrowser("document.title === 'Show · Monitor Mix' && document.querySelector('.scene-bar').innerText.includes('Show')", 'Scene recall did not update mix page/title');
   await expectBrowser("document.body.innerText.includes('New scene, so Solo turned off.') && !document.querySelector('.solo-banner')", 'Scene recall did not clear solo and explain why');
@@ -428,7 +438,7 @@ try {
   await rcp('ssrecall_ex MIXER:Lib/Scene 3', 'OK');
   await expectBrowser("document.title === 'Scene 3 · Monitor Mix' && document.querySelector('.scene-bar').innerText.includes('Scene 3')", 'Unnamed scene missing on picker');
   await evaluate("document.querySelector('.mix-picker button').click()");
-  await expectBrowser("document.querySelectorAll('.channel-strip').length===80 && document.title==='Scene 3 · Monitor Mix' && document.querySelector('.scene-bar').innerText.includes('Scene 3')", 'Unnamed scene missing on mix screen');
+  await expectBrowser("document.querySelectorAll('.channel-strip').length===79 && document.title==='Scene 3 · Monitor Mix' && document.querySelector('.scene-bar').innerText.includes('Scene 3')", 'Unnamed scene missing on mix screen');
   await evaluate("[...document.querySelectorAll('button')].find(b=>b.textContent==='Choose another mix').click()");
   // Regression: losing the solo owner must still leave an authorized recovery
   // path. Exercise real HTTP authorization, admin UI and TCP console readback.

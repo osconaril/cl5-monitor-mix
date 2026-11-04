@@ -104,6 +104,7 @@ pub(super) fn performer(props: &PerformerProps) -> Html {
     let dismissed_notice = use_state(|| None::<String>);
     let reordering = use_state(|| false);
     let reorder_pending = use_mut_ref(|| false);
+    let initial_hidden_saved = use_mut_ref(|| false);
     let layout_error = use_state(String::new);
     let load_generation = use_state(|| 0u32);
     {
@@ -142,7 +143,10 @@ pub(super) fn performer(props: &PerformerProps) -> Html {
             || ()
         });
     }
-    let channel_names: Vec<String> = (0..80)
+    // Keep the wire value separate from the display fallback. A fallback such
+    // as "Channel 2" is useful once a performer deliberately shows an input,
+    // but it must never make an unnamed input look named on a first layout.
+    let raw_channel_names: Vec<Option<String>> = (0..80)
         .map(|input| {
             live.console
                 .values
@@ -150,10 +154,105 @@ pub(super) fn performer(props: &PerformerProps) -> Html {
                 .map(|name| name.trim_matches('"'))
                 .filter(|name| !name.is_empty())
                 .map(str::to_owned)
+        })
+        .collect();
+    let channel_names: Vec<String> = raw_channel_names
+        .iter()
+        .enumerate()
+        .map(|(input, name)| {
+            name.clone()
                 .unwrap_or_else(|| format!("Channel {}", input + 1))
         })
         .collect();
     let shown_layout = layout.as_ref().cloned().unwrap_or_default();
+    // Empty names are meaningful, so wait for the bridge's complete label
+    // snapshot rather than treating the first unrelated console value as proof
+    // that all 80 labels have arrived.
+    let channel_names_hydrated = (0..80).all(|input| {
+        live.console
+            .values
+            .contains_key(&format!("MIXER:Current/InCh/Label/Name {input} 0"))
+    });
+    {
+        let layout = layout.clone();
+        let error = layout_error.clone();
+        let reordering = reordering.clone();
+        let attempted = initial_hidden_saved.clone();
+        let noop = || ();
+        use_effect_with(
+            (
+                layout.is_some(),
+                channel_names_hydrated,
+                raw_channel_names.clone(),
+            ),
+            move |(loaded, hydrated, names)| {
+                // The layout request can beat the bridge snapshot. Do not turn
+                // an as-yet-unhydrated console into 80 hidden channels; wait
+                // until every label has arrived, including deliberately empty
+                // ones.
+                if !*loaded || !*hydrated || *attempted.borrow() {
+                    return noop;
+                }
+                *attempted.borrow_mut() = true;
+                let Some(current) = (*layout).clone() else {
+                    return noop;
+                };
+                // An empty saved hidden list is the server's first-layout
+                // default. Persist the real unnamed inputs immediately, so
+                // every later device reads the same initial presentation.
+                if !current.hidden.is_empty() {
+                    return noop;
+                }
+                let hidden: Vec<u8> = names
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(input, name)| name.is_none().then_some(input as u8))
+                    .collect();
+                if hidden.is_empty() {
+                    return noop;
+                }
+                let mut next = current;
+                next.hidden = hidden;
+                layout.set(Some(next.clone()));
+                reordering.set(true);
+                let (layout, error, reordering) =
+                    (layout.clone(), error.clone(), reordering.clone());
+                spawn_local(async move {
+                    let result = async {
+                        let response = Request::put("/api/performer/layout")
+                            .json(&next)
+                            .map_err(|_| "Could not prepare your initial layout.".to_owned())?
+                            .send()
+                            .await
+                            .map_err(|_| {
+                                "Could not save your initial layout. Check your connection."
+                                    .to_owned()
+                            })?;
+                        if !response.ok() {
+                            return Err(response
+                                .text()
+                                .await
+                                .unwrap_or_else(|_| "Your initial layout was refused.".into()));
+                        }
+                        response
+                            .json::<Layout>()
+                            .await
+                            .map_err(|_| "Could not read your saved initial layout.".to_owned())
+                    }
+                    .await;
+                    match result {
+                        Ok(saved) => {
+                            layout.set(Some(saved));
+                            error.set(String::new());
+                        }
+                        Err(message) => error.set(message),
+                    }
+                    reordering.set(false);
+                });
+                noop
+            },
+        );
+    }
     {
         let layout = layout.clone();
         let error = layout_error.clone();
