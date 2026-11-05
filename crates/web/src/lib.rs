@@ -1,5 +1,7 @@
 //! CL5 Monitor Mix's browser client, compiled to WebAssembly by Trunk.
 
+// ============================================================================================== //
+
 use gloo_net::http::Request;
 use gloo_timers::callback::{Interval, Timeout};
 use serde::Deserialize;
@@ -12,11 +14,15 @@ use wasm_bindgen_futures::spawn_local;
 use web_sys::{MessageEvent, WebSocket};
 use yew::prelude::*;
 
+// ============================================================================================== //
+
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 struct User {
     name: String,
     role: String,
 }
+
+// ============================================================================================== //
 
 #[derive(Debug, Deserialize)]
 struct Bootstrap {
@@ -24,6 +30,9 @@ struct Bootstrap {
     user: Option<User>,
     users: Vec<String>,
 }
+
+// ============================================================================================== //
+
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 struct AdminUser {
     name: String,
@@ -32,12 +41,18 @@ struct AdminUser {
     mixes: Vec<String>,
     last_sign_in: Option<String>,
 }
+
+// ============================================================================================== //
+
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 struct HistoryRow {
     who: String,
     what: String,
     when: String,
 }
+
+// ============================================================================================== //
+
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 struct ConsoleStatus {
     connected: bool,
@@ -47,16 +62,24 @@ struct ConsoleStatus {
     mix_labels: Vec<String>,
     phones_connected: usize,
 }
+
+// ============================================================================================== //
+
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 struct AdminOverview {
     users: Vec<AdminUser>,
     history: Vec<HistoryRow>,
     console: ConsoleStatus,
 }
+
+// ============================================================================================== //
+
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 struct PerformerMixes {
     mixes: Vec<String>,
 }
+
+// ============================================================================================== //
 
 fn refresh_performer_mixes(mixes: UseStateHandle<Option<PerformerMixes>>) {
     spawn_local(async move {
@@ -65,6 +88,8 @@ fn refresh_performer_mixes(mixes: UseStateHandle<Option<PerformerMixes>>) {
         }
     });
 }
+
+// ============================================================================================== //
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
@@ -76,6 +101,8 @@ enum BridgeMessage {
     },
     Event(BridgeEvent),
 }
+
+// ============================================================================================== //
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 struct BridgeState {
@@ -89,11 +116,15 @@ struct BridgeState {
     solo_notice: Option<String>,
 }
 
+// ============================================================================================== //
+
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 struct SoloStatus {
     owner: String,
     channels: std::collections::BTreeSet<u8>,
 }
+
+// ============================================================================================== //
 
 #[derive(Debug, Deserialize)]
 enum BridgeEvent {
@@ -113,6 +144,8 @@ enum BridgeEvent {
     },
 }
 
+// ============================================================================================== //
+
 #[derive(Clone, Debug, PartialEq)]
 enum Screen {
     Loading,
@@ -122,7 +155,11 @@ enum Screen {
     Unavailable,
 }
 
+// ============================================================================================== //
+
 const SCENE_RECALL_NOTICE_MS: u32 = 3_000;
+
+// ============================================================================================== //
 
 fn connection_notice(connected: bool) -> &'static str {
     if connected {
@@ -132,11 +169,14 @@ fn connection_notice(connected: bool) -> &'static str {
     }
 }
 
+// ============================================================================================== //
+
 /// The sign-in and first-run UI. Later cards extend this component rather than
 /// adding server-side HTML templates.
 #[function_component(App)]
 pub fn app() -> Html {
     let screen = use_state(|| Screen::Loading);
+
     let notice = web_sys::window()
         .and_then(|window| window.location().search().ok())
         .and_then(|search| error_notice(&search));
@@ -162,9 +202,14 @@ pub fn app() -> Html {
 
     match &*screen {
         Screen::Loading => html! { <p role="status">{"Loading Monitor Mix…"}</p> },
+
         Screen::Unavailable => html! {
-            <><h1>{"Monitor Mix"}</h1><p>{"The show-machine server could not be reached. Check the LAN connection and try again."}</p></>
+            <>
+            <h1>{"Monitor Mix"}</h1>
+            <p>{"The show-machine server could not be reached. Check the LAN connection and try again."}</p>
+            </>
         },
+
         Screen::Setup => html! {
             <>
                 <h1>{"Create the first admin"}</h1>
@@ -172,12 +217,19 @@ pub fn app() -> Html {
                 {notice.map(|text| html! { <p role="alert">{text}</p> }).unwrap_or_default()}
                 <form method="post" action="/setup">
                     <label>{"Name"}<input name="name" required=true /></label>
-                    <label>{"4-digit passcode"}<input name="passcode" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" required=true /></label>
+                    <label>
+                        {"4-digit passcode"}
+                        <input name="passcode" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" required=true />
+                    </label>
                     <button>{"Create admin"}</button>
                 </form>
             </>
         },
-        Screen::SignIn(users) => html! { <SignIn users={users.clone()} notice={notice} /> },
+
+        Screen::SignIn(users) => html! {
+            <SignIn users={users.clone()} notice={notice} />
+        },
+
         Screen::SignedIn(user) => {
             // A name becomes "last time" only after the server has accepted
             // its code and restored a signed-in session.
@@ -191,11 +243,15 @@ pub fn app() -> Html {
     }
 }
 
+// ============================================================================================== //
+
 #[derive(Properties, PartialEq)]
 struct SignInProps {
     users: Vec<String>,
     notice: Option<String>,
 }
+
+// ============================================================================================== //
 
 /// A performer never needs to type a name: selecting it reveals a deliberately
 /// small four-digit keypad, which submits as soon as the fourth digit is tapped.
@@ -209,8 +265,12 @@ fn sign_in(props: &SignInProps) -> Html {
     let seconds_left = use_state(|| lock_seconds_from_notice(props.notice.as_deref()));
     let form = use_node_ref();
     let locked = seconds_left.is_some_and(|seconds| seconds > 0);
+
+    // The countdown timer is a side effect that runs once per second while the lockout is active.
+    // It decrements the seconds left until the user can try again.
     {
         let seconds_left = seconds_left.clone();
+
         use_effect_with(*seconds_left, move |seconds| {
             let timer = seconds.filter(|seconds| *seconds > 0).map(|_| {
                 Interval::new(1_000, {
@@ -223,6 +283,7 @@ fn sign_in(props: &SignInProps) -> Html {
             move || drop(timer)
         });
     }
+
     let choose = {
         let selected = selected.clone();
         let digits = digits.clone();
@@ -232,27 +293,49 @@ fn sign_in(props: &SignInProps) -> Html {
             digits.set(String::new());
         })
     };
+
+    // The digit callback appends a single digit to the passcode, and submits the form when four
+    // digits are entered. It ignores any non-digit input or attempts to enter more than four
+    // digits.
     let digit = {
         let digits = digits.clone();
         let form = form.clone();
+
         Callback::from(move |value: String| {
             let mut next = (*digits).clone();
+
             if next.len() == 4
                 || value.len() != 1
                 || !value.bytes().all(|byte| byte.is_ascii_digit())
             {
                 return;
             }
+
             next.push_str(&value);
+
             let submit = next.len() == 4;
-            digits.set(next);
+
+            digits.set(next.clone());
+
             if submit {
                 if let Some(form) = form.cast::<web_sys::HtmlFormElement>() {
+                    // The hidden passcode input only picks up `digits` on the next
+                    // render, which is after this submit. Write the fourth digit
+                    // into it directly or the server receives three digits.
+                    if let Some(input) = form
+                        .query_selector("input[name=passcode]")
+                        .ok()
+                        .flatten()
+                        .and_then(|element| element.dyn_into::<web_sys::HtmlInputElement>().ok())
+                    {
+                        input.set_value(&next);
+                    }
                     let _ = form.submit();
                 }
             }
         })
     };
+
     let erase = {
         let digits = digits.clone();
         Callback::from(move |_| {
@@ -261,10 +344,12 @@ fn sign_in(props: &SignInProps) -> Html {
             digits.set(next);
         })
     };
+
     let zero = {
         let digit = digit.clone();
         Callback::from(move |_| digit.emit("0".into()))
     };
+
     let change_name = {
         let selected = selected.clone();
         Callback::from(move |_| {
@@ -272,6 +357,7 @@ fn sign_in(props: &SignInProps) -> Html {
             selected.set(None)
         })
     };
+
     let keypad_key = {
         let digit = digit.clone();
         let digits = digits.clone();
@@ -287,12 +373,20 @@ fn sign_in(props: &SignInProps) -> Html {
             _ => {}
         })
     };
+
     html! {
         <section class="sign-in" aria-label="Sign in">
             <h1>{"Monitor Mix"}</h1>
+
+            // Show a notice if the user has not yet selected a name. Once a name is selected, the
+            // notice is replaced by the keypad and instructions.
             if selected.is_none() {
                 {props.notice.as_ref().map(|text| html! { <p role="alert">{text}</p> }).unwrap_or_default()}
             }
+
+            // Show the keypad and instructions once a name is selected. The form is submitted when
+            // four digits are entered, or when the user presses Enter on the keypad. The form is
+            // hidden from view, but is still present in the DOM so that it can be submitted.
             if let Some(name) = selected.as_ref() {
                 <form method="post" action="/signin" ref={form}>
                     <input type="hidden" name="name" value={name.clone()} />
@@ -321,7 +415,7 @@ fn sign_in(props: &SignInProps) -> Html {
             } else {
                 <h1>{"Tap your name"}</h1>
                 if let Some(last_name) = last_name(&props.users) {
-                    <section class="last-name"><p>{"Last time on this phone"}</p>
+                    <section class="last-name"><p>{"Last time on this device"}</p>
                     {{
                         let choose = choose.clone();
                         let name = last_name.clone();
@@ -343,9 +437,13 @@ fn sign_in(props: &SignInProps) -> Html {
     }
 }
 
+// ============================================================================================== //
+
 fn first_name(name: &str) -> &str {
     name.split_whitespace().next().unwrap_or(name)
 }
+
+// ============================================================================================== //
 
 fn storage(session: bool) -> Option<web_sys::Storage> {
     let window = web_sys::window()?;
@@ -358,6 +456,8 @@ fn storage(session: bool) -> Option<web_sys::Storage> {
     .flatten()
 }
 
+// ============================================================================================== //
+
 fn stored_name(key: &str, session: bool) -> Option<String> {
     storage(session)?
         .get_item(key)
@@ -366,11 +466,15 @@ fn stored_name(key: &str, session: bool) -> Option<String> {
         .filter(|name| !name.is_empty())
 }
 
+// ============================================================================================== //
+
 fn store_name(key: &str, name: &str, session: bool) {
     if let Some(storage) = storage(session) {
         let _ = storage.set_item(key, name);
     }
 }
+
+// ============================================================================================== //
 
 fn remove_name(key: &str, session: bool) {
     if let Some(storage) = storage(session) {
@@ -378,18 +482,26 @@ fn remove_name(key: &str, session: bool) {
     }
 }
 
+// ============================================================================================== //
+
 fn pending_name() -> Option<String> {
     stored_name("cl5.pendingName", true)
 }
+
+// ============================================================================================== //
 
 fn last_name(users: &[String]) -> Option<String> {
     stored_name("cl5.lastName", false).filter(|name| users.contains(name))
 }
 
+// ============================================================================================== //
+
 #[derive(Properties, PartialEq)]
 struct AdminPortalProps {
     user: User,
 }
+
+// ============================================================================================== //
 
 #[function_component(AdminPortal)]
 fn admin_portal(props: &AdminPortalProps) -> Html {
@@ -425,6 +537,8 @@ fn admin_portal(props: &AdminPortalProps) -> Html {
         </>
     }
 }
+
+// ============================================================================================== //
 
 /// Admin recovery remains available after a solo owner is removed or unassigned.
 #[function_component(SoloRecovery)]
@@ -467,11 +581,15 @@ fn solo_recovery() -> Html {
     </section> }
 }
 
+// ============================================================================================== //
+
 #[derive(Properties, PartialEq)]
 struct UserCardProps {
     user: AdminUser,
     mix_labels: Vec<String>,
 }
+
+// ============================================================================================== //
 
 #[function_component(UserCard)]
 fn user_card(props: &UserCardProps) -> Html {
@@ -506,14 +624,57 @@ fn user_card(props: &UserCardProps) -> Html {
     } else {
         html! { <button type="button" onclick={ask_to_delete}>{"Delete user"}</button> }
     };
-    html! { <article class="user-card"><h3>{&user.name}</h3><p>{format!("{} · code {}", user.role, user.passcode)}</p><p>{format!("Mixes: {mixes}")}</p><p>{format!("Last sign-in: {}", user.last_sign_in.as_deref().unwrap_or("Never"))}</p><form method="post" action={format!("/api/admin/users/{encoded}/passcode")}><label>{"New passcode"}<input name="passcode" value="Generate" pattern="([0-9]{4}|Generate)" required=true /></label><button>{"Reset passcode"}</button></form><form method="post" action={format!("/api/admin/users/{encoded}/mixes")}><fieldset><legend>{"Console mixes"}</legend>{for props.mix_labels.iter().enumerate().map(|(index, label)| { let number = index + 1; let selected = user.mixes.contains(&format!("Mix {number}")); html! { <label class="mix-choice"><input type="checkbox" name="mixes" value={number.to_string()} checked={selected} />{format!("Mix {number}: {label}")}</label> } })}</fieldset><button>{"Save mix assignments"}</button></form><form method="post" action={format!("/api/admin/users/{encoded}")}>{delete_controls}</form></article> }
+    html! {
+        <article class="user-card">
+            <h3>{&user.name}</h3>
+            <p>{format!("{} · code {}", user.role, user.passcode)}</p>
+            <p>{format!("Mixes: {mixes}")}</p>
+            <p>{format!("Last sign-in: {}", user.last_sign_in.as_deref().unwrap_or("Never"))}</p>
+
+            <form method="post" action={format!("/api/admin/users/{encoded}/passcode")}>
+                <label>{"New passcode"}
+                    <input name="passcode" value="Generate" pattern="([0-9]{4}|Generate)" required=true />
+                </label>
+                <button>{"Reset passcode"}</button>
+            </form>
+
+            <form method="post" action={format!("/api/admin/users/{encoded}/mixes")}>
+                <fieldset>
+                    <legend>{"Console mixes"}</legend>
+
+                    {
+                        for props.mix_labels.iter().enumerate().map(|(index, label)| {
+                            let number = index + 1;
+                            let selected = user.mixes.contains(&format!("Mix {number}"));
+                            html! {
+                                <label class="mix-choice">
+                                    <input type="checkbox" name="mixes" value={number.to_string()} checked={selected} />
+                                    {format!("Mix {number}: {label}")}
+                                </label>
+                            }
+                        })
+                    }
+                </fieldset>
+
+                <button>{"Save mix assignments"}</button>
+            </form>
+
+            <form method="post" action={format!("/api/admin/users/{encoded}")}>
+                {delete_controls}
+            </form>
+        </article>
+    }
 }
+
+// ============================================================================================== //
 
 fn document_title(window: &web_sys::Window, title: &str) {
     if let Some(document) = window.document() {
         document.set_title(title);
     }
 }
+
+// ============================================================================================== //
 
 #[derive(Clone, Debug, Default, PartialEq)]
 struct LiveState {
@@ -556,11 +717,15 @@ impl Reducible for LiveState {
     }
 }
 
+// ============================================================================================== //
+
 #[derive(Properties, PartialEq)]
 struct LiveConsoleProps {
     #[prop_or_default]
     children: Children,
 }
+
+// ============================================================================================== //
 
 /// One socket supplies the scene bar and all performer controls. Reducer actions
 /// apply to the latest state, including bursts of notifications between renders.
@@ -669,11 +834,15 @@ fn live_console(props: &LiveConsoleProps) -> Html {
     }
 }
 
+// ============================================================================================== //
+
 #[derive(Properties, PartialEq)]
 struct SceneBarProps {
     connected: bool,
     scene: BridgeState,
 }
+
+// ============================================================================================== //
 
 #[function_component(SceneBar)]
 fn scene_bar(props: &SceneBarProps) -> Html {
@@ -707,6 +876,8 @@ fn scene_bar(props: &SceneBarProps) -> Html {
     html! { <header class="scene-bar"><small>{number}</small><strong>{name}</strong></header> }
 }
 
+// ============================================================================================== //
+
 fn error_notice(search: &str) -> Option<String> {
     if let Some(seconds) = lock_seconds(search) {
         Some(format!(
@@ -721,6 +892,8 @@ fn error_notice(search: &str) -> Option<String> {
     }
 }
 
+// ============================================================================================== //
+
 fn lock_seconds(search: &str) -> Option<u64> {
     search
         .contains("error=locked")
@@ -732,11 +905,19 @@ fn lock_seconds(search: &str) -> Option<u64> {
         .flatten()
 }
 
+// ============================================================================================== //
+/* #region Lock Seconds From Notice Function */
+
 fn lock_seconds_from_notice(notice: Option<&str>) -> Option<u64> {
     let notice = notice?;
     let prefix = "Too many wrong codes. Try again in ";
     notice.strip_prefix(prefix)?.split_once(',')?.0.parse().ok()
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Tests */
 
 #[cfg(test)]
 mod tests {
@@ -817,3 +998,7 @@ mod tests {
         );
     }
 }
+
+/* #endregion */
+
+// ============================================================================================== //
