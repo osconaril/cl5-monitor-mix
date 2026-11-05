@@ -473,7 +473,7 @@ impl App {
 			.unwrap()
 			.execute(
 				"INSERT INTO users(name,passcode,role,created_at,updated_at) VALUES(?1,?2,?3,?4,?4)",
-				params![n.trim(),p,role,now]
+				params![n.trim(), p.trim(), role, now]
 			)
 			.map(|_|())
 			.map_err(|_|"That name is already in use.".into())
@@ -510,7 +510,7 @@ impl App {
         transaction
 			.execute(
 				"INSERT INTO users(name,passcode,role,created_at,updated_at) VALUES(?1,?2,'admin',?3,?3)",
-				params![n.trim(), p, now],
+				params![n.trim(), p.trim(), now],
 			)
 			.map_err(|_| "That name is already in use. Try another name.".to_string())?;
         transaction
@@ -638,10 +638,10 @@ impl App {
     fn create_user(&self, actor: &str, f: &NewUser) -> Result<String, String> {
         // If the passcode is "Generate", generate a new random passcode; otherwise, use the
         // provided passcode.
-        let passcode = if f.passcode == "Generate" {
+        let passcode = if f.passcode.trim() == "Generate" {
             generate_passcode()
         } else {
-            f.passcode.clone()
+            f.passcode.trim().to_string()
         };
 
         // Validate the name and passcode before attempting to insert the new user.
@@ -677,10 +677,10 @@ impl App {
     fn reset_passcode(&self, actor: &str, name: &str, requested: &str) -> Result<String, String> {
         // If the requested passcode is "Generate", generate a new random passcode; otherwise, use the
         // provided passcode.
-        let passcode = if requested == "Generate" {
+        let passcode = if requested.trim() == "Generate" {
             generate_passcode()
         } else {
-            requested.into()
+            requested.trim().into()
         };
 
         // Validate the name and passcode before attempting to reset the user's passcode.
@@ -1825,6 +1825,16 @@ mod tests {
 
         let again = call(&app, Request::get("/setup").body(Body::empty()).unwrap()).await;
         assert_eq!(again.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn passcodes_are_stored_without_surrounding_spaces() {
+        // CL5-13 review: a code typed as " 1234 " must sign in later as "1234".
+        let app = App::memory().unwrap();
+        assert!(app.add_first_admin("Corey", " 1234 ").is_ok());
+        assert!(app.user("Corey", "1234").unwrap().is_some());
+        assert!(app.add_user("Denrey", " 5678", "performer").is_ok());
+        assert!(app.user("Denrey", "5678").unwrap().is_some());
     }
 
     #[test]
