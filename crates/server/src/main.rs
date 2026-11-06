@@ -525,7 +525,7 @@ impl App {
             .unwrap()
             .query_row(
                 "SELECT name,role,updated_at FROM users WHERE name=?1 AND passcode=?2",
-                params![n.trim(), p],
+                params![n.trim(), p.trim()],
                 |r| {
                     Ok(User {
                         name: r.get(0)?,
@@ -1825,6 +1825,32 @@ mod tests {
 
         let again = call(&app, Request::get("/setup").body(Body::empty()).unwrap()).await;
         assert_eq!(again.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn first_admin_setup_accepts_a_code_with_surrounding_spaces() {
+        // CL5-13 review: POST /setup panicked looking up the spaced code it had just stored trimmed.
+        let app = App::memory().unwrap();
+        let created = call(
+            &app,
+            Request::post("/setup")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("name=Corey&passcode=+1234+"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::SEE_OTHER);
+        assert!(created.headers().contains_key(header::SET_COOKIE));
+
+        let signed_in = call(
+            &app,
+            Request::post("/signin")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("name=Corey&passcode=1234"))
+                .unwrap(),
+        )
+        .await;
+        assert!(signed_in.headers().contains_key(header::SET_COOKIE));
     }
 
     #[test]
