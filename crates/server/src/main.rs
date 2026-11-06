@@ -1,4 +1,8 @@
 //! Offline LAN sign-in server and the shared CL5 console bridge.
+
+// ============================================================================================== //
+/* #region Imports */
+
 mod console;
 mod layout;
 mod solo;
@@ -29,7 +33,18 @@ use std::{
 };
 use tower_http::services::ServeDir;
 
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Types */
+
 type Db = Arc<Mutex<Connection>>;
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region App Struct */
+
 #[derive(Clone)]
 struct App {
     db: Db,
@@ -40,6 +55,11 @@ struct App {
     live_connections: LiveConnections,
 }
 
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Live Connections Struct */
+
 /// A phone counts as connected only while its signed-in browser has an open
 /// console subscription. Sessions intentionally survive server restarts, but
 /// a browser which has gone away must not remain visible as a live phone.
@@ -49,6 +69,11 @@ struct LiveConnections {
     active: Arc<AtomicUsize>,
     next_id: Arc<AtomicU64>,
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Live Connection Struct */
 
 struct LiveConnection {
     id: u64,
@@ -141,24 +166,48 @@ impl LiveConnections {
         self.active.load(Ordering::Relaxed)
     }
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region User Struct */
+
 #[derive(Clone)]
 struct User {
     name: String,
     role: String,
     updated_at: String,
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Bootstrap Struct */
+
 #[derive(Serialize)]
 struct Bootstrap {
     has_admin: bool,
     user: Option<BootstrapUser>,
     users: Vec<String>,
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Admin Overview Struct */
+
 #[derive(Serialize)]
 struct AdminOverview {
     users: Vec<AdminUser>,
     history: Vec<HistoryRow>,
     console: ConsoleStatus,
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Admin User Struct */
+
 #[derive(Serialize)]
 struct AdminUser {
     name: String,
@@ -167,12 +216,24 @@ struct AdminUser {
     mixes: Vec<String>,
     last_sign_in: Option<String>,
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region History Row Struct */
+
 #[derive(Serialize)]
 struct HistoryRow {
     who: String,
     what: String,
     when: String,
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Console Status Struct */
+
 #[derive(Serialize)]
 struct ConsoleStatus {
     connected: bool,
@@ -182,34 +243,76 @@ struct ConsoleStatus {
     mix_labels: Vec<String>,
     phones_connected: usize,
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Performer Mixes Struct */
+
 #[derive(Serialize)]
 struct PerformerMixes {
     mixes: Vec<String>,
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Bootstrap User Struct */
+
 #[derive(Serialize)]
 struct BootstrapUser {
     name: String,
     role: String,
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Attempt Struct */
+
 struct Attempt {
     failures: u8,
     locked_until: Option<Instant>,
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Credentials Struct */
+
 #[derive(Deserialize)]
 struct Credentials {
     name: String,
     passcode: String,
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region New User Struct */
+
 #[derive(Deserialize)]
 struct NewUser {
     name: String,
     role: String,
     passcode: String,
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Passcode Struct */
+
 #[derive(Deserialize)]
 struct Passcode {
     passcode: String,
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Console Change Struct */
+
 #[derive(Deserialize)]
 struct ConsoleChange {
     path: String,
@@ -217,12 +320,23 @@ struct ConsoleChange {
     mix: u8,
     value: String,
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Console Snapshot Struct */
+
 #[derive(Serialize)]
 struct ConsoleSnapshot {
     kind: &'static str,
     connected: bool,
     state: console::ConsoleState,
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Main Function */
 
 #[tokio::main]
 async fn main() {
@@ -249,9 +363,21 @@ async fn main() {
         .await
         .expect("serve HTTP");
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Setup Instruction Function */
+
 fn setup_instruction(lan_address: std::net::IpAddr, port: u16) -> String {
     format!("First-run setup: open http://{lan_address}:{port}/setup from the stage network.")
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Routes Function */
+
 fn routes(app: App) -> Router {
     Router::new()
         .route("/", get(web_app))
@@ -276,10 +402,19 @@ fn routes(app: App) -> Router {
         .with_state(app)
         .fallback_service(ServeDir::new(web_dist()))
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region App Implementation */
+
 impl App {
+    // Open the SQLite database at the given path, applying any necessary migrations.
     fn open(path: &str) -> rusqlite::Result<Self> {
         let mut c = Connection::open(path)?;
+
         migrate(&mut c)?;
+
         Ok(Self {
             db: Arc::new(Mutex::new(c)),
             attempts: Default::default(),
@@ -287,6 +422,8 @@ impl App {
             live_connections: Default::default(),
         })
     }
+
+    // Open an in-memory SQLite database for testing, applying any necessary migrations.
     #[cfg(test)]
     fn memory() -> rusqlite::Result<Self> {
         let mut c = Connection::open_in_memory()?;
@@ -298,15 +435,21 @@ impl App {
             live_connections: Default::default(),
         })
     }
+
+    // Start the console bridge and connect to the given address.
     fn with_console(mut self, address: String) -> Self {
         self.bridge = console::ConsoleBridge::start(address);
         self
     }
+
+    // Replace the console bridge with a test double.
     #[cfg(test)]
     fn with_bridge(mut self, bridge: console::ConsoleBridge) -> Self {
         self.bridge = bridge;
         self
     }
+
+    // Check if an admin user exists in the database.
     fn has_admin(&self) -> rusqlite::Result<bool> {
         Ok(self.db.lock().unwrap().query_row(
             "SELECT EXISTS(SELECT 1 FROM users WHERE role='admin')",
@@ -314,18 +457,41 @@ impl App {
             |r| r.get::<_, i64>(0),
         )? != 0)
     }
+
+    // Add a user to the database with the given name, passcode, and role.
     #[cfg(test)]
     fn add_user(&self, n: &str, p: &str, role: &str) -> Result<(), String> {
+        // Validate the name and passcode before attempting to insert the new user.
         valid(n, p)?;
+
+        // Get the current UTC time in RFC 3339 format for the created_at and updated_at fields
         let now = Utc::now().to_rfc3339();
-        self.db.lock().unwrap().execute("INSERT INTO users(name,passcode,role,created_at,updated_at) VALUES(?1,?2,?3,?4,?4)",params![n.trim(),p,role,now]).map(|_|()).map_err(|_|"That name is already in use.".into())
+
+        // Insert the new user into the database. If the name is already in use, return an error.
+        self.db
+			.lock()
+			.unwrap()
+			.execute(
+				"INSERT INTO users(name,passcode,role,created_at,updated_at) VALUES(?1,?2,?3,?4,?4)",
+				params![n.trim(), p.trim(), role, now]
+			)
+			.map(|_|())
+			.map_err(|_|"That name is already in use.".into())
     }
+
+    // Add the first admin user to the database with the given name and passcode.
     fn add_first_admin(&self, n: &str, p: &str) -> Result<(), String> {
+        // Validate the name and passcode before attempting to insert the first admin.
         valid(n, p)?;
+
+        // Use a transaction to ensure that the check for existing admins and the insertion of the
+        // new admin are atomic.
         let mut connection = self.db.lock().unwrap();
         let transaction = connection
             .transaction()
             .map_err(|_| "Could not create the first admin. Try again.".to_string())?;
+
+        // Check if an admin already exists
         let has_admin: i64 = transaction
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM users WHERE role='admin')",
@@ -336,24 +502,30 @@ impl App {
         if has_admin != 0 {
             return Err("An administrator already exists. Sign in instead.".into());
         }
+
+        // Get the current UTC time in RFC 3339 format for the created_at and updated_at fields
         let now = Utc::now().to_rfc3339();
+
+        // Insert the first admin user
         transaction
-            .execute(
-                "INSERT INTO users(name,passcode,role,created_at,updated_at) VALUES(?1,?2,'admin',?3,?3)",
-                params![n.trim(), p, now],
-            )
-            .map_err(|_| "That name is already in use. Try another name.".to_string())?;
+			.execute(
+				"INSERT INTO users(name,passcode,role,created_at,updated_at) VALUES(?1,?2,'admin',?3,?3)",
+				params![n.trim(), p.trim(), now],
+			)
+			.map_err(|_| "That name is already in use. Try another name.".to_string())?;
         transaction
             .commit()
             .map_err(|_| "Could not create the first admin. Try again.".to_string())
     }
+
+    // This function retrieves a user from the database based on their name and passcode.
     fn user(&self, n: &str, p: &str) -> rusqlite::Result<Option<User>> {
         self.db
             .lock()
             .unwrap()
             .query_row(
                 "SELECT name,role,updated_at FROM users WHERE name=?1 AND passcode=?2",
-                params![n.trim(), p],
+                params![n.trim(), p.trim()],
                 |r| {
                     Ok(User {
                         name: r.get(0)?,
@@ -364,13 +536,19 @@ impl App {
             )
             .optional()
     }
+
+    // This function retrieves a list of all user names from the database, ordered alphabetically
+    // (case-insensitive).
     fn user_names(&self) -> rusqlite::Result<Vec<String>> {
         let connection = self.db.lock().unwrap();
         let mut statement =
             connection.prepare("SELECT name FROM users ORDER BY name COLLATE NOCASE")?;
         let names = statement.query_map([], |row| row.get(0))?.collect();
+
         names
     }
+
+    // This function retrieves an overview of the admin panel.
     async fn admin_overview(&self) -> rusqlite::Result<AdminOverview> {
         let (users, history, phones_connected) = {
             let c = self.db.lock().unwrap();
@@ -436,6 +614,8 @@ impl App {
             },
         })
     }
+
+    // This function records an administrative action in the admin_history table of the database.
     fn audit(&self, who: &str, what: &str) -> rusqlite::Result<()> {
         self.db.lock().unwrap().execute(
             "INSERT INTO admin_history(who,what,happened_at) VALUES(?1,?2,?3)",
@@ -443,6 +623,8 @@ impl App {
         )?;
         Ok(())
     }
+
+    // This function retrieves the list of mixes assigned to a specific user from the database.
     fn user_mixes(&self, name: &str) -> rusqlite::Result<Vec<String>> {
         let c = self.db.lock().unwrap();
         let mixes = c
@@ -451,30 +633,63 @@ impl App {
             .collect();
         mixes
     }
+
+    // This function creates a new user in the database.
     fn create_user(&self, actor: &str, f: &NewUser) -> Result<String, String> {
-        let passcode = if f.passcode == "Generate" {
+        // If the passcode is "Generate", generate a new random passcode; otherwise, use the
+        // provided passcode.
+        let passcode = if f.passcode.trim() == "Generate" {
             generate_passcode()
         } else {
-            f.passcode.clone()
+            f.passcode.trim().to_string()
         };
+
+        // Validate the name and passcode before attempting to insert the new user.
         valid(&f.name, &passcode)?;
+
+        // Validate the role to ensure it's either "admin" or "performer".
         if !matches!(f.role.as_str(), "admin" | "performer") {
             return Err("Choose admin or performer.".into());
         }
+
+        // Get the current UTC time in RFC 3339 format for the created_at and updated_at fields
         let now = Utc::now().to_rfc3339();
-        self.db.lock().unwrap().execute("INSERT INTO users(name,passcode,role,created_at,updated_at) VALUES(?1,?2,?3,?4,?4)", params![f.name.trim(), passcode, f.role, now]).map_err(|_| "That name is already in use.".to_string())?;
+
+        // Insert the new user into the database. If the name is already in use, return an error.
+        self.db
+			.lock()
+			.unwrap()
+			.execute(
+				"INSERT INTO users(name,passcode,role,created_at,updated_at) VALUES(?1,?2,?3,?4,?4)",
+				params![f.name.trim(), passcode, f.role, now]
+			)
+			.map_err(|_| "That name is already in use.".to_string())?;
+
+        // Record the action in the admin_history table.
         self.audit(actor, &format!("Added {} ({})", f.name.trim(), f.role))
             .map_err(|_| "Could not save history.".to_string())?;
+
+        // Return the passcode of the newly created user.
         Ok(passcode)
     }
+
+    // This function resets the passcode for a specific user in the database.
     fn reset_passcode(&self, actor: &str, name: &str, requested: &str) -> Result<String, String> {
-        let passcode = if requested == "Generate" {
+        // If the requested passcode is "Generate", generate a new random passcode; otherwise, use the
+        // provided passcode.
+        let passcode = if requested.trim() == "Generate" {
             generate_passcode()
         } else {
-            requested.into()
+            requested.trim().into()
         };
+
+        // Validate the name and passcode before attempting to reset the user's passcode.
         valid(name, &passcode)?;
+
+        // Get the current UTC time in RFC 3339 format for the updated_at field
         let now = Utc::now().to_rfc3339();
+
+        // Update the user's passcode in the database. If the user does not exist, return an error.
         let changed = self
             .db
             .lock()
@@ -487,11 +702,18 @@ impl App {
         if changed == 0 {
             return Err("That user no longer exists.".into());
         }
+
+        // Disconnect the user from any live connections after resetting their passcode.
         self.live_connections.disconnect_user(name);
+
+        // Record the action in the admin_history table.
         self.audit(actor, &format!("Reset passcode for {name}"))
             .map_err(|_| "Could not save history.".to_string())?;
+
+        // Return the new passcode of the user.
         Ok(passcode)
     }
+
     fn delete_user(&self, actor: &str, name: &str) -> Result<(), String> {
         if actor == name {
             return Err("You cannot delete yourself.".into());
@@ -527,6 +749,7 @@ impl App {
         self.audit(actor, &format!("Deleted {name} and their saved settings"))
             .map_err(|_| "Could not save history.".to_string())
     }
+
     fn assign_mixes(&self, actor: &str, name: &str, mixes: &[String]) -> Result<(), String> {
         let c = self.db.lock().unwrap();
         if c.query_row(
@@ -558,6 +781,12 @@ impl App {
             .map_err(|_| "Could not save history.".to_string())
     }
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Canonical Mix Numbers Function */
+
 fn canonical_mix_numbers(mixes: &[String]) -> Result<Vec<String>, String> {
     let mut result = Vec::new();
     for value in mixes {
@@ -575,15 +804,23 @@ fn canonical_mix_numbers(mixes: &[String]) -> Result<Vec<String>, String> {
     }
     Ok(result)
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Migrate Function */
+
 fn migrate(c: &mut Connection) -> rusqlite::Result<()> {
     c.execute_batch(
-        "CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY, applied_at TEXT NOT NULL);",
-    )?;
+		"CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY, applied_at TEXT NOT NULL);",
+	)?;
+
     apply_migration(
         c,
         "0001_users",
         include_str!("../migrations/0001_users.sql"),
     )?;
+
     apply_migration(
         c,
         "0002_admin_portal",
@@ -596,6 +833,12 @@ fn migrate(c: &mut Connection) -> rusqlite::Result<()> {
     )?;
     Ok(())
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Apply Migration Function */
+
 fn apply_migration(c: &mut Connection, version: &str, sql: &str) -> rusqlite::Result<()> {
     let transaction = c.transaction()?;
     let applied = transaction.query_row(
@@ -613,25 +856,54 @@ fn apply_migration(c: &mut Connection, version: &str, sql: &str) -> rusqlite::Re
     transaction.commit()?;
     Ok(())
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Valid Function */
+
 fn valid(n: &str, p: &str) -> Result<(), String> {
-    if n.trim().is_empty() {
+    let trimmed_name = n.trim();
+    let trimmed_passcode = p.trim();
+
+    if trimmed_name.is_empty() {
         Err("Enter your name.".into())
-    } else if p.len() != 4 || !p.bytes().all(|c| c.is_ascii_digit()) {
+    } else if trimmed_passcode.chars().count() != 4
+        || !trimmed_passcode.bytes().all(|c| c.is_ascii_digit())
+    {
         Err("Passcode must be exactly 4 digits.".into())
     } else {
         Ok(())
     }
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Web Dist Function */
+
 fn web_dist() -> PathBuf {
     env::var_os("CL5_WEB_DIST")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("crates/web/dist"))
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Web App Function */
+
 async fn web_app() -> Response {
     let index = std::fs::read_to_string(web_dist().join("index.html"))
         .unwrap_or_else(|_| include_str!("../../web/index.html").to_owned());
     ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], index).into_response()
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Bootstrap Function */
+
 async fn bootstrap(State(a): State<App>, headers: HeaderMap) -> Json<Bootstrap> {
     let user = session(&a, &headers).map(|user| BootstrapUser {
         name: user.name,
@@ -643,6 +915,12 @@ async fn bootstrap(State(a): State<App>, headers: HeaderMap) -> Json<Bootstrap> 
         users: a.user_names().unwrap_or_default(),
     })
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Console Socket Function */
+
 async fn console_socket(
     ws: WebSocketUpgrade,
     State(a): State<App>,
@@ -659,6 +937,11 @@ async fn console_socket(
     })
     .into_response()
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Stream Console Function */
 
 async fn stream_console(
     mut socket: WebSocket,
@@ -699,6 +982,11 @@ async fn stream_console(
     live_connections.disconnect(&token, connection_id);
 }
 
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Send Console Snapshot Function */
+
 async fn send_console_snapshot(
     socket: &mut WebSocket,
     bridge: &console::ConsoleBridge,
@@ -714,6 +1002,11 @@ async fn send_console_snapshot(
     .await
 }
 
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Send Socket Function */
+
 async fn send_socket<T: Serialize>(socket: &mut WebSocket, message: &T) -> Result<(), ()> {
     let json = serde_json::to_string(message).map_err(|_| ())?;
     socket
@@ -722,12 +1015,22 @@ async fn send_socket<T: Serialize>(socket: &mut WebSocket, message: &T) -> Resul
         .map_err(|_| ())
 }
 
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Solo Request Struct */
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SoloRequest {
     mix: u8,
     channels: std::collections::BTreeSet<u8>,
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Performer Solo Function */
 
 async fn performer_solo(
     State(a): State<App>,
@@ -753,6 +1056,11 @@ async fn performer_solo(
     }
 }
 
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Console Change Function */
+
 async fn console_change(
     State(a): State<App>,
     headers: HeaderMap,
@@ -776,11 +1084,21 @@ async fn console_change(
     }
 }
 
+/* #endregion */
+
+// ============================================================================================== //
+/* #region May Change Mix Function */
+
 /// Performers are limited to the mix numbers recorded by the admin portal;
 /// admins retain emergency control of every mix.
 fn may_change_mix(a: &App, user: &User, mix: u8) -> bool {
     user.role == "admin" || assigned_mixes(a, &user.name).contains(&mix)
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Assigned Mixes Function */
 
 fn assigned_mixes(a: &App, user_name: &str) -> HashSet<u8> {
     a.user_mixes(user_name)
@@ -791,15 +1109,31 @@ fn assigned_mixes(a: &App, user_name: &str) -> HashSet<u8> {
         .filter_map(|mix| mix.strip_prefix("Mix ")?.parse::<u8>().ok()?.checked_sub(1))
         .collect()
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Setup Function */
+
 async fn setup(State(a): State<App>, Form(f): Form<Credentials>) -> Response {
     match a.add_first_admin(&f.name, &f.passcode) {
         Ok(()) => login(&a, a.user(&f.name, &f.passcode).unwrap().unwrap()),
         Err(_) => Redirect::to("/setup?error=setup").into_response(),
     }
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Signin Function */
+
 async fn signin(State(a): State<App>, Form(f): Form<Credentials>) -> Response {
+    let name = f.name.trim();
+    let passcode = f.passcode.trim();
+
+    // Track failed sign-in attempts and lock out after 5 failures for 5 minutes.
     let mut attempts = a.attempts.lock().unwrap();
-    let entry = attempts.entry(f.name.trim().into()).or_insert(Attempt {
+    let entry = attempts.entry(name.into()).or_insert(Attempt {
         failures: 0,
         locked_until: None,
     });
@@ -811,14 +1145,16 @@ async fn signin(State(a): State<App>, Form(f): Form<Credentials>) -> Response {
         entry.locked_until = None
     }
     drop(attempts);
-    match a.user(&f.name, &f.passcode).unwrap_or(None) {
+
+    // Attempt to authenticate the user with the provided credentials.
+    match a.user(name, passcode).unwrap_or(None) {
         Some(u) => {
-            a.attempts.lock().unwrap().remove(f.name.trim());
+            a.attempts.lock().unwrap().remove(name);
             login(&a, u)
         }
         None => {
             let mut m = a.attempts.lock().unwrap();
-            let e = m.entry(f.name.trim().into()).or_insert(Attempt {
+            let e = m.entry(name.into()).or_insert(Attempt {
                 failures: 0,
                 locked_until: None,
             });
@@ -832,6 +1168,12 @@ async fn signin(State(a): State<App>, Form(f): Form<Credentials>) -> Response {
         }
     }
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Locked Redirect Function */
+
 fn locked_redirect(until: Instant) -> Redirect {
     let seconds = until
         .saturating_duration_since(Instant::now())
@@ -839,6 +1181,12 @@ fn locked_redirect(until: Instant) -> Redirect {
         .max(1);
     Redirect::to(&format!("/?error=locked&seconds={seconds}"))
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Signout Function */
+
 async fn signout(State(a): State<App>, h: HeaderMap) -> Response {
     if let Some(t) = cookie(&h) {
         let _ =
@@ -849,6 +1197,12 @@ async fn signout(State(a): State<App>, h: HeaderMap) -> Response {
     }
     Redirect::to("/").into_response()
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Admin Ping Function */
+
 async fn admin_ping(State(a): State<App>, h: HeaderMap) -> Response {
     match session(&a, &h) {
         Some(u) if u.role == "admin" => (StatusCode::OK, "Admin access confirmed.").into_response(),
@@ -856,6 +1210,12 @@ async fn admin_ping(State(a): State<App>, h: HeaderMap) -> Response {
         None => (StatusCode::UNAUTHORIZED, "Sign in first.").into_response(),
     }
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Admin Function */
+
 fn admin(a: &App, h: &HeaderMap) -> Result<User, StatusCode> {
     match session(a, h) {
         Some(u) if u.role == "admin" => Ok(u),
@@ -863,6 +1223,12 @@ fn admin(a: &App, h: &HeaderMap) -> Result<User, StatusCode> {
         None => Err(StatusCode::UNAUTHORIZED),
     }
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Admin Overview Function */
+
 async fn admin_overview(State(a): State<App>, h: HeaderMap) -> Response {
     if let Err(status) = admin(&a, &h) {
         return (
@@ -884,6 +1250,12 @@ async fn admin_overview(State(a): State<App>, h: HeaderMap) -> Response {
             .into_response(),
     }
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Create User Function */
+
 async fn create_user(State(a): State<App>, h: HeaderMap, Form(f): Form<NewUser>) -> Response {
     let actor = match admin(&a, &h) {
         Ok(actor) => actor,
@@ -894,6 +1266,12 @@ async fn create_user(State(a): State<App>, h: HeaderMap, Form(f): Form<NewUser>)
         Err(message) => (StatusCode::BAD_REQUEST, message).into_response(),
     }
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Reset Passcode Function */
+
 async fn reset_passcode(
     State(a): State<App>,
     h: HeaderMap,
@@ -909,6 +1287,12 @@ async fn reset_passcode(
         Err(message) => (StatusCode::BAD_REQUEST, message).into_response(),
     }
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Assign Mixes Function */
+
 async fn assign_mixes(
     State(a): State<App>,
     h: HeaderMap,
@@ -930,6 +1314,12 @@ async fn assign_mixes(
         Err(message) => (StatusCode::BAD_REQUEST, message).into_response(),
     }
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Performer Mixes Function */
+
 async fn performer_mixes(State(a): State<App>, h: HeaderMap) -> Response {
     match session(&a, &h) {
         Some(user) => match a.user_mixes(&user.name) {
@@ -943,6 +1333,12 @@ async fn performer_mixes(State(a): State<App>, h: HeaderMap) -> Response {
         None => (StatusCode::UNAUTHORIZED, "Sign in first.").into_response(),
     }
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Delete User Function */
+
 async fn delete_user(State(a): State<App>, h: HeaderMap, Path(name): Path<String>) -> Response {
     let actor = match admin(&a, &h) {
         Ok(actor) => actor,
@@ -953,6 +1349,12 @@ async fn delete_user(State(a): State<App>, h: HeaderMap, Path(name): Path<String
         Err(message) => (StatusCode::BAD_REQUEST, message).into_response(),
     }
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Login Function */
+
 fn login(a: &App, u: User) -> Response {
     let t: String = rand::rng()
         .sample_iter(&Alphanumeric)
@@ -982,9 +1384,21 @@ fn login(a: &App, u: User) -> Response {
     )
         .into_response()
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Generate Passcode Function */
+
 fn generate_passcode() -> String {
     format!("{:04}", rand::rng().random_range(0..10_000))
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Cookie Function */
+
 fn cookie(h: &HeaderMap) -> Option<&str> {
     h.get(header::COOKIE)?
         .to_str()
@@ -993,19 +1407,31 @@ fn cookie(h: &HeaderMap) -> Option<&str> {
         .map(str::trim)
         .find_map(|x| x.strip_prefix("cl5_session="))
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Session Function */
+
 fn session(a: &App, h: &HeaderMap) -> Option<User> {
     let token = cookie(h)?;
     a.db
-        .lock()
-        .unwrap()
-        .query_row(
-            "SELECT u.name,u.role,u.updated_at FROM sessions s JOIN users u ON u.name=s.user_name WHERE s.token=?1 AND s.user_updated_at=u.updated_at",
-            [token],
-            |r| Ok(User { name: r.get(0)?, role: r.get(1)?, updated_at: r.get(2)? }),
-        )
-        .optional()
-        .ok()?
+		.lock()
+		.unwrap()
+		.query_row(
+			"SELECT u.name,u.role,u.updated_at FROM sessions s JOIN users u ON u.name=s.user_name WHERE s.token=?1 AND s.user_updated_at=u.updated_at",
+			[token],
+			|r| Ok(User { name: r.get(0)?, role: r.get(1)?, updated_at: r.get(2)? }),
+		)
+		.optional()
+		.ok()?
 }
+
+/* #endregion */
+
+// ============================================================================================== //
+/* #region Tests */
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1157,10 +1583,10 @@ mod tests {
     fn migration_ledger_skips_an_already_applied_migration() {
         let mut connection = Connection::open_in_memory().unwrap();
         connection
-            .execute_batch(
-                "CREATE TABLE schema_migrations (version TEXT PRIMARY KEY, applied_at TEXT NOT NULL);",
-            )
-            .unwrap();
+			.execute_batch(
+				"CREATE TABLE schema_migrations (version TEXT PRIMARY KEY, applied_at TEXT NOT NULL);",
+			)
+			.unwrap();
         apply_migration(
             &mut connection,
             "test_once",
@@ -1361,10 +1787,12 @@ mod tests {
         assert!(matches!(
             closed,
             Ok(None)
-                | Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))))
-                // Axum drops a server-side socket without a close frame here;
-                // tungstenite reports that peer closure as a protocol error.
-                | Ok(Some(Err(_)))
+				| Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))))
+				// Axum drops a server-side socket without a close frame here;
+				// tungstenite reports that peer closure as a protocol error.
+				// Axum drops a server-side socket without a close frame here;
+				// tungstenite reports that peer closure as a protocol error.
+				| Ok(Some(Err(_)))
         ));
         assert_eq!(app.live_connections.count(), 0);
     }
@@ -1397,6 +1825,42 @@ mod tests {
 
         let again = call(&app, Request::get("/setup").body(Body::empty()).unwrap()).await;
         assert_eq!(again.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn first_admin_setup_accepts_a_code_with_surrounding_spaces() {
+        // CL5-13 review: POST /setup panicked looking up the spaced code it had just stored trimmed.
+        let app = App::memory().unwrap();
+        let created = call(
+            &app,
+            Request::post("/setup")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("name=Corey&passcode=+1234+"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::SEE_OTHER);
+        assert!(created.headers().contains_key(header::SET_COOKIE));
+
+        let signed_in = call(
+            &app,
+            Request::post("/signin")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("name=Corey&passcode=1234"))
+                .unwrap(),
+        )
+        .await;
+        assert!(signed_in.headers().contains_key(header::SET_COOKIE));
+    }
+
+    #[test]
+    fn passcodes_are_stored_without_surrounding_spaces() {
+        // CL5-13 review: a code typed as " 1234 " must sign in later as "1234".
+        let app = App::memory().unwrap();
+        assert!(app.add_first_admin("Corey", " 1234 ").is_ok());
+        assert!(app.user("Corey", "1234").unwrap().is_some());
+        assert!(app.add_user("Denrey", " 5678", "performer").is_ok());
+        assert!(app.user("Denrey", "5678").unwrap().is_some());
     }
 
     #[test]
@@ -1705,3 +2169,7 @@ mod tests {
             .contains("yourself"));
     }
 }
+
+/* #endregion */
+
+// ============================================================================================== //
