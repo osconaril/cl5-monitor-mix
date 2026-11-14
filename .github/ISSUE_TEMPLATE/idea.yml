@@ -1,0 +1,47 @@
+name: New idea or fix
+description: Tell the builder what you want CL5 to do. Fill in the boxes, then add the ready-to-build label.
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Fill in the boxes below. When you're happy with it, add the **`ready-to-build`** label on the right. Within 15 minutes the builder picks it up and comments here.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What's wrong or missing?
+      description: One or two sentences. What should a performer or the sound engineer be able to do?
+      placeholder: "Example: Performers can't tell which channel is their own vocal, so they turn up the wrong one."
+    validations:
+      required: true
+  - type: dropdown
+    id: who
+    attributes:
+      label: Who uses it?
+      multiple: true
+      options:
+        - A performer, on their phone
+        - The admin or sound engineer
+        - Everyone
+    validations:
+      required: true
+  - type: textarea
+    id: checks
+    attributes:
+      label: How will we know it works?
+      description: One line per thing a person can SEE happen. Keep the AC-1, AC-2 numbering. Add more lines if you need them.
+      value: |
+        - [ ] AC-1 — 
+        - [ ] AC-2 — 
+    validations:
+      required: true
+  - type: textarea
+    id: not
+    attributes:
+      label: What should it NOT change? (optional)
+      placeholder: "Example: Don't change anyone else's mix."
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else? (optional)
+      description: Screenshots, sketches, or how another app does it.
