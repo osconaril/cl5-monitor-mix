@@ -70,6 +70,8 @@ struct AdminOverview {
     users: Vec<AdminUser>,
     history: Vec<HistoryRow>,
     console: ConsoleStatus,
+    // Optional so a server started before this field existed still deserializes.
+    listen_address: Option<String>,
 }
 
 // ============================================================================================== //
@@ -80,6 +82,16 @@ struct PerformerMixes {
 }
 
 // ============================================================================================== //
+
+/// The browser's own reachable host (e.g. "localhost:8080"), used as a fallback
+/// when the server omits `listen_address` (older builds) or binds to 0.0.0.0.
+fn browser_host() -> String {
+    web_sys::window()
+        .map(|window| window.location().host())
+        .and_then(|host| host.ok())
+        .map(String::from)
+        .unwrap_or_default()
+}
 
 fn refresh_performer_mixes(mixes: UseStateHandle<Option<PerformerMixes>>) {
     spawn_local(async move {
@@ -374,6 +386,11 @@ fn sign_in(props: &SignInProps) -> Html {
         })
     };
 
+    // Compute the "last time on this device" name once. It is rendered in its own
+    // section above the name picker, so it must be excluded from that list or it
+    // would appear twice (which is all that is shown when there is one user).
+    let last_user = last_name(&props.users);
+
     html! {
         <section class="sign-in" aria-label="Sign in">
             <h1>{"Monitor Mix"}</h1>
@@ -414,7 +431,7 @@ fn sign_in(props: &SignInProps) -> Html {
                 <button type="button" class="change-name" onclick={change_name}>{format!("‹ Not {}?", first_name(name))}</button>
             } else {
                 <h1>{"Tap your name"}</h1>
-                if let Some(last_name) = last_name(&props.users) {
+                if let Some(last_name) = last_user.as_ref() {
                     <section class="last-name"><p>{"Last time on this device"}</p>
                     {{
                         let choose = choose.clone();
@@ -424,7 +441,7 @@ fn sign_in(props: &SignInProps) -> Html {
                     }}</section>
                 }
                 <div class="name-picker" aria-label="Choose your name">
-                    {for props.users.iter().map(|name| {
+                    {for props.users.iter().filter(|name| Some(*name) != last_user.as_ref()).map(|name| {
                         let choose = choose.clone();
                         let name_for_click = name.clone();
                         let onclick = Callback::from(move |_| choose.emit(name_for_click.clone()));
@@ -528,6 +545,7 @@ fn admin_portal(props: &AdminPortalProps) -> Html {
     html! {
         <>
             <LiveConsole><SoloRecovery /></LiveConsole>
+            <p class="listening" role="status">{format!("CL5 Monitor Mix listening on http://{}", overview.listen_address.as_deref().map(str::to_owned).filter(|address| !address.is_empty()).unwrap_or_else(browser_host))}</p>
             <h1>{"Users"}</h1>
             <p>{format!("Signed in as {}. Console {} at {} · {} phone{} connected.", props.user.name, if overview.console.connected { "connected" } else { "disconnected" }, overview.console.address, overview.console.phones_connected, if overview.console.phones_connected == 1 { "" } else { "s" })}</p>
             <section class="panel"><h2>{"Add user"}</h2><form method="post" action="/api/admin/users"><label>{"Name"}<input name="name" required=true /></label><label>{"Role"}<select name="role"><option value="performer">{"Performer"}</option><option value="admin">{"Admin"}</option></select></label><label>{"4-digit passcode"}<input name="passcode" value="Generate" pattern="([0-9]{4}|Generate)" required=true /></label><button>{"Add user"}</button></form></section>

@@ -21,15 +21,45 @@ cargo test --workspace
 cargo check --workspace --all-targets
 node scripts/browser-smoke.mjs
 ```
+
 ## Web application
 
-The phone UI is a Yew WebAssembly application. Build it before starting the
-LAN server:
+The phone UI is a Yew WebAssembly application. **Trunk builds it, not Cargo** —
+`cargo build` and `cargo run` never recompile the wasm that the server serves.
+After changing anything under `crates/web`, rebuild it with Trunk before
+(re)starting the app, and hard-refresh the page so the browser drops its cached
+`.wasm`/`.js` (on Windows: `Ctrl+Shift+R`).
+
+### Run in a browser (LAN server)
 
 ```bash
-cargo install trunk
+cargo install trunk                          # one-time
 cd crates/web && trunk build --dist dist
-cd ../.. && cargo run -p cl5-server
+cd ../.. && cargo run -p cl5-server          # prints the panel URL (default 0.0.0.0:8080)
+```
+
+Open that URL on any device on the local network.
+
+### Run as a desktop app (Tauri)
+
+The desktop shell is a thin window: it starts `cl5-server` and points the webview
+at `127.0.0.1:8787`. So build the wasm and the native server binary, then launch
+the shell:
+
+```bash
+cd crates/web && trunk build --dist dist
+cd ../..
+cargo build -p cl5-server                    # the shell launches cl5-server next to it
+cargo build -p cl5-desktop
+cargo run -p cl5-desktop
+```
+
+### Rebuild everything from scratch
+
+```bash
+cargo clean
+cd crates/web && trunk build --release --dist dist
+cd ../.. && cargo build -p cl5-server -p cl5-desktop
 ```
 
 For the full phone-size smoke check, run `node scripts/browser-smoke.mjs`; it
