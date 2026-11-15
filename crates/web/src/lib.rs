@@ -89,7 +89,6 @@ fn browser_host() -> String {
     web_sys::window()
         .map(|window| window.location().host())
         .and_then(|host| host.ok())
-        .map(String::from)
         .unwrap_or_default()
 }
 
