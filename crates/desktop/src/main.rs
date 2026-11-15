@@ -4,7 +4,10 @@
 //! process and points the webview at it on a loopback port. Because the web
 //! app, the REST API, and the console WebSocket are all served from the same
 //! origin, no Tauri IPC bridge is required.
-#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
 
 use std::fs;
 use std::net::TcpStream;
@@ -74,7 +77,11 @@ fn main() {
 /// Resolution order: `CL5_DESKTOP_SERVER_BIN`, next to the current executable,
 /// or inside the Tauri resource directory (the bundled layout).
 fn resolve_server_bin(resource_dir: &Path) -> Result<PathBuf, String> {
-    let binary_name = if cfg!(target_os = "windows") { "cl5-server.exe" } else { "cl5-server" };
+    let binary_name = if cfg!(target_os = "windows") {
+        "cl5-server.exe"
+    } else {
+        "cl5-server"
+    };
 
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Ok(value) = std::env::var("CL5_DESKTOP_SERVER_BIN") {
@@ -121,7 +128,10 @@ fn resolve_web_dist(resource_dir: &Path) -> Result<PathBuf, String> {
         }
     }
 
-    Err("could not find a built web app; run `trunk build --dist dist` in `crates/web` first".to_string())
+    Err(
+        "could not find a built web app; run `trunk build --dist dist` in `crates/web` first"
+            .to_string(),
+    )
 }
 
 /// Block until something accepts TCP connections on the server port.
@@ -132,7 +142,9 @@ fn wait_until_ready() -> Result<(), String> {
             return Ok(());
         }
         if Instant::now() >= deadline {
-            return Err(format!("timed out waiting for the server on 127.0.0.1:{PORT}"));
+            return Err(format!(
+                "timed out waiting for the server on 127.0.0.1:{PORT}"
+            ));
         }
         std::thread::sleep(Duration::from_millis(100));
     }
