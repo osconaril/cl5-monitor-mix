@@ -201,6 +201,7 @@ struct AdminOverview {
     users: Vec<AdminUser>,
     history: Vec<HistoryRow>,
     console: ConsoleStatus,
+    listen_address: String,
 }
 
 /* #endregion */
@@ -612,6 +613,9 @@ impl App {
                 mix_labels,
                 phones_connected,
             },
+            // Surface the exact address main() printed at startup so the admin
+            // panel can mirror "CL5 Monitor Mix listening on http://{address}".
+            listen_address: env::var("CL5_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".into()),
         })
     }
 

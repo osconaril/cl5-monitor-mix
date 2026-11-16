@@ -1,5 +1,9 @@
 /target
+crates/desktop/binaries/*
+!crates/desktop/binaries/.gitkeep
+crates/desktop/resources/web/*
 /dist
+/crates/web/dist/
 *.db
 *.db-shm
 *.db-wal
