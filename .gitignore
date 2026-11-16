@@ -1,5 +1,6 @@
 /target
 /crates/desktop/binaries/
+/crates/desktop/resources/web/*
 /dist
 /crates/web/dist/
 *.db

@@ -160,7 +160,7 @@ fn server_bin_candidates(
     candidates
 }
 
-/// Locate the built web app (the `index.html` plus the assets Trunk emits).
+/// Locate the built web app (the `index.html` plus the WebAssembly Trunk emits).
 ///
 /// Resolution order: `CL5_DESKTOP_WEB_DIST`, the `resources/web` copy bundled
 /// by Tauri, or the workspace `crates/web/dist` (the development layout).
@@ -178,7 +178,7 @@ fn resolve_web_dist(resource_dir: &Path) -> Result<PathBuf, String> {
     }
 
     for candidate in candidates {
-        if candidate.join("index.html").is_file() {
+        if contains_built_web_app(&candidate) {
             return Ok(candidate);
         }
     }
@@ -187,6 +187,23 @@ fn resolve_web_dist(resource_dir: &Path) -> Result<PathBuf, String> {
         "could not find a built web app; run `trunk build --dist dist` in `crates/web` first"
             .to_string(),
     )
+}
+
+/// A launch page alone is not a web build. The packaged tree must include the
+/// generated WebAssembly asset which the admin and performer application loads.
+fn contains_built_web_app(path: &Path) -> bool {
+    path.join("index.html").is_file()
+        && fs::read_dir(path)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "wasm")
+            })
 }
 
 /// Block until something accepts TCP connections on the server port.
@@ -231,6 +248,19 @@ mod tests {
             candidates.into_iter().find(|path| path.is_file()),
             Some(server)
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn packaged_web_tree_requires_generated_wasm() {
+        let root =
+            std::env::temp_dir().join(format!("cl5-desktop-web-test-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("index.html"), "<main>Starting</main>").unwrap();
+        assert!(!contains_built_web_app(&root));
+
+        fs::write(root.join("cl5_web_bg.wasm"), b"wasm").unwrap();
+        assert!(contains_built_web_app(&root));
         fs::remove_dir_all(root).unwrap();
     }
 }
