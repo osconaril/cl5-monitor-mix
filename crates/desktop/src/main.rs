@@ -1,9 +1,7 @@
 //! Desktop shell for CL5 Monitor Mix.
 //!
-//! A thin Tauri wrapper: it starts the existing `cl5-server` binary as a child
-//! process and points the webview at it on a loopback port. Because the web
-//! app, the REST API, and the console WebSocket are all served from the same
-//! origin, no Tauri IPC bridge is required.
+//! A Tauri wrapper that lets an admin choose a real CL5 or the bundled fake
+//! console before it starts the local server and opens the web UI.
 #![cfg_attr(
     all(not(debug_assertions), target_os = "windows"),
     windows_subsystem = "windows"
@@ -16,7 +14,7 @@ use std::process::Child;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use tauri::{Manager, RunEvent};
+use tauri::{AppHandle, Manager, RunEvent};
 
 /// Loopback port the spawned server binds to (must match `tauri.conf.json`).
 const PORT: u16 = 8787;
@@ -26,49 +24,77 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const DB_FILE_NAME: &str = "cl5.sqlite";
 
 /// The server child, so the app can terminate it on exit.
-static SERVER: Mutex<Option<Child>> = Mutex::new(None);
+static CHILDREN: Mutex<Vec<Child>> = Mutex::new(Vec::new());
 
 fn main() {
     tauri::Builder::default()
-        .setup(|app| {
-            let resource_dir = app.path().resource_dir()?;
-
-            let server_bin = resolve_server_bin(&resource_dir)?;
-            let web_dist = resolve_web_dist(&resource_dir)?;
-            let db_dir = app.path().app_data_dir()?;
-            fs::create_dir_all(&db_dir)?;
-            let db_path = db_dir.join(DB_FILE_NAME);
-
-            let child = std::process::Command::new(&server_bin)
-                .env("CL5_LISTEN", format!("127.0.0.1:{PORT}"))
-                .env("CL5_WEB_DIST", web_dist)
-                .env("CL5_DATABASE_PATH", db_path)
-                .env("CL5_CONSOLE_ADDRESS", "127.0.0.1:49280")
-                .spawn()
-                .map_err(|error| format!("failed to start cl5-server ({server_bin:?}): {error}"))?;
-
-            *SERVER.lock().unwrap() = Some(child);
-
-            wait_until_ready()
-                .map_err(|error| format!("{error}; is cl5-server built and healthy?"))?;
-
-            if let Some(window) = app.get_webview_window("main") {
-                // The first load raced the spawn; reload now that the server is up.
-                window.eval("window.location.reload()")?;
-            }
-
-            Ok(())
-        })
+        .invoke_handler(tauri::generate_handler![launch_console_mode])
         .build(tauri::generate_context!())
         .expect("failed to start the CL5 Monitor Mix desktop app")
         .run(|_app, event| {
             if let RunEvent::Exit = event {
-                if let Some(mut server) = SERVER.lock().unwrap().take() {
-                    let _ = server.kill();
-                    let _ = server.wait();
+                for mut child in CHILDREN.lock().unwrap().drain(..) {
+                    let _ = child.kill();
+                    let _ = child.wait();
                 }
             }
         });
+}
+
+/// Starts the requested console mode, then starts the local web server.
+#[tauri::command]
+fn launch_console_mode(
+    app: AppHandle,
+    mode: String,
+    address: Option<String>,
+) -> Result<(), String> {
+    if !CHILDREN.lock().unwrap().is_empty() {
+        return Err("CL5 Monitor Mix is already running".into());
+    }
+
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .map_err(|error| error.to_string())?;
+    let console_address = match mode.as_str() {
+        "real" => address
+            .filter(|value| !value.trim().is_empty())
+            .ok_or("Enter the real CL5 address before connecting.")?,
+        "fake" => {
+            let fake_bin = resolve_fake_console_bin(&resource_dir)?;
+            let fake = std::process::Command::new(&fake_bin)
+                .env("FAKE_CONSOLE_ADDR", "127.0.0.1:49280")
+                .spawn()
+                .map_err(|error| format!("failed to start fake-console ({fake_bin:?}): {error}"))?;
+            CHILDREN.lock().unwrap().push(fake);
+            "127.0.0.1:49280".into()
+        }
+        _ => return Err("Choose either the real CL5 or the fake console.".into()),
+    };
+
+    let server_bin = resolve_server_bin(&resource_dir)?;
+    let web_dist = resolve_web_dist(&resource_dir)?;
+    let db_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| error.to_string())?;
+    fs::create_dir_all(&db_dir).map_err(|error| error.to_string())?;
+    let db_path = db_dir.join(DB_FILE_NAME);
+    let server = std::process::Command::new(&server_bin)
+        .env("CL5_LISTEN", format!("127.0.0.1:{PORT}"))
+        .env("CL5_WEB_DIST", web_dist)
+        .env("CL5_DATABASE_PATH", db_path)
+        .env("CL5_CONSOLE_ADDRESS", console_address)
+        .spawn()
+        .map_err(|error| format!("failed to start cl5-server ({server_bin:?}): {error}"))?;
+    CHILDREN.lock().unwrap().push(server);
+
+    wait_until_ready().map_err(|error| format!("{error}; is cl5-server built and healthy?"))?;
+    app.get_webview_window("main")
+        .ok_or("the main window is unavailable")?
+        .eval("window.location.replace('http://127.0.0.1:8787/')")
+        .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 /// Locate the `cl5-server` executable.
@@ -76,17 +102,30 @@ fn main() {
 /// Resolution order: `CL5_DESKTOP_SERVER_BIN`, next to the current executable,
 /// or inside the Tauri resource directory (the bundled layout).
 fn resolve_server_bin(resource_dir: &Path) -> Result<PathBuf, String> {
+    resolve_sidecar_bin(resource_dir, "CL5_DESKTOP_SERVER_BIN", "cl5-server")
+}
+
+/// Locate the bundled fake console executable.
+fn resolve_fake_console_bin(resource_dir: &Path) -> Result<PathBuf, String> {
+    resolve_sidecar_bin(resource_dir, "CL5_DESKTOP_FAKE_CONSOLE_BIN", "fake-console")
+}
+
+fn resolve_sidecar_bin(
+    resource_dir: &Path,
+    environment_name: &str,
+    binary_stem: &str,
+) -> Result<PathBuf, String> {
     let binary_name = if cfg!(target_os = "windows") {
-        "cl5-server.exe"
+        format!("{binary_stem}.exe")
     } else {
-        "cl5-server"
+        binary_stem.to_string()
     };
 
     let candidates = server_bin_candidates(
         resource_dir,
-        std::env::var_os("CL5_DESKTOP_SERVER_BIN"),
+        std::env::var_os(environment_name),
         std::env::current_exe().ok(),
-        binary_name,
+        &binary_name,
     );
 
     for candidate in candidates {
@@ -96,7 +135,7 @@ fn resolve_server_bin(resource_dir: &Path) -> Result<PathBuf, String> {
     }
 
     Err(format!(
-        "could not find `{binary_name}`; build it with `cargo build -p cl5-server` and keep it next to the app"
+        "could not find `{binary_name}`; prepare the desktop sidecars and keep it next to the app"
     ))
 }
 

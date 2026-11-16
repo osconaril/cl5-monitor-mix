@@ -7,6 +7,7 @@
     "frontendDist": "resources/web"
   },
   "app": {
+    "withGlobalTauri": true,
     "windows": [
       {
         "label": "main",
@@ -14,7 +15,7 @@
         "width": 480,
         "height": 820,
         "resizable": true,
-        "url": "http://127.0.0.1:8787/"
+        "url": "launcher.html"
       }
     ]
   },
@@ -22,7 +23,8 @@
     "active": true,
     "targets": "all",
     "externalBin": [
-      "binaries/cl5-server"
+      "binaries/cl5-server",
+      "binaries/fake-console"
     ],
     "resources": [
       "resources/web"
