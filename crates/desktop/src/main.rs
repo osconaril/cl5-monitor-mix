@@ -26,6 +26,27 @@ const DB_FILE_NAME: &str = "cl5.sqlite";
 /// The server child, so the app can terminate it on exit.
 static CHILDREN: Mutex<Vec<Child>> = Mutex::new(Vec::new());
 
+/// Children started during one launch attempt.  They are only made visible to
+/// the running app after every setup step succeeds; otherwise `Drop` tears
+/// them down so a failed attempt can be retried.
+#[derive(Default)]
+struct PendingChildren(Vec<Child>);
+
+impl PendingChildren {
+    fn commit(mut self) {
+        CHILDREN.lock().unwrap().append(&mut self.0);
+    }
+}
+
+impl Drop for PendingChildren {
+    fn drop(&mut self) {
+        for mut child in self.0.drain(..) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![launch_console_mode])
@@ -52,6 +73,18 @@ fn launch_console_mode(
         return Err("CL5 Monitor Mix is already running".into());
     }
 
+    let mut children = PendingChildren::default();
+    launch_console_mode_inner(app, mode, address, &mut children.0)?;
+    children.commit();
+    Ok(())
+}
+
+fn launch_console_mode_inner(
+    app: AppHandle,
+    mode: String,
+    address: Option<String>,
+    children: &mut Vec<Child>,
+) -> Result<(), String> {
     let resource_dir = app
         .path()
         .resource_dir()
@@ -66,7 +99,7 @@ fn launch_console_mode(
                 .env("FAKE_CONSOLE_ADDR", "127.0.0.1:49280")
                 .spawn()
                 .map_err(|error| format!("failed to start fake-console ({fake_bin:?}): {error}"))?;
-            CHILDREN.lock().unwrap().push(fake);
+            children.push(fake);
             "127.0.0.1:49280".into()
         }
         _ => return Err("Choose either the real CL5 or the fake console.".into()),
@@ -87,7 +120,7 @@ fn launch_console_mode(
         .env("CL5_CONSOLE_ADDRESS", console_address)
         .spawn()
         .map_err(|error| format!("failed to start cl5-server ({server_bin:?}): {error}"))?;
-    CHILDREN.lock().unwrap().push(server);
+    children.push(server);
 
     wait_until_ready().map_err(|error| format!("{error}; is cl5-server built and healthy?"))?;
     app.get_webview_window("main")
@@ -262,5 +295,23 @@ mod tests {
         fs::write(root.join("cl5_web_bg.wasm"), b"wasm").unwrap();
         assert!(contains_built_web_app(&root));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_launch_cleans_up_children_before_a_retry() {
+        assert!(CHILDREN.lock().unwrap().is_empty());
+        let mut pending = PendingChildren::default();
+        pending.0.push(
+            std::process::Command::new("sh")
+                .args(["-c", "sleep 30"])
+                .spawn()
+                .unwrap(),
+        );
+
+        // Dropping this failed attempt must not poison the process-wide
+        // running state that the next launcher invocation checks.
+        drop(pending);
+        assert!(CHILDREN.lock().unwrap().is_empty());
     }
 }
