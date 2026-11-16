@@ -49,7 +49,7 @@ the shell:
 ```bash
 cd crates/web && trunk build --dist dist
 cd ../..
-cargo build -p cl5-server                    # the shell launches cl5-server next to it
+./scripts/prepare-desktop-sidecar.sh         # builds the server sidecar Tauri packages
 cargo build -p cl5-desktop
 cargo run -p cl5-desktop
 ```
@@ -61,6 +61,11 @@ cargo clean
 cd crates/web && trunk build --release --dist dist
 cd ../.. && cargo build -p cl5-server -p cl5-desktop
 ```
+
+`prepare-desktop-sidecar.sh` builds `cl5-server` for the current target and
+places it where Tauri's `externalBin` configuration expects it. Tauri copies
+that sidecar alongside the desktop executable in a packaged application, so the
+app can start its server without a separately installed binary.
 
 For the full phone-size smoke check, run `node scripts/browser-smoke.mjs`; it
 builds the Yew app into an isolated temporary directory before starting the

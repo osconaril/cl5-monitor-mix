@@ -1,4 +1,5 @@
 /target
+/crates/desktop/binaries/
 /dist
 *.db
 *.db-shm

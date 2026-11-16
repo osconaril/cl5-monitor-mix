@@ -61,14 +61,13 @@ fn main() {
         })
         .build(tauri::generate_context!())
         .expect("failed to start the CL5 Monitor Mix desktop app")
-        .run(|_app, event| match event {
-            RunEvent::Exit => {
+        .run(|_app, event| {
+            if let RunEvent::Exit = event {
                 if let Some(mut server) = SERVER.lock().unwrap().take() {
                     let _ = server.kill();
                     let _ = server.wait();
                 }
             }
-            _ => {}
         });
 }
 
@@ -83,16 +82,12 @@ fn resolve_server_bin(resource_dir: &Path) -> Result<PathBuf, String> {
         "cl5-server"
     };
 
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Ok(value) = std::env::var("CL5_DESKTOP_SERVER_BIN") {
-        candidates.push(PathBuf::from(value));
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            candidates.push(parent.join(binary_name));
-        }
-    }
-    candidates.push(resource_dir.join(binary_name));
+    let candidates = server_bin_candidates(
+        resource_dir,
+        std::env::var_os("CL5_DESKTOP_SERVER_BIN"),
+        std::env::current_exe().ok(),
+        binary_name,
+    );
 
     for candidate in candidates {
         if candidate.is_file() {
@@ -103,6 +98,27 @@ fn resolve_server_bin(resource_dir: &Path) -> Result<PathBuf, String> {
     Err(format!(
         "could not find `{binary_name}`; build it with `cargo build -p cl5-server` and keep it next to the app"
     ))
+}
+
+/// Build the lookup order for the server sidecar. Tauri copies `externalBin`
+/// next to the desktop executable for both development and packaged builds.
+fn server_bin_candidates(
+    resource_dir: &Path,
+    configured_path: Option<std::ffi::OsString>,
+    executable_path: Option<PathBuf>,
+    binary_name: &str,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(value) = configured_path {
+        candidates.push(PathBuf::from(value));
+    }
+    if let Some(executable_path) = executable_path {
+        if let Some(parent) = executable_path.parent() {
+            candidates.push(parent.join(binary_name));
+        }
+    }
+    candidates.push(resource_dir.join(binary_name));
+    candidates
 }
 
 /// Locate the built web app (the `index.html` plus the assets Trunk emits).
@@ -147,5 +163,35 @@ fn wait_until_ready() -> Result<(), String> {
             ));
         }
         std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packaged_sidecar_is_found_next_to_the_desktop_binary() {
+        let root =
+            std::env::temp_dir().join(format!("cl5-desktop-sidecar-test-{}", std::process::id()));
+        let app_dir = root.join("CL5 Monitor Mix.app/Contents/MacOS");
+        let resources = root.join("CL5 Monitor Mix.app/Contents/Resources");
+        fs::create_dir_all(&app_dir).unwrap();
+        fs::create_dir_all(&resources).unwrap();
+
+        let server = app_dir.join("cl5-server");
+        fs::write(&server, b"sidecar").unwrap();
+        let candidates = server_bin_candidates(
+            &resources,
+            None,
+            Some(app_dir.join("cl5-desktop")),
+            "cl5-server",
+        );
+
+        assert_eq!(
+            candidates.into_iter().find(|path| path.is_file()),
+            Some(server)
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

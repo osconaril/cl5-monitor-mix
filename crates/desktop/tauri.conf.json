@@ -21,6 +21,9 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "externalBin": [
+      "binaries/cl5-server"
+    ],
     "resources": [
       "resources/web"
     ]
