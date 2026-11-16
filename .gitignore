@@ -1,6 +1,7 @@
 /target
 /crates/desktop/binaries/
 /dist
+/crates/web/dist/
 *.db
 *.db-shm
 *.db-wal
