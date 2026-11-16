@@ -1,6 +1,7 @@
 /target
-/crates/desktop/binaries/
-/crates/desktop/resources/web/*
+crates/desktop/binaries/*
+!crates/desktop/binaries/.gitkeep
+crates/desktop/resources/web/*
 /dist
 /crates/web/dist/
 *.db
